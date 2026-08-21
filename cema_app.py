@@ -507,11 +507,12 @@ class HackRFSweepThread(QThread):
 
 # --- FPV Video Decoding & Stream Bridge Engine ---
 FPV_VIDEO_CHANNELS = {
+    "RaceBand R5 (5805 MHz)": 5805,
+    "RaceBand R5 (5806 MHz)": 5806,
     "RaceBand R1 (5658 MHz)": 5658,
     "RaceBand R2 (5695 MHz)": 5695,
     "RaceBand R3 (5732 MHz)": 5732,
     "RaceBand R4 (5769 MHz)": 5769,
-    "RaceBand R5 (5806 MHz)": 5806,
     "RaceBand R6 (5843 MHz)": 5843,
     "RaceBand R7 (5880 MHz)": 5880,
     "RaceBand R8 (5917 MHz)": 5917,
@@ -654,7 +655,7 @@ class NativeHackRFVideoThread(QThread):
     frame_ready = pyqtSignal(QImage, bool, float)
     status_signal = pyqtSignal(str)
 
-    def __init__(self, freq_mhz=5806, standard="PAL", invert_polarity=False, lna=32, vga=40):
+    def __init__(self, freq_mhz=5805, standard="PAL", invert_polarity=False, lna=32, vga=32):
         super().__init__()
         self.freq_mhz = freq_mhz
         self.standard = standard
@@ -666,25 +667,36 @@ class NativeHackRFVideoThread(QThread):
         self.color_palette = "GRAYSCALE"
         self.brightness = 0
         self.contrast = 1.0
+        self.auto_hsync = True
+        self.manual_line_len = 1286.34
+        self.auto_vsync = True
 
     def set_freq(self, freq_mhz):
         self.freq_mhz = freq_mhz
 
-    def set_tuning(self, standard, invert_polarity, palette, brightness, contrast):
+    def set_tuning(self, standard, invert_polarity, palette, brightness, contrast, auto_hsync=True, manual_line_len=1286.34, auto_vsync=True):
         self.standard = standard
         self.invert_polarity = invert_polarity
         self.color_palette = palette
         self.brightness = brightness
         self.contrast = contrast
+        self.auto_hsync = auto_hsync
+        self.manual_line_len = manual_line_len
+        self.auto_vsync = auto_vsync
 
     def run(self):
+        SAMPLE_RATE = 20000000
+        OFFSET_HZ = 4000000.0  # 4 MHz IF Offset to completely avoid HackRF LO DC center spike
+        tuning_hz = int(self.freq_mhz * 1e6 - OFFSET_HZ)
+        
         cmd = [
             "hackrf_transfer",
-            "-f", str(int(self.freq_mhz * 1e6)),
-            "-s", "20000000",
+            "-f", str(tuning_hz),
+            "-s", str(SAMPLE_RATE),
             "-a", "1",
             "-l", str(self.lna),
             "-g", str(self.vga),
+            "-b", "20000000",
             "-r", "-"
         ]
         
@@ -701,9 +713,14 @@ class NativeHackRFVideoThread(QThread):
             self.status_signal.emit(f"Failed to start HackRF: {e}")
             return
 
-        LINE_LEN = 1280 if self.standard == "PAL" else 1271
-        SAMPLES_PER_CHUNK = LINE_LEN * 600
+        NOMINAL_LINE = 1280.0 if self.standard == "PAL" else 1271.0
+        NUM_LINES_FRAME = 625 if self.standard == "PAL" else 525
+        SAMPLES_PER_CHUNK = int(NOMINAL_LINE * NUM_LINES_FRAME)
         BYTES_PER_CHUNK = SAMPLES_PER_CHUNK * 2
+        
+        # Precompute complex digital LO rotation table for 4 MHz VFO shift
+        t_arr = np.arange(SAMPLES_PER_CHUNK, dtype=np.float32) / float(SAMPLE_RATE)
+        rot_table = np.exp(-1j * 2 * np.pi * OFFSET_HZ * t_arr).astype(np.complex64)
         
         frame_counter = 0
         last_fps_calc = time.time()
@@ -719,49 +736,101 @@ class NativeHackRFVideoThread(QThread):
         lut_amber[:, 1] = (np.arange(256) * 0.65).astype(np.uint8)
         lut_amber[:, 2] = np.arange(256, dtype=np.uint8)
 
+        exact_line_period = 1286.34
+        NUM_VISIBLE_LINES = 576
+        ACTIVE_PIXELS = 720
+        SYNC_OFFSET = 200.0
+        
+        y_grid = np.arange(NUM_VISIBLE_LINES, dtype=np.float32)
+        x_grid = np.arange(ACTIVE_PIXELS, dtype=np.float32)
+
+        # Precompute 3.5 MHz low-pass de-emphasis filter coefficients (eliminates 4.43 MHz PAL chroma static)
+        b_luma, a_luma = scipy.signal.butter(2, 3.5e6 / (float(SAMPLE_RATE) / 2.0), btype='low')
+
+        LINE_LEN = 1286.34
+
         while self.running:
             raw_data = self.process.stdout.read(BYTES_PER_CHUNK)
             if not raw_data or len(raw_data) < BYTES_PER_CHUNK:
                 time.sleep(0.005)
                 continue
 
-            LINE_LEN = 1280 if self.standard == "PAL" else 1271
-            
             d = np.frombuffer(raw_data, dtype=np.int8).astype(np.float32)
             ib = d[0::2]
             qb = d[1::2]
             
             ib -= np.mean(ib)
             qb -= np.mean(qb)
-            iq = ib + 1j * qb
+            raw_iq = ib + 1j * qb
             
-            cc = iq[1:] * np.conj(iq[:-1])
+            # 1. Digital VFO Frequency Shift (+4 MHz): completely shifts signal away from HackRF DC spike
+            n_samples = len(raw_iq)
+            shifted_iq = raw_iq * rot_table[:n_samples]
+            
+            # 2. Fast FM discriminator
+            cc = shifted_iq[1:] * np.conj(shifted_iq[:-1])
             fm_demod = np.angle(cc)
             
             if self.invert_polarity:
                 fm_demod = -fm_demod
                 
-            num_lines = len(fm_demod) // LINE_LEN
-            if num_lines < 50:
-                continue
-                
-            chunks = fm_demod[:num_lines * LINE_LEN].reshape((num_lines, LINE_LEN))
+            # 3. 3.5 MHz Luma Low-Pass De-Emphasis Filter (cuts out 4.43 MHz chroma & triangular FM static)
+            video = scipy.signal.lfilter(b_luma, a_luma, fm_demod)
             
-            sync_indices = np.argmin(chunks, axis=1)
-            sync_jitter = float(np.std(sync_indices))
-            sync_locked = sync_jitter < (LINE_LEN * 0.15)
-            
-            abs_syncs = np.arange(num_lines) * LINE_LEN + sync_indices
-            valid_syncs = abs_syncs[(abs_syncs >= 0) & (abs_syncs + LINE_LEN < len(fm_demod))]
-            
-            if len(valid_syncs) > 100:
-                line_matrix = fm_demod[valid_syncs[:, None] + np.arange(LINE_LEN)]
+            # 4. Fractional Sub-Sample H-Sync Parabolic Peak Tracker
+            if self.auto_hsync and (frame_counter % 15 == 0):
+                lags = range(1260, 1320)
+                sub_sample = video[5000:150000]
+                corrs = [np.corrcoef(sub_sample, video[5000+lag : 150000+lag])[0, 1] for lag in lags]
+                b_idx = np.argmax(corrs)
+                if 0 < b_idx < len(corrs) - 1 and corrs[b_idx] > 0.15:
+                    y1, y2, y3 = corrs[b_idx - 1], corrs[b_idx], corrs[b_idx + 1]
+                    denom = 2 * (2 * y2 - y1 - y3)
+                    delta = (y3 - y1) / denom if abs(denom) > 1e-6 else 0.0
+                    LINE_LEN = float(lags[b_idx] + delta)
+                    sync_locked = True
+                else:
+                    sync_locked = False
+            elif not self.auto_hsync:
+                LINE_LEN = float(self.manual_line_len)
+                sync_locked = True
             else:
-                line_matrix = chunks
+                sync_locked = True
                 
-            clamped = np.clip(line_matrix * self.contrast + (self.brightness / 100.0), -2.2, 2.2)
-            norm = ((clamped - clamped.min()) / (clamped.max() - clamped.min() + 1e-6) * 255.0).astype(np.uint8)
+            # 5. Coherent Sub-Sample Phase Dip for this chunk
+            int_len = int(np.round(LINE_LEN))
+            num_l = min(len(video) // int_len, 600)
+            if num_l < 100:
+                continue
+            avg_line = np.mean(video[:num_l * int_len].reshape(num_l, int_len), axis=0)
+            p0 = float(np.argmin(avg_line))
             
+            # 6. Fractional 2D Resampling Grid (Sub-Pixel Linear Interpolation)
+            sample_indices = (p0 + SYNC_OFFSET) + y_grid[:, None] * LINE_LEN + x_grid[None, :] * (LINE_LEN * 0.8125 / float(ACTIVE_PIXELS))
+            sample_indices = np.clip(sample_indices, 0, len(video) - 2)
+            
+            idx_floor = sample_indices.astype(np.int32)
+            alpha = (sample_indices - idx_floor).astype(np.float32)
+            frame_raw = (1.0 - alpha) * video[idx_floor] + alpha * video[idx_floor + 1]
+            
+            # 7. V-Sync Broad-Pulse Phase Lock
+            if self.auto_vsync:
+                v_prof = np.mean(frame_raw[:, :100], axis=1)
+                v_smooth = np.convolve(v_prof, np.ones(15)/15.0, mode='same')
+                vsync_idx = int(np.argmin(v_smooth))
+                frame_locked = np.roll(frame_raw, -(vsync_idx + 25), axis=0)
+            else:
+                frame_locked = frame_raw
+                
+            # 8. Dynamic Range Scaling & Auto-Contrast AGC
+            p_lo = np.percentile(frame_locked, 4)
+            p_hi = np.percentile(frame_locked, 97)
+            denom = max(0.08, p_hi - p_lo)
+            
+            scaled = ((frame_locked - p_lo) / denom) * 255.0 * self.contrast + self.brightness
+            norm = np.clip(scaled, 0, 255).astype(np.uint8)
+            
+            # 9. Resize to clean 640x480 CRT display
             resized = cv2.resize(norm, (640, 480), interpolation=cv2.INTER_LINEAR)
             
             if self.color_palette == "TACTICAL_GREEN":
@@ -1357,11 +1426,11 @@ class CEMAApp(QMainWindow):
         drone_layout.addWidget(self.create_drone_telemetry_ui())
         self.sidebar_tabs.addTab(tab_drone, "Drone Telemetry")
 
-        # Tab 6: Drone Video Feed
+        # Tab 6: Drone Video Feed (Experimental)
         tab_video = QWidget()
         video_layout = QVBoxLayout(tab_video)
         video_layout.addWidget(self.create_drone_video_ui())
-        self.sidebar_tabs.addTab(tab_video, "Drone Video")
+        self.sidebar_tabs.addTab(tab_video, "⚠️ Drone Video (Exp)")
         
         # State
         self.global_masks = []
@@ -1727,6 +1796,21 @@ class CEMAApp(QMainWindow):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
+        # Experimental Warning Banner
+        warning_card = QFrame()
+        warning_card.setStyleSheet("background-color: #2a1b0a; border: 1px solid #d97706; border-radius: 6px; padding: 4px;")
+        warn_layout = QVBoxLayout(warning_card)
+        warn_layout.setContentsMargins(8, 6, 8, 6)
+        warn_layout.setSpacing(2)
+        warn_title = QLabel("⚠️ EXPERIMENTAL FEATURE")
+        warn_title.setStyleSheet("color: #fbbf24; font-weight: bold; font-size: 11px;")
+        warn_desc = QLabel("Direct analog composite (CVBS) software demodulation is experimental. Signal lock depends heavily on USB transfer stability and RF SNR. For broadcast-stable feeds, the external UDP Stream Bridge is recommended.")
+        warn_desc.setStyleSheet("color: #fef3c7; font-size: 10px;")
+        warn_desc.setWordWrap(True)
+        warn_layout.addWidget(warn_title)
+        warn_layout.addWidget(warn_desc)
+        layout.addWidget(warning_card)
+
         # Tactical Video Display Screen
         self.video_display = VideoDisplayWidget()
         self.video_display.setFixedHeight(210)
@@ -1775,8 +1859,8 @@ class CEMAApp(QMainWindow):
 
         layout.addWidget(source_group)
 
-        # Demodulator Tuning & Display Controls
-        tuning_group = QGroupBox("Demodulator & DSP Tuning")
+        # Demodulator Tuning & Display Controls (SDRangel Style)
+        tuning_group = QGroupBox("Demodulator, H-Sync & V-Sync Controls")
         tuning_layout = QGridLayout(tuning_group)
         tuning_layout.setContentsMargins(6, 6, 6, 6)
 
@@ -1792,29 +1876,50 @@ class CEMAApp(QMainWindow):
         tuning_layout.addWidget(QLabel("Palette:"), 1, 0)
         tuning_layout.addWidget(self.video_palette_combo, 1, 1)
 
+        # H-Sync PLL and V-Sync Controls
+        self.auto_hsync_cb = QCheckBox("🔒 Auto H-Sync Lock (PLL)")
+        self.auto_hsync_cb.setChecked(True)
+        self.auto_hsync_cb.toggled.connect(self.update_video_tuning)
+        tuning_layout.addWidget(self.auto_hsync_cb, 2, 0)
+
+        self.auto_vsync_cb = QCheckBox("🔒 Auto V-Sync Lock (V-Hold)")
+        self.auto_vsync_cb.setChecked(True)
+        self.auto_vsync_cb.toggled.connect(self.update_video_tuning)
+        tuning_layout.addWidget(self.auto_vsync_cb, 2, 1)
+
+        self.hsync_lbl = QLabel("H-Sync: 1286 px (15.55 kHz)")
+        self.hsync_lbl.setStyleSheet("color: #38bdf8; font-weight: bold;")
+        tuning_layout.addWidget(self.hsync_lbl, 3, 0)
+
+        self.hsync_slider = QSlider(Qt.Orientation.Horizontal)
+        self.hsync_slider.setRange(1270, 1315)
+        self.hsync_slider.setValue(1286)
+        self.hsync_slider.valueChanged.connect(self.update_video_tuning)
+        tuning_layout.addWidget(self.hsync_slider, 3, 1)
+
         self.invert_polarity_cb = QCheckBox("Invert Polarity (Sync Up)")
         self.invert_polarity_cb.setToolTip("Toggle if video sync is inverted or video signal appears inverted.")
         self.invert_polarity_cb.toggled.connect(self.update_video_tuning)
-        tuning_layout.addWidget(self.invert_polarity_cb, 2, 0, 1, 2)
+        tuning_layout.addWidget(self.invert_polarity_cb, 4, 0)
 
-        self.show_reticle_cb = QCheckBox("Tactical Crosshairs / Reticle")
+        self.show_reticle_cb = QCheckBox("Tactical Crosshairs")
         self.show_reticle_cb.toggled.connect(self.toggle_video_reticle)
-        tuning_layout.addWidget(self.show_reticle_cb, 3, 0, 1, 2)
+        tuning_layout.addWidget(self.show_reticle_cb, 4, 1)
 
         # Contrast & Brightness Sliders
-        tuning_layout.addWidget(QLabel("Contrast:"), 4, 0)
+        tuning_layout.addWidget(QLabel("Contrast AGC:"), 5, 0)
         self.video_contrast_slider = QSlider(Qt.Orientation.Horizontal)
         self.video_contrast_slider.setRange(50, 300)
         self.video_contrast_slider.setValue(100)
         self.video_contrast_slider.valueChanged.connect(self.update_video_tuning)
-        tuning_layout.addWidget(self.video_contrast_slider, 4, 1)
+        tuning_layout.addWidget(self.video_contrast_slider, 5, 1)
 
-        tuning_layout.addWidget(QLabel("Brightness:"), 5, 0)
+        tuning_layout.addWidget(QLabel("Brightness:"), 6, 0)
         self.video_brightness_slider = QSlider(Qt.Orientation.Horizontal)
         self.video_brightness_slider.setRange(-50, 50)
         self.video_brightness_slider.setValue(0)
         self.video_brightness_slider.valueChanged.connect(self.update_video_tuning)
-        tuning_layout.addWidget(self.video_brightness_slider, 5, 1)
+        tuning_layout.addWidget(self.video_brightness_slider, 6, 1)
 
         layout.addWidget(tuning_group)
 
@@ -1867,9 +1972,15 @@ class CEMAApp(QMainWindow):
         palette = "TACTICAL_GREEN" if "Green" in palette_text else ("AMBER_FLIR" if "Amber" in palette_text else "GRAYSCALE")
         contrast = self.video_contrast_slider.value() / 100.0
         brightness = self.video_brightness_slider.value()
+        auto_hsync = self.auto_hsync_cb.isChecked()
+        manual_line_len = self.hsync_slider.value()
+        auto_vsync = self.auto_vsync_cb.isChecked()
+        
+        freq_khz = (20000.0 / manual_line_len)
+        self.hsync_lbl.setText(f"H-Sync: {manual_line_len} px ({freq_khz:.2f} kHz)")
         
         if self.native_video_thread and self.native_video_thread.isRunning():
-            self.native_video_thread.set_tuning(standard, invert, palette, brightness, contrast)
+            self.native_video_thread.set_tuning(standard, invert, palette, brightness, contrast, auto_hsync, manual_line_len, auto_vsync)
 
     def toggle_video_reticle(self, checked):
         if hasattr(self, 'video_display'):
@@ -1892,13 +2003,17 @@ class CEMAApp(QMainWindow):
             palette = "TACTICAL_GREEN" if "Green" in palette_text else ("AMBER_FLIR" if "Amber" in palette_text else "GRAYSCALE")
             contrast = self.video_contrast_slider.value() / 100.0
             brightness = self.video_brightness_slider.value()
-            lna = self.lna_input.value()
-            vga = self.vga_input.value()
+            lna = max(32, self.lna_input.value())
+            vga = max(32, self.vga_input.value())
 
             # Temporarily pause background SDR spectrum thread to yield HackRF USB device
             if self.hackrf_thread and self.hackrf_thread.isRunning():
                 self.hackrf_thread.stop()
                 self.hackrf_thread.wait(500)
+
+            auto_hsync = self.auto_hsync_cb.isChecked()
+            manual_line_len = self.hsync_slider.value()
+            auto_vsync = self.auto_vsync_cb.isChecked()
 
             self.native_video_thread = NativeHackRFVideoThread(
                 freq_mhz=freq_mhz,
@@ -1907,7 +2022,7 @@ class CEMAApp(QMainWindow):
                 lna=lna,
                 vga=vga
             )
-            self.native_video_thread.set_tuning(standard, invert, palette, brightness, contrast)
+            self.native_video_thread.set_tuning(standard, invert, palette, brightness, contrast, auto_hsync, manual_line_len, auto_vsync)
             self.native_video_thread.frame_ready.connect(self.on_video_frame)
             self.native_video_thread.status_signal.connect(self.log_event)
             self.native_video_thread.start()
@@ -2804,9 +2919,8 @@ class CEMAApp(QMainWindow):
                 self.active_events = {k: v for k, v in self.active_events.items() if current_time - v < 10.0}
 
                 # Watchlist & Fingerprint
-                if "" in mod_type and mod_type != self.last_mod_type:
+                if "🚨" in mod_type and mod_type != self.last_mod_type:
                     self.log_event(mod_type)
-                    self.sidebar_tabs.setCurrentIndex(1) # Auto-switch to Intel tab
                     
                 if fingerprint:
                     f_hz = self.freq_input.value()
