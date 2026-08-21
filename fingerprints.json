@@ -1,0 +1,17 @@
+{
+    "ELRS_0x2156": {
+        "name": "ELRS Pilot (0x2156)",
+        "classification": "[ELRS 900MHz]",
+        "found_at": 915.0,
+        "protocol": "ExpressLRS 900MHz (50Hz SF8)",
+        "crc_init": "0x2156",
+        "uid": "33.85",
+        "first_seen": "20:07:15",
+        "last_seen": "20:10:48",
+        "trend": "STATIONARY",
+        "trend_diff": 0.0,
+        "last_pulse": 20.0,
+        "duty_cycle": 92.8,
+        "packet_count": 2535
+    }
+}

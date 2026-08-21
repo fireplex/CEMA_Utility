@@ -1,0 +1,26 @@
+[
+    {
+        "name": "DJI OcuSync (Video Link)",
+        "min_bw": 8000000,
+        "max_bw": 22000000,
+        "mod": "Wideband/Impulsive"
+    },
+    {
+        "name": "ExpressLRS/Crossfire FPV",
+        "min_bw": 200000,
+        "max_bw": 1200000,
+        "mod": "Wideband/Impulsive"
+    },
+    {
+        "name": "Orlan-10 Telemetry (UAV)",
+        "min_bw": 15000,
+        "max_bw": 50000,
+        "mod": "FM/FSK/CW"
+    },
+    {
+        "name": "DMR / P25 Digital Radio",
+        "min_bw": 10000,
+        "max_bw": 15000,
+        "mod": "FM/FSK/CW"
+    }
+]
