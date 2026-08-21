@@ -1,17 +1,23 @@
 {
-    "ELRS_0x2156": {
-        "name": "ELRS Pilot (0x2156)",
-        "classification": "[ELRS 900MHz]",
-        "found_at": 915.0,
-        "protocol": "ExpressLRS 900MHz (50Hz SF8)",
-        "crc_init": "0x2156",
-        "uid": "33.85",
-        "first_seen": "20:07:15",
-        "last_seen": "20:10:48",
+    "706F71": {
+        "found_at": 5806.0,
+        "name": "Radio 0x706F71",
+        "classification": "ISM 5.8GHz (Wi-Fi/FPV Drones) [UAV TELEMETRY]",
+        "last_seen": 1787335467.2686985,
+        "power_history": [
+            12.834049931341099,
+            5.833930853180134,
+            3.3228512383926256,
+            7.293250346695533,
+            12.541153599730785,
+            4.513359110171131,
+            3.936376320414306
+        ],
         "trend": "STATIONARY",
-        "trend_diff": 0.0,
-        "last_pulse": 20.0,
-        "duty_cycle": 92.8,
-        "packet_count": 2535
+        "trend_diff": -0.25924249671834776,
+        "last_pulse": 1.6384,
+        "last_event_seen": 1787335466.2334316,
+        "duty_cycle": 3.9,
+        "last_power_update": 1787335467.2686985
     }
 }

@@ -16,9 +16,9 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QLineEdit, QPushButton, 
                              QComboBox, QSpinBox, QDoubleSpinBox, QGridLayout, QGroupBox, QSlider, 
                              QTextEdit, QListWidget, QListWidgetItem, QTabWidget, QTreeWidget, 
-                             QTreeWidgetItem, QSplitter, QProgressBar, QFrame, QSizePolicy, QMenu, QInputDialog)
+                             QTreeWidgetItem, QSplitter, QProgressBar, QFrame, QSizePolicy, QMenu, QInputDialog, QCheckBox)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QTimer, QPointF, QRectF
-from PyQt6.QtGui import QPainter, QPen, QBrush, QColor, QFont, QPolygonF
+from PyQt6.QtGui import QPainter, QPen, QBrush, QColor, QFont, QPolygonF, QImage, QPixmap
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from heltec_bridge import HeltecLoraThread, get_available_com_ports
 
@@ -504,6 +504,348 @@ class HackRFSweepThread(QThread):
 
         if self.process:
             self.process.terminate()
+
+# --- FPV Video Decoding & Stream Bridge Engine ---
+FPV_VIDEO_CHANNELS = {
+    "RaceBand R1 (5658 MHz)": 5658,
+    "RaceBand R2 (5695 MHz)": 5695,
+    "RaceBand R3 (5732 MHz)": 5732,
+    "RaceBand R4 (5769 MHz)": 5769,
+    "RaceBand R5 (5806 MHz)": 5806,
+    "RaceBand R6 (5843 MHz)": 5843,
+    "RaceBand R7 (5880 MHz)": 5880,
+    "RaceBand R8 (5917 MHz)": 5917,
+    "FatShark F1 (5740 MHz)": 5740,
+    "FatShark F2 (5760 MHz)": 5760,
+    "FatShark F3 (5780 MHz)": 5780,
+    "FatShark F4 (5800 MHz)": 5800,
+    "FatShark F5 (5820 MHz)": 5820,
+    "FatShark F6 (5840 MHz)": 5840,
+    "FatShark F7 (5860 MHz)": 5860,
+    "FatShark F8 (5880 MHz)": 5880,
+    "Band A - A1 (5865 MHz)": 5865,
+    "Band A - A2 (5845 MHz)": 5845,
+    "Band A - A3 (5825 MHz)": 5825,
+    "Band A - A4 (5805 MHz)": 5805,
+    "Band A - A5 (5785 MHz)": 5785,
+    "Band A - A6 (5765 MHz)": 5765,
+    "Band A - A7 (5745 MHz)": 5745,
+    "Band A - A8 (5725 MHz)": 5725,
+    "Band B - B1 (5733 MHz)": 5733,
+    "Band B - B2 (5752 MHz)": 5752,
+    "Band B - B3 (5771 MHz)": 5771,
+    "Band B - B4 (5790 MHz)": 5790,
+    "Band B - B5 (5809 MHz)": 5809,
+    "Band B - B6 (5828 MHz)": 5828,
+    "Band B - B7 (5847 MHz)": 5847,
+    "Band B - B8 (5866 MHz)": 5866,
+    "Band E - E1 (5705 MHz)": 5705,
+    "Band E - E2 (5685 MHz)": 5685,
+    "Band E - E3 (5665 MHz)": 5665,
+    "Band E - E4 (5645 MHz)": 5645,
+    "Band E - E5 (5885 MHz)": 5885,
+    "Band E - E6 (5905 MHz)": 5905,
+    "Band E - E7 (5925 MHz)": 5925,
+    "Band E - E8 (5945 MHz)": 5945,
+    "1.2GHz - CH1 (1080 MHz)": 1080,
+    "1.2GHz - CH2 (1120 MHz)": 1120,
+    "1.2GHz - CH3 (1160 MHz)": 1160,
+    "1.2GHz - CH4 (1200 MHz)": 1200,
+    "1.2GHz - CH5 (1240 MHz)": 1240,
+    "1.2GHz - CH6 (1280 MHz)": 1280,
+    "1.2GHz - CH7 (1320 MHz)": 1320,
+    "1.2GHz - CH8 (1360 MHz)": 1360,
+}
+
+class VideoDisplayWidget(QWidget):
+    """
+    High-Performance Tactical CRT / FPV Video Display Widget.
+    Renders analog PAL/NTSC frames or RTSP/UDP streams with tactical OSD overlay.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(320, 240)
+        self.current_pixmap = None
+        self.osd_channel = "5806 MHz (R5)"
+        self.osd_mode = "NATIVE HACKRF (PAL 64.0µs)"
+        self.osd_status = "SEEKING CARRIER"
+        self.osd_fps = 0.0
+        self.show_osd = True
+        self.show_reticle = False
+        self.setStyleSheet("background-color: #050811; border: 1px solid #1e293b; border-radius: 6px;")
+
+    def update_frame(self, qimage, sync_locked=True, fps=0.0):
+        if qimage and not qimage.isNull():
+            self.current_pixmap = QPixmap.fromImage(qimage)
+            self.osd_status = "LOCKED (PAL 64.0µs)" if sync_locked else "CARRIER DETECTED"
+            self.osd_fps = fps
+            self.update()
+
+    def set_stream_info(self, channel_str, mode_str):
+        self.osd_channel = channel_str
+        self.osd_mode = mode_str
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        w = self.width()
+        h = self.height()
+        
+        # Fill background
+        painter.fillRect(0, 0, w, h, QColor("#050811"))
+        
+        if self.current_pixmap and not self.current_pixmap.isNull():
+            # Draw video frame preserving 4:3 aspect ratio
+            scaled_pixmap = self.current_pixmap.scaled(
+                w, h, 
+                Qt.AspectRatioMode.KeepAspectRatio, 
+                Qt.TransformationMode.FastTransformation
+            )
+            pw = scaled_pixmap.width()
+            ph = scaled_pixmap.height()
+            px = (w - pw) // 2
+            py = (h - ph) // 2
+            painter.drawPixmap(px, py, scaled_pixmap)
+        else:
+            # Standby / Static Grid Screen
+            painter.setPen(QPen(QColor("#1e293b"), 1, Qt.PenStyle.DotLine))
+            grid_step = 30
+            for gx in range(0, w, grid_step):
+                painter.drawLine(gx, 0, gx, h)
+            for gy in range(0, h, grid_step):
+                painter.drawLine(0, gy, w, gy)
+                
+            font = QFont("Consolas", 10)
+            font.setBold(True)
+            painter.setFont(font)
+            painter.setPen(QPen(QColor("#64748b")))
+            painter.drawText(QRectF(0, 0, w, h), Qt.AlignmentFlag.AlignCenter, "NO ACTIVE VIDEO STREAM\n[ Select Channel & Click 'START VIDEO STREAM' ]")
+
+        # Tactical OSD Overlay
+        if self.show_osd:
+            painter.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+            
+            # Top Banner Background
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(QColor(0, 0, 0, 160)))
+            painter.drawRoundedRect(QRectF(8, 8, max(200, w - 16), 26), 4, 4)
+            
+            # Top-Left: Channel & Source
+            painter.setPen(QPen(QColor("#38bdf8")))
+            painter.drawText(QPointF(16, 25), f"📹 {self.osd_mode} | {self.osd_channel}")
+            
+            # Top-Right: Status & FPS
+            status_color = QColor("#10b981") if "LOCKED" in self.osd_status else QColor("#f59e0b")
+            painter.setPen(QPen(status_color))
+            fps_str = f"[{self.osd_status}] {self.osd_fps:.1f} FPS"
+            painter.drawText(QRectF(w - 250, 8, 234, 26), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, fps_str)
+            
+            # Reticle / Crosshair (if enabled)
+            if self.show_reticle:
+                cx, cy = w / 2.0, h / 2.0
+                painter.setPen(QPen(QColor(239, 68, 68, 180), 1.5))
+                painter.drawLine(QPointF(cx - 20, cy), QPointF(cx + 20, cy))
+                painter.drawLine(QPointF(cx, cy - 20), QPointF(cx, cy + 20))
+                painter.drawEllipse(QPointF(cx, cy), 35, 35)
+
+class NativeHackRFVideoThread(QThread):
+    frame_ready = pyqtSignal(QImage, bool, float)
+    status_signal = pyqtSignal(str)
+
+    def __init__(self, freq_mhz=5806, standard="PAL", invert_polarity=False, lna=32, vga=40):
+        super().__init__()
+        self.freq_mhz = freq_mhz
+        self.standard = standard
+        self.invert_polarity = invert_polarity
+        self.lna = lna
+        self.vga = vga
+        self.running = True
+        self.process = None
+        self.color_palette = "GRAYSCALE"
+        self.brightness = 0
+        self.contrast = 1.0
+
+    def set_freq(self, freq_mhz):
+        self.freq_mhz = freq_mhz
+
+    def set_tuning(self, standard, invert_polarity, palette, brightness, contrast):
+        self.standard = standard
+        self.invert_polarity = invert_polarity
+        self.color_palette = palette
+        self.brightness = brightness
+        self.contrast = contrast
+
+    def run(self):
+        cmd = [
+            "hackrf_transfer",
+            "-f", str(int(self.freq_mhz * 1e6)),
+            "-s", "20000000",
+            "-a", "1",
+            "-l", str(self.lna),
+            "-g", str(self.vga),
+            "-r", "-"
+        ]
+        
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        try:
+            self.process = subprocess.Popen(
+                cmd, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.DEVNULL, 
+                bufsize=20000000, 
+                creationflags=creationflags
+            )
+        except Exception as e:
+            self.status_signal.emit(f"Failed to start HackRF: {e}")
+            return
+
+        LINE_LEN = 1280 if self.standard == "PAL" else 1271
+        SAMPLES_PER_CHUNK = LINE_LEN * 600
+        BYTES_PER_CHUNK = SAMPLES_PER_CHUNK * 2
+        
+        frame_counter = 0
+        last_fps_calc = time.time()
+        current_fps = 0.0
+        
+        lut_green = np.zeros((256, 3), dtype=np.uint8)
+        lut_green[:, 1] = np.arange(256, dtype=np.uint8)
+        lut_green[:, 0] = (np.arange(256) * 0.15).astype(np.uint8)
+        lut_green[:, 2] = (np.arange(256) * 0.15).astype(np.uint8)
+
+        lut_amber = np.zeros((256, 3), dtype=np.uint8)
+        lut_amber[:, 0] = (np.arange(256) * 0.15).astype(np.uint8)
+        lut_amber[:, 1] = (np.arange(256) * 0.65).astype(np.uint8)
+        lut_amber[:, 2] = np.arange(256, dtype=np.uint8)
+
+        while self.running:
+            raw_data = self.process.stdout.read(BYTES_PER_CHUNK)
+            if not raw_data or len(raw_data) < BYTES_PER_CHUNK:
+                time.sleep(0.005)
+                continue
+
+            LINE_LEN = 1280 if self.standard == "PAL" else 1271
+            
+            d = np.frombuffer(raw_data, dtype=np.int8).astype(np.float32)
+            ib = d[0::2]
+            qb = d[1::2]
+            
+            ib -= np.mean(ib)
+            qb -= np.mean(qb)
+            iq = ib + 1j * qb
+            
+            cc = iq[1:] * np.conj(iq[:-1])
+            fm_demod = np.angle(cc)
+            
+            if self.invert_polarity:
+                fm_demod = -fm_demod
+                
+            num_lines = len(fm_demod) // LINE_LEN
+            if num_lines < 50:
+                continue
+                
+            chunks = fm_demod[:num_lines * LINE_LEN].reshape((num_lines, LINE_LEN))
+            
+            sync_indices = np.argmin(chunks, axis=1)
+            sync_jitter = float(np.std(sync_indices))
+            sync_locked = sync_jitter < (LINE_LEN * 0.15)
+            
+            abs_syncs = np.arange(num_lines) * LINE_LEN + sync_indices
+            valid_syncs = abs_syncs[(abs_syncs >= 0) & (abs_syncs + LINE_LEN < len(fm_demod))]
+            
+            if len(valid_syncs) > 100:
+                line_matrix = fm_demod[valid_syncs[:, None] + np.arange(LINE_LEN)]
+            else:
+                line_matrix = chunks
+                
+            clamped = np.clip(line_matrix * self.contrast + (self.brightness / 100.0), -2.2, 2.2)
+            norm = ((clamped - clamped.min()) / (clamped.max() - clamped.min() + 1e-6) * 255.0).astype(np.uint8)
+            
+            resized = cv2.resize(norm, (640, 480), interpolation=cv2.INTER_LINEAR)
+            
+            if self.color_palette == "TACTICAL_GREEN":
+                rgb_frame = lut_green[resized]
+                qimg = QImage(rgb_frame.data, 640, 480, 640 * 3, QImage.Format.Format_BGR888).copy()
+            elif self.color_palette == "AMBER_FLIR":
+                rgb_frame = lut_amber[resized]
+                qimg = QImage(rgb_frame.data, 640, 480, 640 * 3, QImage.Format.Format_BGR888).copy()
+            else:
+                qimg = QImage(resized.data, 640, 480, 640, QImage.Format.Format_Grayscale8).copy()
+                
+            frame_counter += 1
+            now = time.time()
+            if now - last_fps_calc >= 1.0:
+                current_fps = frame_counter / (now - last_fps_calc)
+                frame_counter = 0
+                last_fps_calc = now
+                
+            self.frame_ready.emit(qimg, sync_locked, current_fps)
+
+        if self.process:
+            self.process.terminate()
+            self.process.wait()
+
+    def stop(self):
+        self.running = False
+        if self.process:
+            try:
+                self.process.terminate()
+            except: pass
+        self.wait(1000)
+
+class ExternalStreamVideoThread(QThread):
+    frame_ready = pyqtSignal(QImage, bool, float)
+    status_signal = pyqtSignal(str)
+
+    def __init__(self, stream_url="udp://127.0.0.1:5005"):
+        super().__init__()
+        self.stream_url = stream_url
+        self.running = True
+        self.cap = None
+
+    def run(self):
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "overrun_nonfatal;1;fifo_size;50000000;timeout;2000000"
+        
+        self.status_signal.emit(f"Connecting to stream: {self.stream_url}")
+        self.cap = cv2.VideoCapture(self.stream_url, cv2.CAP_FFMPEG)
+        
+        if not self.cap.isOpened():
+            self.status_signal.emit(f"Failed to open video stream: {self.stream_url}")
+            return
+            
+        self.status_signal.emit("Connected to video stream.")
+        
+        frame_counter = 0
+        last_fps_calc = time.time()
+        current_fps = 0.0
+
+        while self.running:
+            ret, frame = self.cap.read()
+            if not ret or frame is None:
+                time.sleep(0.01)
+                continue
+                
+            resized = cv2.resize(frame, (640, 480))
+            qimg = QImage(resized.data, 640, 480, 640 * 3, QImage.Format.Format_BGR888).copy()
+            
+            frame_counter += 1
+            now = time.time()
+            if now - last_fps_calc >= 1.0:
+                current_fps = frame_counter / (now - last_fps_calc)
+                frame_counter = 0
+                last_fps_calc = now
+                
+            self.frame_ready.emit(qimg, True, current_fps)
+
+        if self.cap:
+            self.cap.release()
+
+    def stop(self):
+        self.running = False
+        if self.cap:
+            self.cap.release()
+        self.wait(1000)
 
 # --- Tactical Flight & Avionics Widgets (Heltec V3 Live Telemetry) ---
 class GimbalHUDWidget(QWidget):
@@ -1015,6 +1357,11 @@ class CEMAApp(QMainWindow):
         drone_layout.addWidget(self.create_drone_telemetry_ui())
         self.sidebar_tabs.addTab(tab_drone, "Drone Telemetry")
 
+        # Tab 6: Drone Video Feed
+        tab_video = QWidget()
+        video_layout = QVBoxLayout(tab_video)
+        video_layout.addWidget(self.create_drone_video_ui())
+        self.sidebar_tabs.addTab(tab_video, "Drone Video")
         
         # State
         self.global_masks = []
@@ -1036,6 +1383,9 @@ class CEMAApp(QMainWindow):
         self.gps_breadcrumbs_count = 0
         self.last_drone_rssi = -100
         self.last_drone_lq = 0
+        self.native_video_thread = None
+        self.external_video_thread = None
+        self.is_video_streaming = False
 
         # pyqtgraph setup
         pg.setConfigOptions(antialias=False)
@@ -1370,6 +1720,249 @@ class CEMAApp(QMainWindow):
 
         layout.addStretch()
         return drone_widget
+
+    def create_drone_video_ui(self):
+        video_widget = QWidget()
+        layout = QVBoxLayout(video_widget)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        # Tactical Video Display Screen
+        self.video_display = VideoDisplayWidget()
+        self.video_display.setFixedHeight(210)
+        layout.addWidget(self.video_display)
+
+        # Source Selection Group
+        source_group = QGroupBox("Video Stream Source")
+        source_layout = QVBoxLayout(source_group)
+        source_layout.setContentsMargins(6, 6, 6, 6)
+
+        self.video_source_combo = QComboBox()
+        self.video_source_combo.addItems([
+            "📡 Native HackRF Demod (5.8G / 1.2G)",
+            "🌐 SDRangel UDP Stream (udp://127.0.0.1:5005)",
+            "🌐 Custom RTSP / UDP / HTTP Stream"
+        ])
+        self.video_source_combo.currentTextChanged.connect(self.on_video_source_changed)
+        source_layout.addWidget(self.video_source_combo)
+
+        # FPV Channel Row
+        self.fpv_chan_row = QWidget()
+        chan_row_layout = QHBoxLayout(self.fpv_chan_row)
+        chan_row_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.fpv_channel_combo = QComboBox()
+        for label, mhz in FPV_VIDEO_CHANNELS.items():
+            self.fpv_channel_combo.addItem(label, mhz)
+        self.fpv_channel_combo.setCurrentIndex(4) # Default RaceBand R5 (5806 MHz)
+        self.fpv_channel_combo.currentIndexChanged.connect(self.on_fpv_channel_changed)
+        
+        chan_row_layout.addWidget(QLabel("Preset:"))
+        chan_row_layout.addWidget(self.fpv_channel_combo)
+        source_layout.addWidget(self.fpv_chan_row)
+
+        # Stream URL Row (for SDRangel / RTSP)
+        self.stream_url_row = QWidget()
+        stream_url_layout = QHBoxLayout(self.stream_url_row)
+        stream_url_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.stream_url_input = QLineEdit("udp://127.0.0.1:5005")
+        self.stream_url_input.setToolTip("URL or address for SDRangel or RTSP stream.\nExample: udp://127.0.0.1:5005 or rtsp://127.0.0.1:8554/live")
+        stream_url_layout.addWidget(QLabel("Stream URI:"))
+        stream_url_layout.addWidget(self.stream_url_input)
+        source_layout.addWidget(self.stream_url_row)
+        self.stream_url_row.hide()
+
+        layout.addWidget(source_group)
+
+        # Demodulator Tuning & Display Controls
+        tuning_group = QGroupBox("Demodulator & DSP Tuning")
+        tuning_layout = QGridLayout(tuning_group)
+        tuning_layout.setContentsMargins(6, 6, 6, 6)
+
+        self.video_standard_combo = QComboBox()
+        self.video_standard_combo.addItems(["PAL (64.0 µs / 1280 px)", "NTSC (63.55 µs / 1271 px)"])
+        self.video_standard_combo.currentIndexChanged.connect(self.update_video_tuning)
+        tuning_layout.addWidget(QLabel("Standard:"), 0, 0)
+        tuning_layout.addWidget(self.video_standard_combo, 0, 1)
+
+        self.video_palette_combo = QComboBox()
+        self.video_palette_combo.addItems(["Grayscale (Analog CRT)", "Tactical NVG (Green)", "Amber (Thermal FLIR)"])
+        self.video_palette_combo.currentIndexChanged.connect(self.update_video_tuning)
+        tuning_layout.addWidget(QLabel("Palette:"), 1, 0)
+        tuning_layout.addWidget(self.video_palette_combo, 1, 1)
+
+        self.invert_polarity_cb = QCheckBox("Invert Polarity (Sync Up)")
+        self.invert_polarity_cb.setToolTip("Toggle if video sync is inverted or video signal appears inverted.")
+        self.invert_polarity_cb.toggled.connect(self.update_video_tuning)
+        tuning_layout.addWidget(self.invert_polarity_cb, 2, 0, 1, 2)
+
+        self.show_reticle_cb = QCheckBox("Tactical Crosshairs / Reticle")
+        self.show_reticle_cb.toggled.connect(self.toggle_video_reticle)
+        tuning_layout.addWidget(self.show_reticle_cb, 3, 0, 1, 2)
+
+        # Contrast & Brightness Sliders
+        tuning_layout.addWidget(QLabel("Contrast:"), 4, 0)
+        self.video_contrast_slider = QSlider(Qt.Orientation.Horizontal)
+        self.video_contrast_slider.setRange(50, 300)
+        self.video_contrast_slider.setValue(100)
+        self.video_contrast_slider.valueChanged.connect(self.update_video_tuning)
+        tuning_layout.addWidget(self.video_contrast_slider, 4, 1)
+
+        tuning_layout.addWidget(QLabel("Brightness:"), 5, 0)
+        self.video_brightness_slider = QSlider(Qt.Orientation.Horizontal)
+        self.video_brightness_slider.setRange(-50, 50)
+        self.video_brightness_slider.setValue(0)
+        self.video_brightness_slider.valueChanged.connect(self.update_video_tuning)
+        tuning_layout.addWidget(self.video_brightness_slider, 5, 1)
+
+        layout.addWidget(tuning_group)
+
+        # Action Buttons
+        btn_layout = QHBoxLayout()
+        self.toggle_video_btn = QPushButton("▶ START VIDEO STREAM")
+        self.toggle_video_btn.setStyleSheet("background-color: #10b981; color: white; font-weight: bold; padding: 8px;")
+        self.toggle_video_btn.clicked.connect(self.toggle_video_stream)
+        
+        self.video_snapshot_btn = QPushButton("📸 SNAPSHOT")
+        self.video_snapshot_btn.setStyleSheet("background-color: #1e293b; color: #38bdf8; font-weight: bold; border: 1px solid #38bdf8;")
+        self.video_snapshot_btn.clicked.connect(self.capture_video_snapshot)
+        
+        btn_layout.addWidget(self.toggle_video_btn)
+        btn_layout.addWidget(self.video_snapshot_btn)
+        layout.addLayout(btn_layout)
+
+        layout.addStretch()
+        return video_widget
+
+    def on_video_source_changed(self, text):
+        if "Native" in text:
+            self.fpv_chan_row.show()
+            self.stream_url_row.hide()
+            if hasattr(self, 'video_display'):
+                chan_text = self.fpv_channel_combo.currentText()
+                self.video_display.set_stream_info(chan_text, "NATIVE HACKRF (PAL 64.0µs)")
+        else:
+            self.fpv_chan_row.hide()
+            self.stream_url_row.show()
+            if hasattr(self, 'video_display'):
+                uri = self.stream_url_input.text()
+                self.video_display.set_stream_info(uri, "EXTERNAL STREAM")
+
+    def on_fpv_channel_changed(self, index):
+        freq_mhz = self.fpv_channel_combo.currentData()
+        if freq_mhz:
+            if hasattr(self, 'freq_input'):
+                self.freq_input.setValue(float(freq_mhz))
+            if hasattr(self, 'video_display'):
+                chan_text = self.fpv_channel_combo.currentText()
+                self.video_display.set_stream_info(chan_text, "NATIVE HACKRF (PAL 64.0µs)")
+            if self.native_video_thread and self.native_video_thread.isRunning():
+                self.native_video_thread.set_freq(freq_mhz)
+
+    def update_video_tuning(self):
+        standard = "PAL" if "PAL" in self.video_standard_combo.currentText() else "NTSC"
+        invert = self.invert_polarity_cb.isChecked()
+        palette_text = self.video_palette_combo.currentText()
+        palette = "TACTICAL_GREEN" if "Green" in palette_text else ("AMBER_FLIR" if "Amber" in palette_text else "GRAYSCALE")
+        contrast = self.video_contrast_slider.value() / 100.0
+        brightness = self.video_brightness_slider.value()
+        
+        if self.native_video_thread and self.native_video_thread.isRunning():
+            self.native_video_thread.set_tuning(standard, invert, palette, brightness, contrast)
+
+    def toggle_video_reticle(self, checked):
+        if hasattr(self, 'video_display'):
+            self.video_display.show_reticle = checked
+            self.video_display.update()
+
+    def toggle_video_stream(self):
+        if self.is_video_streaming:
+            self.stop_video_stream()
+        else:
+            self.start_video_stream()
+
+    def start_video_stream(self):
+        source_mode = self.video_source_combo.currentText()
+        if "Native" in source_mode:
+            freq_mhz = self.fpv_channel_combo.currentData() or 5806
+            standard = "PAL" if "PAL" in self.video_standard_combo.currentText() else "NTSC"
+            invert = self.invert_polarity_cb.isChecked()
+            palette_text = self.video_palette_combo.currentText()
+            palette = "TACTICAL_GREEN" if "Green" in palette_text else ("AMBER_FLIR" if "Amber" in palette_text else "GRAYSCALE")
+            contrast = self.video_contrast_slider.value() / 100.0
+            brightness = self.video_brightness_slider.value()
+            lna = self.lna_input.value()
+            vga = self.vga_input.value()
+
+            # Temporarily pause background SDR spectrum thread to yield HackRF USB device
+            if self.hackrf_thread and self.hackrf_thread.isRunning():
+                self.hackrf_thread.stop()
+                self.hackrf_thread.wait(500)
+
+            self.native_video_thread = NativeHackRFVideoThread(
+                freq_mhz=freq_mhz,
+                standard=standard,
+                invert_polarity=invert,
+                lna=lna,
+                vga=vga
+            )
+            self.native_video_thread.set_tuning(standard, invert, palette, brightness, contrast)
+            self.native_video_thread.frame_ready.connect(self.on_video_frame)
+            self.native_video_thread.status_signal.connect(self.log_event)
+            self.native_video_thread.start()
+            
+            chan_name = self.fpv_channel_combo.currentText()
+            self.video_display.set_stream_info(chan_name, f"NATIVE HACKRF ({standard})")
+            self.log_event(f"Started Native HackRF FPV Video Demodulator on {freq_mhz} MHz ({standard})")
+        else:
+            stream_url = self.stream_url_input.text().strip()
+            self.external_video_thread = ExternalStreamVideoThread(stream_url=stream_url)
+            self.external_video_thread.frame_ready.connect(self.on_video_frame)
+            self.external_video_thread.status_signal.connect(self.log_event)
+            self.external_video_thread.start()
+            
+            self.video_display.set_stream_info(stream_url, "EXTERNAL STREAM")
+            self.log_event(f"Connecting to external video stream: {stream_url}")
+
+        self.is_video_streaming = True
+        self.toggle_video_btn.setText("⏹ STOP VIDEO STREAM")
+        self.toggle_video_btn.setStyleSheet("background-color: #ef4444; color: white; font-weight: bold; padding: 8px;")
+
+    def stop_video_stream(self):
+        if self.native_video_thread:
+            self.native_video_thread.stop()
+            self.native_video_thread = None
+        if self.external_video_thread:
+            self.external_video_thread.stop()
+            self.external_video_thread = None
+            
+        self.is_video_streaming = False
+        self.toggle_video_btn.setText("▶ START VIDEO STREAM")
+        self.toggle_video_btn.setStyleSheet("background-color: #10b981; color: white; font-weight: bold; padding: 8px;")
+        
+        # Resume background SDR spectrum thread if Stare/Sweep mode active
+        if hasattr(self, 'current_mode') and (self.hackrf_thread is None or not self.hackrf_thread.isRunning()):
+            self.start_sdr()
+            
+        self.log_event("Stopped Video Stream.")
+
+    def on_video_frame(self, qimage, sync_locked, fps):
+        if hasattr(self, 'video_display'):
+            self.video_display.update_frame(qimage, sync_locked, fps)
+
+    def capture_video_snapshot(self):
+        if not hasattr(self, 'video_display') or self.video_display.current_pixmap is None:
+            self.log_event("Cannot snapshot: No video frame available.")
+            return
+            
+        os.makedirs("captures", exist_ok=True)
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        chan_mhz = self.fpv_channel_combo.currentData() if hasattr(self, 'fpv_channel_combo') else 5806
+        filepath = os.path.join("captures", f"FPV_Capture_{chan_mhz}MHz_{timestamp}.png")
+        
+        self.video_display.current_pixmap.save(filepath, "PNG")
+        self.log_event(f"📸 Saved Video Snapshot: {filepath}")
 
     def start_heltec(self):
         port = self.heltec_port_combo.currentText() if hasattr(self, 'heltec_port_combo') else "COM6"
@@ -2435,6 +3028,10 @@ class CEMAApp(QMainWindow):
         self.force_demod_btn.setText(" STOP AUDIO")
 
     def closeEvent(self, event):
+        if hasattr(self, 'native_video_thread') and self.native_video_thread:
+            self.native_video_thread.stop()
+        if hasattr(self, 'external_video_thread') and self.external_video_thread:
+            self.external_video_thread.stop()
         if self.heltec_thread:
             self.heltec_thread.stop()
         if self.hackrf_thread:
