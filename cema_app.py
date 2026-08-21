@@ -2,21 +2,24 @@ import sys
 import time
 import json
 import os
-import numpy as np
 import subprocess
 import threading
 import datetime
+import queue
+from collections import deque
+import numpy as np
+import scipy.signal
+import sounddevice as sd
+import cv2
+import pyqtgraph as pg
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QLineEdit, QPushButton, 
-                             QComboBox, QSpinBox, QDoubleSpinBox, QGridLayout, QGroupBox, QSlider, QTextEdit, QListWidget, QListWidgetItem, QTabWidget, QTreeWidget, QTreeWidgetItem, QSplitter, QProgressBar, QFrame)
+                             QComboBox, QSpinBox, QDoubleSpinBox, QGridLayout, QGroupBox, QSlider, 
+                             QTextEdit, QListWidget, QListWidgetItem, QTabWidget, QTreeWidget, 
+                             QTreeWidgetItem, QSplitter, QProgressBar, QFrame, QSizePolicy, QMenu, QInputDialog)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QTimer, QPointF, QRectF
 from PyQt6.QtGui import QPainter, QPen, QBrush, QColor, QFont, QPolygonF
 from PyQt6.QtWebEngineWidgets import QWebEngineView
-import pyqtgraph as pg
-import sounddevice as sd
-import queue
-import cv2
-import scipy.signal
 from heltec_bridge import HeltecLoraThread, get_available_com_ports
 
 # --- DSP Functions ---
@@ -62,8 +65,6 @@ class HackRFThread(QThread):
         self.start_time = time.time()
         self.active_blocks = 0
         self.last_pulse_duration = 0.0
-        
-        from collections import deque
         self.duty_window = deque(maxlen=1000)
         self.current_duty_cycle = 0.0
         self.audio_buffer = deque(maxlen=1024)
@@ -729,7 +730,6 @@ class CEMAApp(QMainWindow):
         main_layout = QVBoxLayout(central_widget)
 
         # Control Panel
-        from PyQt6.QtWidgets import QSizePolicy
         control_group = QGroupBox("SDR Parameters")
         control_group.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
         control_layout = QHBoxLayout()
@@ -1688,7 +1688,6 @@ class CEMAApp(QMainWindow):
             self.log_event(f"Error saving fingerprints: {e}")
 
     def refresh_fingerprint_ui(self):
-        from PyQt6.QtGui import QColor
         self.fingerprint_ui.clear()
         for fp, data in self.fingerprint_db.items():
             name = data.get("name", f"Radio 0x{fp}")
@@ -1730,7 +1729,6 @@ class CEMAApp(QMainWindow):
     def fingerprint_context_menu(self, position):
         item = self.fingerprint_ui.itemAt(position)
         if item is not None:
-            from PyQt6.QtWidgets import QMenu, QInputDialog
             menu = QMenu()
             rename_action = menu.addAction("Rename Emitter")
             action = menu.exec(self.fingerprint_ui.viewport().mapToGlobal(position))
@@ -1798,7 +1796,6 @@ class CEMAApp(QMainWindow):
     def watchlist_context_menu(self, position):
         item = self.watchlist_ui.itemAt(position)
         if item is not None:
-            from PyQt6.QtWidgets import QMenu
             menu = QMenu()
             delete_action = menu.addAction("Delete Profile")
             action = menu.exec(self.watchlist_ui.viewport().mapToGlobal(position))
