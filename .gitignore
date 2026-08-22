@@ -7,6 +7,8 @@ __pycache__/
 build/
 dist/
 *.spec
+*.exe
+CEMA_Tracker.exe
 
 # Temporary logs & debug dumps
 *.wav
@@ -14,3 +16,4 @@ audio_debug.txt
 output.txt
 error.txt
 logs/
+captures/
