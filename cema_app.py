@@ -12,6 +12,13 @@ import numpy as np
 import scipy.signal
 import sounddevice as sd
 import cv2
+try:
+    import PyQt6.QtOpenGLWidgets
+    import PyQt6.QtOpenGL
+    import PyQt6.uic
+except ImportError:
+    pass
+
 import pyqtgraph as pg
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QDialog, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QLineEdit, QPushButton, 
