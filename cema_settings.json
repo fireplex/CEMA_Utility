@@ -1,0 +1,22 @@
+{
+    "kraken_host": "127.0.0.1",
+    "kraken_api_port": 8080,
+    "kraken_doa_port": 8081,
+    "kraken_wsl_path": "\\\\wsl.localhost\\Ubuntu\\home\\feeka\\krakensdr_doa\\krakensdr_doa\\_share",
+    "kraken_default_arr": "Uniform Circular Array (UCA)",
+    "kraken_default_radius": 0.135,
+    "kraken_default_gain": 30.0,
+    "heltec_port": "COM6",
+    "heltec_baud": 115200,
+    "heltec_rate_idx": 0,
+    "heltec_auto_reconnect": true,
+    "map_provider": "CartoDB Dark Matter (Tactical)",
+    "map_home_lat": 51.5074,
+    "map_home_lon": -0.1278,
+    "map_breadcrumbs_max": 100,
+    "map_bearing_trail_max": 50,
+    "ui_theme": "Cyberpunk Tactical Dark",
+    "ui_fps_target": 30,
+    "audio_alerts": false,
+    "log_dir": "./cema_logs"
+}

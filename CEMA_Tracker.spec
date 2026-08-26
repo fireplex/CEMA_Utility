@@ -6,11 +6,11 @@ a = Analysis(
     pathex=['C:\\Users\\toxic\\Desktop\\hackrf-utility'],
     binaries=[('fpv_decoder.dll', '.')],
     datas=[],
-    hiddenimports=['PyQt6.QtWebEngineWidgets', 'PyQt6.QtWebEngineCore', 'PyQt6.QtGui', 'PyQt6.QtCore', 'PyQt6.QtWidgets', 'PyQt6.QtOpenGL', 'PyQt6.QtOpenGLWidgets', 'PyQt6.QtSvg', 'PyQt6.QtSvgWidgets', 'PyQt6.QtPrintSupport', 'PyQt6.uic', 'serial', 'serial.tools.list_ports', 'heltec_bridge', 'pyqtgraph'],
+    hiddenimports=['PyQt6.QtWebEngineWidgets', 'PyQt6.QtWebEngineCore', 'PyQt6.QtGui', 'PyQt6.QtCore', 'PyQt6.QtWidgets', 'PyQt6.QtOpenGL', 'PyQt6.QtOpenGLWidgets', 'PyQt6.QtSvg', 'PyQt6.QtSvgWidgets', 'PyQt6.QtPrintSupport', 'PyQt6.uic', 'serial', 'serial.tools.list_ports', 'heltec_bridge', 'pyqtgraph', 'neural_amc', 'tactical_copilot'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['PyQt5', 'PySide2', 'PySide6', 'torch', 'torchvision', 'xformers', 'torchaudio', 'numba', 'pandas', 'matplotlib', 'skimage', 'sklearn', 'tkinter', 'IPython'],
+    excludes=['PyQt5', 'PySide2', 'PySide6', 'xformers', 'numba', 'pandas', 'matplotlib', 'skimage', 'sklearn', 'tkinter', 'IPython'],
     noarchive=False,
     optimize=0,
 )

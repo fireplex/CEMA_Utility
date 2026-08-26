@@ -7,9 +7,14 @@ import threading
 import datetime
 import queue
 import ctypes
+import socket
+import urllib.request
+import random
+import math
 from collections import deque
 import numpy as np
 import scipy.signal
+import scipy.ndimage
 import sounddevice as sd
 import cv2
 try:
@@ -24,11 +29,60 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QDialog, QWidget, QVBoxL
                              QHBoxLayout, QLabel, QLineEdit, QPushButton, 
                              QComboBox, QSpinBox, QDoubleSpinBox, QGridLayout, QGroupBox, QSlider, 
                              QTextEdit, QListWidget, QListWidgetItem, QTabWidget, QTreeWidget, 
-                             QTreeWidgetItem, QSplitter, QProgressBar, QFrame, QSizePolicy, QMenu, QInputDialog, QCheckBox)
+                             QTreeWidgetItem, QSplitter, QProgressBar, QFrame, QSizePolicy, QMenu, 
+                             QInputDialog, QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView, QScrollArea)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QTimer, QPointF, QRectF
-from PyQt6.QtGui import QPainter, QPen, QBrush, QColor, QFont, QPolygonF, QImage, QPixmap
+from PyQt6.QtGui import QPainter, QPen, QBrush, QColor, QFont, QPolygonF, QImage, QPixmap, QShortcut, QKeySequence
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from heltec_bridge import HeltecLoraThread, get_available_com_ports
+from neural_amc import get_neural_amc
+from tactical_copilot import get_tactical_copilot
+
+# --- Tactical Waterfall Colormaps ---
+TACTICAL_COLORMAPS = {
+    "Inferno (Default)": pg.ColorMap(
+        np.array([0.0, 0.25, 0.5, 0.75, 1.0]),
+        np.array([
+            [0, 0, 0, 255], [30, 58, 138, 255], [6, 182, 212, 255], [250, 204, 21, 255], [220, 38, 38, 255]
+        ], dtype=np.ubyte)
+    ),
+    "Thermal Green (NVG)": pg.ColorMap(
+        np.array([0.0, 0.2, 0.5, 0.8, 1.0]),
+        np.array([
+            [0, 10, 0, 255], [0, 45, 10, 255], [16, 185, 129, 255], [52, 211, 153, 255], [236, 253, 245, 255]
+        ], dtype=np.ubyte)
+    ),
+    "CRT Phosphor / Amber": pg.ColorMap(
+        np.array([0.0, 0.2, 0.5, 0.8, 1.0]),
+        np.array([
+            [10, 5, 0, 255], [60, 25, 0, 255], [217, 119, 6, 255], [251, 191, 36, 255], [254, 243, 199, 255]
+        ], dtype=np.ubyte)
+    ),
+    "Viridis": pg.ColorMap(
+        np.array([0.0, 0.25, 0.5, 0.75, 1.0]),
+        np.array([
+            [68, 1, 84, 255], [59, 82, 139, 255], [33, 145, 140, 255], [94, 201, 98, 255], [253, 231, 37, 255]
+        ], dtype=np.ubyte)
+    ),
+    "Plasma": pg.ColorMap(
+        np.array([0.0, 0.25, 0.5, 0.75, 1.0]),
+        np.array([
+            [13, 8, 135, 255], [126, 3, 168, 255], [204, 71, 120, 255], [248, 149, 64, 255], [240, 249, 33, 255]
+        ], dtype=np.ubyte)
+    ),
+    "Cold Ice Blue": pg.ColorMap(
+        np.array([0.0, 0.25, 0.5, 0.75, 1.0]),
+        np.array([
+            [2, 6, 23, 255], [15, 23, 42, 255], [14, 165, 233, 255], [186, 230, 253, 255], [248, 250, 252, 255]
+        ], dtype=np.ubyte)
+    ),
+    "Monochrome White-Hot": pg.ColorMap(
+        np.array([0.0, 0.3, 0.7, 1.0]),
+        np.array([
+            [0, 0, 0, 255], [75, 85, 99, 255], [209, 213, 219, 255], [255, 255, 255, 255]
+        ], dtype=np.ubyte)
+    ),
+}
 
 # --- DSP Functions ---
 def detect_peaks(fft_data, additive_threshold=20.0, min_distance=10):
@@ -43,11 +97,11 @@ def detect_peaks(fft_data, additive_threshold=20.0, min_distance=10):
                 peaks[-1] = i
     return peaks
 
-def classify_modulation(iq_complex, avg_cva, avg_mag):
-    if avg_mag < 6:
-        return "Noise/Quiet", 0.95, avg_cva
+def classify_modulation(iq_complex, avg_cva, avg_mag, is_carrier_active=True):
+    if not is_carrier_active or avg_mag < 8:
+        return "Noise/Inactive", 0.95, avg_cva
     cva = avg_cva
-    if cva < 0.45:
+    if cva < 0.40:
         return "FM/FSK/CW", 0.85, cva
     elif cva < 0.65:
         return "QAM/Digital", 0.65, cva
@@ -55,6 +109,26 @@ def classify_modulation(iq_complex, avg_cva, avg_mag):
         return "AM/Analog", 0.60, cva
     else:
         return "Wideband/Impulsive", 0.40, cva
+
+def speak_tactical_alert(text):
+    def _worker():
+        try:
+            import win32com.client
+            speaker = win32com.client.Dispatch("SAPI.SpVoice")
+            speaker.Speak(text)
+        except Exception:
+            try:
+                clean_text = text.replace("'", "").replace('"', '')
+                creationflags = 0x08000000 if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+                subprocess.run(
+                    ["powershell", "-NoProfile", "-c", f"(New-Object -ComObject SAPI.SpVoice).Speak('{clean_text}')"],
+                    capture_output=True,
+                    timeout=3,
+                    creationflags=creationflags
+                )
+            except Exception:
+                pass
+    threading.Thread(target=_worker, daemon=True).start()
 
 # --- HackRF Stare Thread (with Intelligence logic) ---
 class HackRFThread(QThread):
@@ -79,6 +153,12 @@ class HackRFThread(QThread):
         self.ctcss_detected = False
         self.vfo_offset_hz = 0.0
         self.phase_acc = 0.0
+        self.neural_amc = get_neural_amc()
+        self.last_valid_mod_type = "Noise / Standby"
+        self.last_valid_bw = 0
+        self.last_valid_const_i = []
+        self.last_valid_const_q = []
+        self.hanning_window = np.hanning(1024).astype(np.float32)
         
         self.decode_video = False
         self.video_q = queue.Queue(maxsize=3)
@@ -115,7 +195,13 @@ class HackRFThread(QThread):
         self.last_high_snr_time = time.time()
 
     def run(self):
-        self.audio_stream = sd.OutputStream(device=3, samplerate=50000, channels=1, dtype='float32', callback=self.audio_callback)
+        try:
+            self.audio_stream = sd.OutputStream(device=3, samplerate=50000, channels=1, dtype='float32', callback=self.audio_callback)
+        except Exception:
+            try:
+                self.audio_stream = sd.OutputStream(samplerate=50000, channels=1, dtype='float32', callback=self.audio_callback)
+            except Exception:
+                self.audio_stream = None
         cmd = [
             "hackrf_transfer",
             "-r", "-",
@@ -307,11 +393,30 @@ class HackRFThread(QThread):
             q_coords = q_coords - np.mean(q_coords)
             iq_complex = i_coords + 1j * q_coords
 
-            window = np.hanning(len(iq_complex))
+            window = self.hanning_window if len(iq_complex) == 1024 else np.hanning(len(iq_complex))
             windowed_iq = iq_complex * window
 
             fft_result = np.fft.fftshift(np.fft.fft(windowed_iq))
             magnitude = np.abs(fft_result) / len(windowed_iq)
+
+            # 1. DC Spike Notch Filter (Suppress central LO leakage spike)
+            center_bin = len(magnitude) // 2
+            bg_left = np.median(magnitude[max(0, center_bin-10):max(0, center_bin-3)])
+            bg_right = np.median(magnitude[min(len(magnitude), center_bin+3):min(len(magnitude), center_bin+10)])
+            dc_val = (bg_left + bg_right) / 2.0
+            magnitude[center_bin-2:center_bin+3] = dc_val
+
+            # 2. Vectorized CA-CFAR Noise Floor Equalization (Flattens 20MHz filter skirts)
+            G_cell = 4
+            T_cell = 16
+            tot_w = 2 * (G_cell + T_cell) + 1
+            grd_w = 2 * G_cell + 1
+            sum_tot = scipy.ndimage.uniform_filter1d(magnitude, size=tot_w, mode='reflect') * tot_w
+            sum_grd = scipy.ndimage.uniform_filter1d(magnitude, size=grd_w, mode='reflect') * grd_w
+            cfar_floor = (sum_tot - sum_grd) / (tot_w - grd_w)
+            med_floor = np.median(cfar_floor)
+            if med_floor > 1e-6:
+                magnitude = np.maximum(0, magnitude - (cfar_floor - med_floor))
 
             if fft_avg is None:
                 fft_avg = magnitude
@@ -323,25 +428,50 @@ class HackRFThread(QThread):
             const_i = i_coords[:100]
             const_q = q_coords[:100]
 
+            noise_floor = np.mean(magnitude)
+            peak_val = np.max(magnitude)
+            carrier_snr = peak_val - noise_floor
+            is_carrier_active = (carrier_snr > 10.0)
+            current_time = time.time()
+
             N = 8
-            if len(i_coords) >= N:
-                filt_i = np.convolve(i_coords, np.ones(N)/N, mode='valid')
-                filt_q = np.convolve(q_coords, np.ones(N)/N, mode='valid')
-                filt_iq = filt_i + 1j * filt_q
-                current_mag = np.abs(filt_iq)
-                current_cva = np.std(current_mag) / np.mean(current_mag) if np.mean(current_mag) > 0 else 1.0
-                cva_avg = (ALPHA_MOD * current_cva) + ((1 - ALPHA_MOD) * cva_avg)
-                avg_mag = np.mean(current_mag)
-                mod_type, confidence, _ = classify_modulation(iq_complex, cva_avg, avg_mag)
+            if len(i_coords) >= N and is_carrier_active:
+                neural_classified = False
+                if getattr(self, 'neural_amc', None) and self.neural_amc.is_ready:
+                    ai_class, ai_conf, ai_note, _ = self.neural_amc.classify(iq_complex, carrier_snr)
+                    if ai_class not in ("UNKNOWN", "Noise / Floor"):
+                        mod_type = f"AI: {ai_class} ({ai_conf:.0f}%)"
+                        confidence = ai_conf / 100.0
+                        neural_classified = True
+
+                if not neural_classified:
+                    filt_i = np.convolve(i_coords, np.ones(N)/N, mode='valid')
+                    filt_q = np.convolve(q_coords, np.ones(N)/N, mode='valid')
+                    filt_iq = filt_i + 1j * filt_q
+                    current_mag = np.abs(filt_iq)
+                    current_cva = np.std(current_mag) / np.mean(current_mag) if np.mean(current_mag) > 0 else 1.0
+                    cva_avg = (ALPHA_MOD * current_cva) + ((1 - ALPHA_MOD) * cva_avg)
+                    avg_mag = np.mean(current_mag)
+                    mod_type, confidence, _ = classify_modulation(iq_complex, cva_avg, avg_mag, True)
+
+                # Persist active classification
+                self.last_valid_mod_type = mod_type
+                self.last_valid_const_i = const_i
+                self.last_valid_const_q = const_q
+                self.last_high_snr_time = current_time
             else:
-                mod_type = "UNKNOWN"
+                # In between rapid FHSS hops or pulsed telemetry packets, hold the classification for 1.8s
+                if (current_time - self.last_high_snr_time) < 1.8:
+                    mod_type = self.last_valid_mod_type
+                    const_i = self.last_valid_const_i
+                    const_q = self.last_valid_const_q
+                else:
+                    mod_type = "Noise/Inactive"
+                    const_i = []
+                    const_q = []
                 avg_mag = 0
                 
             # 1. PTT Transient Fingerprinting
-            noise_floor = np.mean(magnitude)
-            peak_val = np.max(magnitude)
-            current_time = time.time()
-            
             if (peak_val - noise_floor) > 12.0:
                 self.last_high_snr_time = current_time
                 if not signal_active:
@@ -364,17 +494,20 @@ class HackRFThread(QThread):
                     else:
                         fingerprint = None
             else:
-                # Temporal Debounce: Wait 1.5 seconds of dead silence before dropping signal_active
-                # This prevents FM radio fading or dead-air from triggering dozens of false "new" fingerprints
-                if signal_active and (current_time - self.last_high_snr_time) > 1.5:
+                # Temporal Debounce: Wait 1.8 seconds of dead silence before dropping signal_active
+                if signal_active and (current_time - self.last_high_snr_time) > 1.8:
                     signal_active = False
                     fingerprint = None
                 
-            # 2. Bandwidth Estimation
-            if signal_active:
-                noise_floor = np.median(fft_avg)
-                active_bins = np.sum(fft_avg > noise_floor * 2.0)
+            # 2. Bandwidth Estimation with Persistence
+            if (current_time - self.last_high_snr_time) < 1.8:
+                noise_floor_m = np.median(fft_avg)
+                active_bins = np.sum(fft_avg > noise_floor_m * 1.8)
                 bw_estimate = active_bins * (20000000 / 1024)
+                if bw_estimate > 0:
+                    self.last_valid_bw = bw_estimate
+                else:
+                    bw_estimate = self.last_valid_bw
             else:
                 bw_estimate = 0
                 
@@ -446,13 +579,13 @@ class HackRFThread(QThread):
 class HackRFSweepThread(QThread):
     error_signal = pyqtSignal(str)
 
-    def __init__(self, start_hz, end_hz, lna, vga):
+    def __init__(self, start_hz, end_hz, lna, vga, bin_width=1000000):
         super().__init__()
         self.start_hz = start_hz
         self.end_hz = end_hz
         self.lna = lna
         self.vga = vga
-        self.bin_width = 1000000 # 1 MHz
+        self.bin_width = int(bin_width)
         self.num_bins = int((end_hz - start_hz) / self.bin_width)
         if self.num_bins <= 0:
             self.num_bins = 1
@@ -696,6 +829,382 @@ class FloatingVideoWindow(QDialog):
         self.video_display.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         layout.addWidget(self.video_display)
 
+class DoACompassWidget(QWidget):
+    """
+    Military-grade 360-degree Tactical Compass Rose & MUSIC Polar Spectrum HUD.
+    Visualizes:
+    1. Continuous 360° azimuth bearing needle with smoothed inertial damping.
+    2. MUSIC (Multiple Signal Classification) spatial pseudo-spectrum polar power graph.
+    3. Angular uncertainty / confidence arc.
+    4. Concentric polar power grid (dB levels) and cardinal degree markings.
+    5. Real-time digital telemetry overlay.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(280, 280)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.bearing_deg = 0.0
+        self.target_bearing_deg = 0.0
+        self.confidence = 0.0
+        self.snr_db = 0.0
+        self.freq_mhz = 915.000
+        self.array_name = "5-UCA (Circular)"
+        self.spectrum = [0.0] * 360
+        self.is_locked = False
+        
+        # 60 FPS smooth needle animation timer
+        self.anim_timer = QTimer(self)
+        self.anim_timer.timeout.connect(self._animate_step)
+        self.anim_timer.start(16)
+
+    def set_bearing_data(self, data):
+        self.target_bearing_deg = float(data.get("doa_deg", 0.0))
+        self.confidence = float(data.get("confidence", 0.0))
+        self.snr_db = float(data.get("snr_db", 0.0))
+        self.freq_mhz = float(data.get("freq_mhz", self.freq_mhz))
+        spec = data.get("spectrum", None)
+        if spec and len(spec) == 360:
+            self.spectrum = spec
+        self.is_locked = (self.confidence > 50.0)
+
+    def _animate_step(self):
+        diff = (self.target_bearing_deg - self.bearing_deg + 180.0) % 360.0 - 180.0
+        if abs(diff) > 0.05:
+            self.bearing_deg = (self.bearing_deg + 0.18 * diff) % 360.0
+            self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        w = self.width()
+        h = self.height()
+        cx = w / 2.0
+        cy = h / 2.0
+        radius = min(cx, cy) - 16.0
+        if radius < 40:
+            return
+
+        # 1. Outer Bezel & Dark CRT Background
+        painter.setPen(QPen(QColor("#1e293b"), 2))
+        painter.setBrush(QBrush(QColor("#060a14")))
+        painter.drawEllipse(QPointF(cx, cy), radius, radius)
+
+        # 2. Polar Radar Grid (Concentric Rings: 25%, 50%, 75%, 100%)
+        grid_pen = QPen(QColor("#0ea5e9"))
+        grid_pen.setStyle(Qt.PenStyle.DashLine)
+        grid_pen.setWidthF(1.0)
+        painter.setPen(grid_pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        
+        for frac in [0.25, 0.50, 0.75]:
+            painter.drawEllipse(QPointF(cx, cy), radius * frac, radius * frac)
+
+        # 3. Radial Spokes every 30 degrees
+        spoke_pen = QPen(QColor(14, 165, 233, 40), 1.0)
+        painter.setPen(spoke_pen)
+        for deg in range(0, 360, 30):
+            rad = math.radians(deg - 90)
+            x1 = cx + (radius * 0.25) * math.cos(rad)
+            y1 = cy + (radius * 0.25) * math.sin(rad)
+            x2 = cx + radius * math.cos(rad)
+            y2 = cy + radius * math.sin(rad)
+            painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+
+        # 4. Polar MUSIC Pseudo-Spectrum Power Polygon
+        if self.is_locked and any(p > 0.01 for p in self.spectrum):
+            spec_poly = QPolygonF()
+            inner_r = radius * 0.25
+            dyn_r = radius * 0.70
+            for deg in range(360):
+                power = max(0.0, min(1.0, self.spectrum[deg]))
+                r_val = inner_r + dyn_r * power
+                rad = math.radians(deg - 90)
+                px = cx + r_val * math.cos(rad)
+                py = cy + r_val * math.sin(rad)
+                spec_poly.append(QPointF(px, py))
+            
+            painter.setPen(QPen(QColor(56, 189, 248, 200), 1.5))
+            painter.setBrush(QBrush(QColor(56, 189, 248, 45)))
+            painter.drawPolygon(spec_poly)
+
+        # 5. Degree Dial & Tick Marks
+        painter.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+        for deg in range(0, 360, 5):
+            rad = math.radians(deg - 90)
+            is_cardinal = (deg % 90 == 0)
+            is_major = (deg % 30 == 0)
+            is_medium = (deg % 10 == 0)
+            
+            tick_len = 10 if is_cardinal else (7 if is_major else (4 if is_medium else 2))
+            tick_color = QColor("#38bdf8") if is_cardinal else (QColor("#94a3b8") if is_major else QColor(148, 163, 184, 80))
+            
+            x_outer = cx + (radius - 2) * math.cos(rad)
+            y_outer = cy + (radius - 2) * math.sin(rad)
+            x_inner = cx + (radius - 2 - tick_len) * math.cos(rad)
+            y_inner = cy + (radius - 2 - tick_len) * math.sin(rad)
+            
+            painter.setPen(QPen(tick_color, 1.5 if is_cardinal else 1.0))
+            painter.drawLine(QPointF(x_inner, y_inner), QPointF(x_outer, y_outer))
+            
+            if is_cardinal or is_major:
+                lbl_r = radius - 18
+                lx = cx + lbl_r * math.cos(rad)
+                ly = cy + lbl_r * math.sin(rad)
+                
+                label = "N" if deg == 0 else ("E" if deg == 90 else ("S" if deg == 180 else ("W" if deg == 270 else f"{deg}°")))
+                lbl_color = QColor("#f59e0b") if is_cardinal else QColor("#94a3b8")
+                painter.setPen(QPen(lbl_color))
+                painter.drawText(QRectF(lx - 16, ly - 10, 32, 20), Qt.AlignmentFlag.AlignCenter, label)
+
+        # 6. Confidence Arc / Uncertainty Halo
+        if self.is_locked:
+            conf_sigma = max(3.0, 35.0 * (1.0 - self.confidence / 100.0))
+            arc_color = QColor(16, 185, 129, 60) if self.confidence >= 80 else (QColor(245, 158, 11, 60) if self.confidence >= 50 else QColor(239, 68, 68, 60))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(arc_color))
+            
+            start_ang = (-(self.bearing_deg + conf_sigma) + 90) * 16
+            span_ang = (2.0 * conf_sigma) * 16
+            painter.drawPie(QRectF(cx - radius * 0.92, cy - radius * 0.92, radius * 1.84, radius * 1.84), int(start_ang), int(span_ang))
+
+        # 7. Target Line-of-Bearing (LoB) Ray & Arrow Needle
+        if self.is_locked or self.confidence > 0:
+            needle_rad = math.radians(self.bearing_deg - 90)
+            nx = cx + (radius - 12) * math.cos(needle_rad)
+            ny = cy + (radius - 12) * math.sin(needle_rad)
+            
+            # Glow Line
+            glow_color = QColor("#10b981") if self.confidence >= 80 else (QColor("#f59e0b") if self.confidence >= 50 else QColor("#ef4444"))
+            painter.setPen(QPen(glow_color, 3.0))
+            painter.drawLine(QPointF(cx, cy), QPointF(nx, ny))
+            
+            # Arrow Tip Head
+            left_rad = needle_rad + math.radians(150)
+            right_rad = needle_rad - math.radians(150)
+            ax1 = nx + 14 * math.cos(left_rad)
+            ay1 = ny + 14 * math.sin(left_rad)
+            ax2 = nx + 14 * math.cos(right_rad)
+            ay2 = ny + 14 * math.sin(right_rad)
+            
+            arrow_poly = QPolygonF([QPointF(nx, ny), QPointF(ax1, ay1), QPointF(ax2, ay2)])
+            painter.setBrush(QBrush(glow_color))
+            painter.drawPolygon(arrow_poly)
+
+        # 8. Center Hub
+        painter.setPen(QPen(QColor("#38bdf8"), 2))
+        painter.setBrush(QBrush(QColor("#0f172a")))
+        painter.drawEllipse(QPointF(cx, cy), 12, 12)
+        painter.setBrush(QBrush(QColor("#38bdf8")))
+        painter.drawEllipse(QPointF(cx, cy), 4, 4)
+
+        # 9. Tactical Telemetry Overlay Banner
+        hud_w = min(260, w - 24)
+        hud_h = 50
+        hx = cx - hud_w / 2.0
+        hy = h - hud_h - 10
+        
+        painter.setPen(QPen(QColor("#1e293b"), 1))
+        painter.setBrush(QBrush(QColor(6, 10, 20, 220)))
+        painter.drawRoundedRect(QRectF(hx, hy, hud_w, hud_h), 4, 4)
+        
+        cardinals = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+        card_idx = int((self.bearing_deg + 11.25) / 22.5) % 16
+        card_str = cardinals[card_idx]
+        
+        painter.setFont(QFont("Consolas", 10, QFont.Weight.Bold))
+        status_col = "#10b981" if self.confidence >= 80 else ("#f59e0b" if self.confidence >= 50 else "#94a3b8")
+        painter.setPen(QPen(QColor(status_col)))
+        painter.drawText(QRectF(hx, hy + 4, hud_w, 20), Qt.AlignmentFlag.AlignCenter, f"BEARING: {self.bearing_deg:05.1f}° {card_str}")
+        
+        painter.setFont(QFont("Consolas", 8))
+        painter.setPen(QPen(QColor("#38bdf8")))
+        painter.drawText(QRectF(hx, hy + 26, hud_w, 18), Qt.AlignmentFlag.AlignCenter, f"CONF: {self.confidence:.0f}% | SNR: {self.snr_db:.0f}dB | {self.freq_mhz:.2f}MHz")
+
+class KrakenDoAThread(QThread):
+    bearing_signal = pyqtSignal(dict)
+    status_signal = pyqtSignal(str, str) # msg, color
+
+    def __init__(self, mode="KRAKEN_TCP", host="127.0.0.1", port=8081, freq_mhz=915.0, parent=None):
+        super().__init__(parent)
+        self.mode = mode # "KRAKEN_TCP", "HTTP", "UDP", "SIMULATOR"
+        self.host = host
+        self.port = port
+        self.freq_mhz = freq_mhz
+        self.running = False
+        self.sim_angle = 135.0
+        self.sim_speed = 0.4
+        
+    def run(self):
+        self.running = True
+        self.status_signal.emit(f"Kraken DoA active ({self.mode})", "#10b981")
+        
+        while self.running:
+            try:
+                if self.mode == "SIMULATOR":
+                    self.sim_angle = (self.sim_angle + self.sim_speed + random.uniform(-0.35, 0.35)) % 360.0
+                    conf = min(98.5, max(65.0, 92.0 + random.uniform(-4.0, 4.0)))
+                    snr = min(35.0, max(12.0, 26.0 + random.uniform(-1.5, 1.5)))
+                    
+                    spectrum = [0.0] * 360
+                    main_deg = int(self.sim_angle)
+                    multipath_deg = (main_deg + 85) % 360
+                    for deg in range(360):
+                        diff_main = min(abs(deg - main_deg), 360 - abs(deg - main_deg))
+                        diff_multi = min(abs(deg - multipath_deg), 360 - abs(deg - multipath_deg))
+                        p_main = max(0.0, 1.0 - (diff_main / 22.0) ** 2)
+                        p_multi = 0.35 * max(0.0, 1.0 - (diff_multi / 32.0) ** 2)
+                        p_noise = random.uniform(0.02, 0.07)
+                        spectrum[deg] = max(0.0, min(1.0, p_main + p_multi + p_noise))
+                    
+                    data = {
+                        "doa_deg": self.sim_angle,
+                        "confidence": conf,
+                        "snr_db": snr,
+                        "freq_mhz": self.freq_mhz,
+                        "spectrum": spectrum,
+                        "timestamp": time.time()
+                    }
+                    self.bearing_signal.emit(data)
+                    time.sleep(0.08)
+
+                elif self.mode in ["KRAKEN_POLL", "KRAKEN_WS", "KRAKEN_TCP"]:
+                    # Direct live reader for Kraken DOA_value.html stream (Port 8081 & WSL UNC)
+                    wsl_unc_path = r"\\wsl.localhost\Ubuntu\home\feeka\krakensdr_doa\krakensdr_doa\_share\DOA_value.html"
+                    http_url = f"http://{self.host}:{self.port}/DOA_value.html"
+                    
+                    last_ts = 0
+                    consecutive_errs = 0
+                    self.status_signal.emit("Kraken Live Stream Connected", "#10b981")
+                    
+                    while self.running:
+                        raw_text = None
+                        try:
+                            # Fast Path: Check direct WSL file if local
+                            if self.host in ["127.0.0.1", "localhost"] and os.path.exists(wsl_unc_path):
+                                try:
+                                    with open(wsl_unc_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                        raw_text = f.read().strip()
+                                except Exception:
+                                    pass
+                            
+                            # Network / Fallback Path: HTTP GET from Kraken Data Server
+                            if not raw_text:
+                                req = urllib.request.Request(http_url, headers={'User-Agent': 'CEMA-Tracker/1.0'})
+                                with urllib.request.urlopen(req, timeout=1.0) as resp:
+                                    if resp.status == 200:
+                                        raw_text = resp.read().decode('utf-8', errors='ignore').strip()
+
+                            if raw_text and "," in raw_text:
+                                parts = [p.strip() for p in raw_text.split(",") if p.strip()]
+                                if len(parts) >= 6:
+                                    try:
+                                        ts = float(parts[0])
+                                        if ts != last_ts:
+                                            last_ts = ts
+                                            bearing = float(parts[1])
+                                            conf_raw = float(parts[2])
+                                            pwr = float(parts[3])
+                                            freq_val = float(parts[4])
+                                            f_mhz = freq_val / 1e6 if freq_val > 1e5 else freq_val
+
+                                            # Parse 360-degree MUSIC Pseudo-Spectrum array
+                                            spec = [0.0] * 360
+                                            if len(parts) >= 17 + 100:
+                                                try:
+                                                    spec_raw = [float(x) for x in parts[17:17+360]]
+                                                    max_s = max(spec_raw) if max(spec_raw) > 0 else 1.0
+                                                    min_s = min(spec_raw)
+                                                    range_s = max_s - min_s if max_s > min_s else 1.0
+                                                    spec = [(x - min_s) / range_s for x in spec_raw]
+                                                except Exception:
+                                                    pass
+
+                                            # Calculate 0-100% confidence percentage
+                                            conf = min(100.0, max(0.0, conf_raw * 18.0)) if conf_raw < 10.0 else min(100.0, conf_raw)
+                                            
+                                            self.bearing_signal.emit({
+                                                "doa_deg": bearing,
+                                                "confidence": conf,
+                                                "snr_db": pwr,
+                                                "freq_mhz": f_mhz,
+                                                "spectrum": spec,
+                                                "timestamp": ts / 1000.0 if ts > 1e11 else time.time()
+                                            })
+                                            consecutive_errs = 0
+                                    except ValueError:
+                                        pass
+                        except Exception as e:
+                            consecutive_errs += 1
+                            if consecutive_errs > 5 and self.running:
+                                self.status_signal.emit(f"Kraken waiting for DOA data... ({e})", "#f59e0b")
+                        
+                        time.sleep(0.05) # 20 Hz update rate
+
+                elif self.mode == "HTTP":
+                    url = f"http://{self.host}:{self.port}/settings"
+                    req = urllib.request.Request(url, headers={'User-Agent': 'CEMA-Tracker/1.0'})
+                    try:
+                        with urllib.request.urlopen(req, timeout=1.5) as resp:
+                            if resp.status == 200:
+                                raw = json.loads(resp.read().decode('utf-8'))
+                                bearing = float(raw.get('doa_deg', raw.get('bearing', 0.0)))
+                                conf = float(raw.get('confidence', raw.get('conf', 85.0)))
+                                self.bearing_signal.emit({
+                                    "doa_deg": bearing,
+                                    "confidence": conf,
+                                    "snr_db": float(raw.get('snr', 20.0)),
+                                    "freq_mhz": float(raw.get('center_freq', self.freq_mhz * 1e6)) / 1e6,
+                                    "spectrum": [0.0] * 360,
+                                    "timestamp": time.time()
+                                })
+                    except Exception:
+                        pass
+                    time.sleep(0.15)
+                    
+                elif self.mode == "UDP":
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    sock.settimeout(1.0)
+                    self.current_socket = sock
+                    try:
+                        sock.bind(("", int(self.port)))
+                        while self.running:
+                            try:
+                                pkt, _ = sock.recvfrom(8192)
+                                raw = json.loads(pkt.decode('utf-8', errors='ignore'))
+                                bearing = float(raw.get('doa_deg', raw.get('bearing', 0.0)))
+                                conf = float(raw.get('confidence', raw.get('conf', 85.0)))
+                                self.bearing_signal.emit({
+                                    "doa_deg": bearing,
+                                    "confidence": conf,
+                                    "snr_db": float(raw.get('snr', 20.0)),
+                                    "freq_mhz": float(raw.get('frequency', self.freq_mhz)),
+                                    "spectrum": raw.get('spectrum', [0.0] * 360),
+                                    "timestamp": time.time()
+                                })
+                            except socket.timeout:
+                                continue
+                    except Exception as e:
+                        if self.running:
+                            self.status_signal.emit(f"UDP Error: {e}", "#ef4444")
+                            time.sleep(1.0)
+                    finally:
+                        try: sock.close()
+                        except: pass
+                        self.current_socket = None
+            except Exception as e:
+                if self.running:
+                    self.status_signal.emit(f"Kraken DoA Error: {e}", "#ef4444")
+                    time.sleep(1.0)
+
+    def stop(self):
+        self.running = False
+        if hasattr(self, 'current_socket') and self.current_socket:
+            try: self.current_socket.close()
+            except: pass
+        self.wait(800)
+
 class NativeHackRFVideoThread(QThread):
     frame_ready = pyqtSignal(QImage, bool, float)
     status_signal = pyqtSignal(str)
@@ -795,15 +1304,11 @@ class NativeHackRFVideoThread(QThread):
         sync_locked = ctypes.c_int(0)
         fps_val = ctypes.c_float(0.0)
 
-        lut_green = np.zeros((256, 3), dtype=np.uint8)
-        lut_green[:, 1] = np.arange(256, dtype=np.uint8)
-        lut_green[:, 0] = (np.arange(256) * 0.15).astype(np.uint8)
-        lut_green[:, 2] = (np.arange(256) * 0.15).astype(np.uint8)
-
-        lut_amber = np.zeros((256, 3), dtype=np.uint8)
-        lut_amber[:, 0] = (np.arange(256) * 0.15).astype(np.uint8)
-        lut_amber[:, 1] = (np.arange(256) * 0.65).astype(np.uint8)
-        lut_amber[:, 2] = np.arange(256, dtype=np.uint8)
+        # Hardware Qt Color Tables (Zero-copy indexed palette rendering)
+        from PyQt6.QtGui import qRgb
+        color_table_gray = [qRgb(i, i, i) for i in range(256)]
+        color_table_green = [qRgb(int(i * 0.15), i, int(i * 0.15)) for i in range(256)]
+        color_table_amber = [qRgb(i, int(i * 0.65), int(i * 0.15)) for i in range(256)]
 
         while self.running:
             got_frame = self.c_lib.fpv_decoder_get_frame(
@@ -817,20 +1322,16 @@ class NativeHackRFVideoThread(QThread):
                 time.sleep(0.005)
                 continue
 
-            raw_bytes = bytes(frame_buf)
-            
+            # Zero-copy direct QImage from C memory buffer
+            qimg = QImage(frame_buf, width, height, width, QImage.Format.Format_Indexed8)
             if self.color_palette == "TACTICAL_GREEN":
-                gray_arr = np.frombuffer(raw_bytes, dtype=np.uint8).reshape((height, width))
-                rgb = lut_green[gray_arr]
-                qimg = QImage(rgb.data, width, height, width * 3, QImage.Format.Format_BGR888).copy()
+                qimg.setColorTable(color_table_green)
             elif self.color_palette == "AMBER_FLIR":
-                gray_arr = np.frombuffer(raw_bytes, dtype=np.uint8).reshape((height, width))
-                rgb = lut_amber[gray_arr]
-                qimg = QImage(rgb.data, width, height, width * 3, QImage.Format.Format_BGR888).copy()
+                qimg.setColorTable(color_table_amber)
             else:
-                qimg = QImage(raw_bytes, width, height, width, QImage.Format.Format_Grayscale8).copy()
+                qimg.setColorTable(color_table_gray)
 
-            self.frame_ready.emit(qimg, bool(sync_locked.value), float(fps_val.value))
+            self.frame_ready.emit(qimg.copy(), bool(sync_locked.value), float(fps_val.value))
             time.sleep(0.015)
 
         try:
@@ -1068,18 +1569,517 @@ class FlightDynamicsClassifier:
         return ("🚁 ACTIVE FLIGHT / CRUISE", "#10b981", f"Nominal Flight | Thr: {thr_pct:.0f}%")
 
 
+DEFAULT_SETTINGS = {
+    "kraken_host": "127.0.0.1",
+    "kraken_api_port": 8080,
+    "kraken_doa_port": 8081,
+    "kraken_wsl_path": r"\\wsl.localhost\Ubuntu\home\feeka\krakensdr_doa\krakensdr_doa\_share",
+    "kraken_default_arr": "Uniform Circular Array (UCA)",
+    "kraken_default_radius": 0.135,
+    "kraken_default_gain": 30.0,
+    "heltec_port": "COM6",
+    "heltec_baud": 115200,
+    "heltec_rate_idx": 0,
+    "heltec_auto_reconnect": True,
+    "map_provider": "CartoDB Dark Matter (Tactical)",
+    "map_home_lat": 51.5074,
+    "map_home_lon": -0.1278,
+    "map_breadcrumbs_max": 100,
+    "map_bearing_trail_max": 50,
+    "ui_theme": "Cyberpunk Tactical Dark",
+    "ui_fps_target": 30,
+    "audio_alerts": False,
+    "log_dir": "./cema_logs"
+}
+
+def load_app_settings():
+    config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cema_settings.json")
+    if os.path.exists(config_file):
+        try:
+            with open(config_file, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+                res = DEFAULT_SETTINGS.copy()
+                res.update(saved)
+                return res
+        except Exception:
+            pass
+    return DEFAULT_SETTINGS.copy()
+
+def save_app_settings(settings_dict):
+    config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cema_settings.json")
+    try:
+        with open(config_file, "w", encoding="utf-8") as f:
+            json.dump(settings_dict, f, indent=4)
+        return True
+    except Exception as e:
+        print(f"[SETTINGS ERROR] Could not save settings: {e}")
+        return False
+
+
+class PopOutWindow(QMainWindow):
+    """
+    Tactical Detachable / Pop-Out Container Window.
+    Allows undocking any UI sub-module (Tactical Map, FPV Video, DoA Compass, Telemetry Cockpit)
+    into a dedicated floating multi-monitor window and re-docking on close.
+    """
+    closed = pyqtSignal()
+
+    def __init__(self, title, widget, original_parent_layout, original_tab_idx, main_app, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"CEMA Tactical - {title}")
+        self.resize(900, 680)
+        self.widget = widget
+        self.original_layout = original_parent_layout
+        self.original_tab_idx = original_tab_idx
+        self.main_app = main_app
+        
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(6, 6, 6, 6)
+        
+        # Header bar with Re-dock button
+        bar = QWidget()
+        bar_layout = QHBoxLayout(bar)
+        bar_layout.setContentsMargins(4, 2, 4, 2)
+        
+        title_lbl = QLabel(f"[ DETACHED VIEW: {title.upper()} ]")
+        title_lbl.setStyleSheet("color: #38bdf8; font-weight: bold; font-family: monospace; font-size: 12px;")
+        
+        dock_btn = QPushButton("DOCK BACK")
+        dock_btn.setStyleSheet("background-color: #1e293b; color: #38bdf8; border: 1px solid #0284c7; font-weight: bold; padding: 4px 12px; border-radius: 4px;")
+        dock_btn.clicked.connect(self.dock_back)
+        
+        bar_layout.addWidget(title_lbl)
+        bar_layout.addStretch()
+        bar_layout.addWidget(dock_btn)
+        
+        layout.addWidget(bar)
+        layout.addWidget(widget)
+        self.setCentralWidget(container)
+        
+        self.setStyleSheet("""
+            QMainWindow, QWidget { background-color: #0b0f19; color: #e2e8f0; font-family: 'Consolas', monospace; }
+            QPushButton { background-color: #1e293b; color: #38bdf8; border: 1px solid #334155; padding: 4px; }
+        """)
+
+    def dock_back(self):
+        self.close()
+
+    def closeEvent(self, event):
+        if self.widget and self.original_layout:
+            self.widget.setParent(None)
+            self.original_layout.addWidget(self.widget)
+            if self.main_app and hasattr(self.main_app, 'sidebar_tabs'):
+                self.main_app.sidebar_tabs.setCurrentIndex(self.original_tab_idx)
+        self.closed.emit()
+        event.accept()
+
+
+def calculate_cep_triangulation(bearing_records):
+    """
+    Computes optimal emitter fix and 95% Circular Error Probable (CEP)
+    from a collection of bearing observations: [(lat, lon, bearing_deg, weight), ...]
+    Using weighted least-squares line-of-bearing intersection.
+    """
+    if not bearing_records or len(bearing_records) < 2:
+        return None
+    
+    lats = [r[0] for r in bearing_records]
+    lons = [r[1] for r in bearing_records]
+    lat0 = sum(lats) / len(lats)
+    lon0 = sum(lons) / len(lons)
+    
+    R = 6378137.0
+    lat0_rad = math.radians(lat0)
+    
+    A = []
+    b = []
+    for r_lat, r_lon, brng_deg, conf in bearing_records:
+        x_obs = math.radians(r_lon - lon0) * R * math.cos(lat0_rad)
+        y_obs = math.radians(r_lat - lat0) * R
+        theta_rad = math.radians(brng_deg)
+        c = math.cos(theta_rad)
+        s = math.sin(theta_rad)
+        w = max(0.1, conf / 100.0)
+        A.append([c * w, -s * w])
+        b.append((c * x_obs - s * y_obs) * w)
+        
+    A = np.array(A)
+    b = np.array(b)
+    
+    try:
+        ATA = A.T @ A
+        if np.linalg.cond(ATA) > 1e6:
+            return None
+            
+        cov = np.linalg.inv(ATA)
+        pos = cov @ A.T @ b
+        x_est, y_est = pos[0], pos[1]
+        
+        t_lon = lon0 + math.degrees(x_est / (R * math.cos(lat0_rad)))
+        t_lat = lat0 + math.degrees(y_est / R)
+        
+        eigvals = np.linalg.eigvals(cov)
+        sigma1 = math.sqrt(max(1.0, float(np.real(eigvals[0]))))
+        sigma2 = math.sqrt(max(1.0, float(np.real(eigvals[1]))))
+        cep_meters = 0.59 * (sigma1 + sigma2) * 1.5
+        
+        return {
+            "lat": float(t_lat),
+            "lon": float(t_lon),
+            "cep_meters": float(max(5.0, min(10000.0, cep_meters))),
+            "num_fixes": len(bearing_records)
+        }
+    except Exception:
+        return None
+
+
+class TacticalSettingsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("CEMA Hardware & System Configuration")
+        self.resize(650, 480)
+        self.parent_app = parent
+        self.settings = load_app_settings()
+        self.setup_ui()
+
+    def setup_ui(self):
+        self.setStyleSheet("""
+            QDialog { background-color: #0b0f19; color: #e2e8f0; font-family: 'Consolas', monospace; }
+            QTabWidget::pane { border: 1px solid #1e293b; border-radius: 6px; background-color: #0b0f19; }
+            QTabBar::tab { background-color: #0f172a; color: #94a3b8; padding: 8px 16px; border: 1px solid #1e293b; border-top-left-radius: 6px; border-top-right-radius: 6px; font-weight: bold; }
+            QTabBar::tab:selected { background-color: #1e293b; color: #38bdf8; border-bottom: 2px solid #38bdf8; }
+            QGroupBox { color: #38bdf8; border: 1px solid #1e293b; margin-top: 10px; padding-top: 10px; background-color: #0b0f19; font-weight: bold; border-radius: 6px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
+            QLabel { color: #cbd5e1; font-weight: bold; }
+            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox { background-color: #0f172a; color: #38bdf8; border: 1px solid #334155; border-radius: 4px; padding: 5px; font-weight: bold; }
+            QPushButton { background-color: #1e293b; color: #cbd5e1; border: 1px solid #334155; padding: 6px 14px; font-weight: bold; border-radius: 4px; }
+            QPushButton:hover { background-color: #334155; color: white; border: 1px solid #38bdf8; }
+            QCheckBox { color: #cbd5e1; font-weight: bold; }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        # Tab Widget
+        tabs = QTabWidget()
+
+        # --- TAB 1: KRAKEN SDR ---
+        kraken_tab = QWidget()
+        k_layout = QVBoxLayout(kraken_tab)
+        k_grp = QGroupBox("KrakenSDR Server & Hardware Settings")
+        k_grid = QGridLayout(k_grp)
+
+        self.k_host = QLineEdit(str(self.settings.get("kraken_host", "127.0.0.1")))
+        self.k_api_port = QSpinBox()
+        self.k_api_port.setRange(1, 65535)
+        self.k_api_port.setValue(int(self.settings.get("kraken_api_port", 8080)))
+
+        self.k_doa_port = QSpinBox()
+        self.k_doa_port.setRange(1, 65535)
+        self.k_doa_port.setValue(int(self.settings.get("kraken_doa_port", 8081)))
+
+        self.k_wsl_path = QLineEdit(str(self.settings.get("kraken_wsl_path", r"\\wsl.localhost\Ubuntu\home\feeka\krakensdr_doa\krakensdr_doa\_share")))
+
+        self.k_arr_combo = QComboBox()
+        self.k_arr_combo.addItems(["Uniform Circular Array (UCA)", "Uniform Linear Array (ULA)"])
+        self.k_arr_combo.setCurrentText(str(self.settings.get("kraken_default_arr", "Uniform Circular Array (UCA)")))
+
+        self.k_radius = QDoubleSpinBox()
+        self.k_radius.setRange(0.01, 5.0)
+        self.k_radius.setDecimals(3)
+        self.k_radius.setSingleStep(0.005)
+        self.k_radius.setSuffix(" m")
+        self.k_radius.setValue(float(self.settings.get("kraken_default_radius", 0.135)))
+
+        self.k_gain = QDoubleSpinBox()
+        self.k_gain.setRange(0.0, 49.6)
+        self.k_gain.setSingleStep(1.0)
+        self.k_gain.setSuffix(" dB")
+        self.k_gain.setValue(float(self.settings.get("kraken_default_gain", 30.0)))
+
+        k_grid.addWidget(QLabel("Server Host / IP:"), 0, 0)
+        k_grid.addWidget(self.k_host, 0, 1)
+        k_grid.addWidget(QLabel("REST API Port:"), 1, 0)
+        k_grid.addWidget(self.k_api_port, 1, 1)
+        k_grid.addWidget(QLabel("DoA Stream Port:"), 2, 0)
+        k_grid.addWidget(self.k_doa_port, 2, 1)
+        k_grid.addWidget(QLabel("WSL Shared Dir:"), 3, 0)
+        k_grid.addWidget(self.k_wsl_path, 3, 1)
+        k_grid.addWidget(QLabel("Default Array:"), 4, 0)
+        k_grid.addWidget(self.k_arr_combo, 4, 1)
+        k_grid.addWidget(QLabel("Default Radius:"), 5, 0)
+        k_grid.addWidget(self.k_radius, 5, 1)
+        k_grid.addWidget(QLabel("Default Tuner Gain:"), 6, 0)
+        k_grid.addWidget(self.k_gain, 6, 1)
+
+        k_layout.addWidget(k_grp)
+
+        k_svc_box = QGroupBox("Daemon & Hardware Service Controls")
+        k_svc_layout = QHBoxLayout(k_svc_box)
+        
+        k_start_btn = QPushButton("Start")
+        k_start_btn.clicked.connect(lambda: self.parent_app.start_kraken_service() if self.parent_app else None)
+        
+        k_stop_btn = QPushButton("Stop")
+        k_stop_btn.clicked.connect(lambda: self.parent_app.stop_kraken_service() if self.parent_app else None)
+        
+        k_restart_btn = QPushButton("Restart")
+        k_restart_btn.clicked.connect(lambda: self.parent_app.restart_kraken_service() if self.parent_app else None)
+        
+        k_repair_btn = QPushButton("Auto-Repair & Fix")
+        k_repair_btn.setStyleSheet("background-color: #0284c7; color: white; font-weight: bold; border: 1px solid #38bdf8;")
+        k_repair_btn.clicked.connect(lambda: self.parent_app.repair_kraken_sdr() if self.parent_app else None)
+        
+        k_attach_btn = QPushButton("Attach USB")
+        k_attach_btn.clicked.connect(lambda: self.parent_app.attach_kraken_usb() if self.parent_app else None)
+
+        k_svc_layout.addWidget(k_start_btn)
+        k_svc_layout.addWidget(k_stop_btn)
+        k_svc_layout.addWidget(k_restart_btn)
+        k_svc_layout.addWidget(k_repair_btn)
+        k_svc_layout.addWidget(k_attach_btn)
+        
+        k_layout.addWidget(k_svc_box)
+        k_layout.addStretch()
+        tabs.addTab(kraken_tab, "Kraken SDR")
+
+        # --- TAB 2: HELTEC LORA ---
+        heltec_tab = QWidget()
+        h_layout = QVBoxLayout(heltec_tab)
+        h_grp = QGroupBox("Heltec WiFi LoRa 32 V3 Sniffer Interface")
+        h_grid = QGridLayout(h_grp)
+
+        self.h_port_combo = QComboBox()
+        self.refresh_com_ports()
+        
+        self.h_refresh_btn = QPushButton("Refresh Ports")
+        self.h_refresh_btn.clicked.connect(self.refresh_com_ports)
+
+        port_row_widget = QWidget()
+        port_row_layout = QHBoxLayout(port_row_widget)
+        port_row_layout.setContentsMargins(0, 0, 0, 0)
+        port_row_layout.addWidget(self.h_port_combo, 1)
+        port_row_layout.addWidget(self.h_refresh_btn)
+
+        self.h_baud = QComboBox()
+        self.h_baud.addItems(["115200", "921600", "57600", "38400", "9600"])
+        self.h_baud.setCurrentText(str(self.settings.get("heltec_baud", 115200)))
+
+        self.h_rate = QComboBox()
+        self.h_rate.addItems([
+            "Auto-Detect (Dynamic Auto-Rate Scanning)",
+            "50 Hz (Standard 915MHz - SF8 / 20ms)",
+            "25 Hz (Long Range - SF9 / 40ms)",
+            "100 Hz (Standard 8ch - SF7 / 10ms)",
+            "100 Hz Full (16ch Full Res - SF7 / 10ms)",
+            "D50 (Déjà Vu 50Hz - SF7 / 10ms)",
+            "150 Hz (SF7 / 6.6ms)",
+            "200 Hz (SF6 / 5ms)",
+            "250 Hz (SF6 / 4ms)",
+            "333 Hz Full (16ch Full Res - SF5 / 3ms)"
+        ])
+        self.h_rate.setCurrentIndex(int(self.settings.get("heltec_rate_idx", 0)))
+
+        self.h_auto_reconnect = QCheckBox("Auto-reconnect on USB disconnect")
+        self.h_auto_reconnect.setChecked(bool(self.settings.get("heltec_auto_reconnect", True)))
+
+        h_grid.addWidget(QLabel("Serial COM Port:"), 0, 0)
+        h_grid.addWidget(port_row_widget, 0, 1)
+        h_grid.addWidget(QLabel("Serial Baud Rate:"), 1, 0)
+        h_grid.addWidget(self.h_baud, 1, 1)
+        h_grid.addWidget(QLabel("Startup Packet Rate:"), 2, 0)
+        h_grid.addWidget(self.h_rate, 2, 1)
+        h_grid.addWidget(self.h_auto_reconnect, 3, 0, 1, 2)
+
+        h_layout.addWidget(h_grp)
+        h_layout.addStretch()
+        tabs.addTab(heltec_tab, "Heltec Sniffer")
+
+        # --- TAB 3: TACTICAL MAP ---
+        map_tab = QWidget()
+        m_layout = QVBoxLayout(map_tab)
+        m_grp = QGroupBox("Tactical Map, Geolocation & Bearing History")
+        m_grid = QGridLayout(m_grp)
+
+        self.m_provider = QComboBox()
+        self.m_provider.addItems([
+            "CartoDB Dark Matter (Tactical)",
+            "OpenStreetMap Standard",
+            "CartoDB Positron (Light)",
+            "ESRI World Imagery (Satellite)"
+        ])
+        self.m_provider.setCurrentText(str(self.settings.get("map_provider", "CartoDB Dark Matter (Tactical)")))
+
+        self.m_lat = QDoubleSpinBox()
+        self.m_lat.setRange(-90.0, 90.0)
+        self.m_lat.setDecimals(5)
+        self.m_lat.setValue(float(self.settings.get("map_home_lat", 51.5074)))
+
+        self.m_lon = QDoubleSpinBox()
+        self.m_lon.setRange(-180.0, 180.0)
+        self.m_lon.setDecimals(5)
+        self.m_lon.setValue(float(self.settings.get("map_home_lon", -0.1278)))
+
+        self.m_breadcrumbs = QSpinBox()
+        self.m_breadcrumbs.setRange(10, 1000)
+        self.m_breadcrumbs.setValue(int(self.settings.get("map_breadcrumbs_max", 100)))
+
+        self.m_bearing_trail = QSpinBox()
+        self.m_bearing_trail.setRange(10, 500)
+        self.m_bearing_trail.setValue(int(self.settings.get("map_bearing_trail_max", 50)))
+
+        m_grid.addWidget(QLabel("Base Map Layer:"), 0, 0)
+        m_grid.addWidget(self.m_provider, 0, 1)
+        m_grid.addWidget(QLabel("Home Latitude:"), 1, 0)
+        m_grid.addWidget(self.m_lat, 1, 1)
+        m_grid.addWidget(QLabel("Home Longitude:"), 2, 0)
+        m_grid.addWidget(self.m_lon, 2, 1)
+        m_grid.addWidget(QLabel("Max Drone Breadcrumbs:"), 3, 0)
+        m_grid.addWidget(self.m_breadcrumbs, 3, 1)
+        m_grid.addWidget(QLabel("Max Bearing Lines:"), 4, 0)
+        m_grid.addWidget(self.m_bearing_trail, 4, 1)
+
+        m_layout.addWidget(m_grp)
+        m_layout.addStretch()
+        tabs.addTab(map_tab, "Map & Tracking")
+
+        # --- TAB 4: UI & GENERAL ---
+        ui_tab = QWidget()
+        u_layout = QVBoxLayout(ui_tab)
+        u_grp = QGroupBox("User Interface & Telemetry Preferences")
+        u_grid = QGridLayout(u_grp)
+
+        self.u_theme = QComboBox()
+        self.u_theme.addItems(["Cyberpunk Tactical Dark", "Stealth Minimalist"])
+        self.u_theme.setCurrentText(str(self.settings.get("ui_theme", "Cyberpunk Tactical Dark")))
+
+        self.u_fps = QSpinBox()
+        self.u_fps.setRange(10, 60)
+        self.u_fps.setValue(int(self.settings.get("ui_fps_target", 30)))
+        self.u_fps.setSuffix(" FPS")
+
+        self.u_audio = QCheckBox("Enable Audible Proximity / Maneuver Alert Chimes")
+        self.u_audio.setChecked(bool(self.settings.get("audio_alerts", False)))
+
+        self.u_log_dir = QLineEdit(str(self.settings.get("log_dir", "./cema_logs")))
+
+        u_grid.addWidget(QLabel("Theme Palette:"), 0, 0)
+        u_grid.addWidget(self.u_theme, 0, 1)
+        u_grid.addWidget(QLabel("GUI Target FPS:"), 1, 0)
+        u_grid.addWidget(self.u_fps, 1, 1)
+        u_grid.addWidget(self.u_audio, 2, 0, 1, 2)
+        u_grid.addWidget(QLabel("Log Directory:"), 3, 0)
+        u_grid.addWidget(self.u_log_dir, 3, 1)
+
+        u_layout.addWidget(u_grp)
+        u_layout.addStretch()
+        tabs.addTab(ui_tab, "UI & General")
+
+        layout.addWidget(tabs)
+
+        # Bottom Buttons
+        btn_layout = QHBoxLayout()
+        reset_btn = QPushButton("Reset Defaults")
+        reset_btn.clicked.connect(self.reset_defaults)
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+
+        save_btn = QPushButton("Save & Apply")
+        save_btn.setStyleSheet("background-color: #0284c7; color: white; font-weight: bold; border: 1px solid #38bdf8;")
+        save_btn.clicked.connect(self.save_and_apply)
+
+        btn_layout.addWidget(reset_btn)
+        btn_layout.addStretch()
+        btn_layout.addWidget(cancel_btn)
+        btn_layout.addWidget(save_btn)
+        layout.addLayout(btn_layout)
+
+    def refresh_com_ports(self):
+        ports = get_available_com_ports()
+        self.h_port_combo.clear()
+        self.h_port_combo.addItems(ports)
+        saved_port = self.settings.get("heltec_port", "COM6")
+        idx = self.h_port_combo.findText(saved_port)
+        if idx >= 0:
+            self.h_port_combo.setCurrentIndex(idx)
+
+    def reset_defaults(self):
+        self.settings = DEFAULT_SETTINGS.copy()
+        self.k_host.setText(self.settings["kraken_host"])
+        self.k_api_port.setValue(self.settings["kraken_api_port"])
+        self.k_doa_port.setValue(self.settings["kraken_doa_port"])
+        self.k_wsl_path.setText(self.settings["kraken_wsl_path"])
+        self.k_arr_combo.setCurrentText(self.settings["kraken_default_arr"])
+        self.k_radius.setValue(self.settings["kraken_default_radius"])
+        self.k_gain.setValue(self.settings["kraken_default_gain"])
+        self.h_baud.setCurrentText(str(self.settings["heltec_baud"]))
+        self.h_rate.setCurrentIndex(self.settings["heltec_rate_idx"])
+        self.h_auto_reconnect.setChecked(self.settings["heltec_auto_reconnect"])
+        self.m_provider.setCurrentText(self.settings["map_provider"])
+        self.m_lat.setValue(self.settings["map_home_lat"])
+        self.m_lon.setValue(self.settings["map_home_lon"])
+        self.m_breadcrumbs.setValue(self.settings["map_breadcrumbs_max"])
+        self.m_bearing_trail.setValue(self.settings["map_bearing_trail_max"])
+        self.u_theme.setCurrentText(self.settings["ui_theme"])
+        self.u_fps.setValue(self.settings["ui_fps_target"])
+        self.u_audio.setChecked(self.settings["audio_alerts"])
+        self.u_log_dir.setText(self.settings["log_dir"])
+
+    def save_and_apply(self):
+        updated = {
+            "kraken_host": self.k_host.text().strip(),
+            "kraken_api_port": self.k_api_port.value(),
+            "kraken_doa_port": self.k_doa_port.value(),
+            "kraken_wsl_path": self.k_wsl_path.text().strip(),
+            "kraken_default_arr": self.k_arr_combo.currentText(),
+            "kraken_default_radius": self.k_radius.value(),
+            "kraken_default_gain": self.k_gain.value(),
+            "heltec_port": self.h_port_combo.currentText(),
+            "heltec_baud": int(self.h_baud.currentText()),
+            "heltec_rate_idx": self.h_rate.currentIndex(),
+            "heltec_auto_reconnect": self.h_auto_reconnect.isChecked(),
+            "map_provider": self.m_provider.currentText(),
+            "map_home_lat": self.m_lat.value(),
+            "map_home_lon": self.m_lon.value(),
+            "map_breadcrumbs_max": self.m_breadcrumbs.value(),
+            "map_bearing_trail_max": self.m_bearing_trail.value(),
+            "ui_theme": self.u_theme.currentText(),
+            "ui_fps_target": self.u_fps.value(),
+            "audio_alerts": self.u_audio.isChecked(),
+            "log_dir": self.u_log_dir.text().strip()
+        }
+        save_app_settings(updated)
+        if self.parent_app and hasattr(self.parent_app, "apply_runtime_settings"):
+            self.parent_app.apply_runtime_settings(updated)
+        self.accept()
+
+
 # --- Main App ---
 class CEMAApp(QMainWindow):
+    kraken_health_signal = pyqtSignal(str, str, str) # msg, color, border
+    copilot_response_signal = pyqtSignal(str, str)   # prompt, response
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("CEMA RF Tracking [HackRF + Heltec V3]")
         self.resize(1300, 850)
         
+        self.settings = load_app_settings()
         self.hackrf_thread = None
         self.heltec_thread = None
         self.floating_video_window = None
         
         self.setup_ui()
+        self.kraken_health_signal.connect(self._on_kraken_health_updated)
+        self.copilot_response_signal.connect(self._on_copilot_response_received)
+
+        self._fingerprints_dirty = False
+        self._topology_dirty = False
+        self.disk_flush_timer = QTimer()
+        self.disk_flush_timer.timeout.connect(self.flush_dirty_state_to_disk)
+        self.disk_flush_timer.start(4000)
         
         self.poll_timer = QTimer()
         self.poll_timer.timeout.connect(self.poll_data)
@@ -1089,46 +2089,230 @@ class CEMAApp(QMainWindow):
         self.clock_timer.timeout.connect(self.update_clock)
         self.clock_timer.start(1000)
 
+        self.kraken_health_timer = QTimer()
+        self.kraken_health_timer.timeout.connect(self.check_kraken_health)
+        self.kraken_health_timer.start(10000)
+        QTimer.singleShot(1500, self.check_kraken_health)
+
         self.start_sdr()
         self.start_heltec()
 
     def setup_ui(self):
         self.setStyleSheet("""
             QWidget {
-                background-color: #0b0f19;
+                background-color: #070a13;
                 color: #e2e8f0;
-                font-family: 'Consolas', 'Courier New', monospace;
-                font-size: 11px;
+                font-family: 'Consolas', 'Segoe UI', 'Courier New', monospace;
+                font-size: 10pt;
             }
-            QToolTip { background-color: #0f172a; color: #38bdf8; border: 1px solid #0284c7; padding: 5px; font-family: 'Consolas', monospace; font-size: 13px; }
-            QMainWindow { background-color: #0b0f19; }
-            QLabel { color: #cbd5e1; font-weight: bold; font-family: 'Consolas', 'Courier New', monospace; font-size: 12px; background-color: transparent; }
-            QDoubleSpinBox, QSpinBox, QLineEdit { background-color: #0f172a; color: #38bdf8; border: 1px solid #334155; border-radius: 4px; padding: 6px; font-family: 'Consolas', monospace; font-size: 13px; font-weight: bold; }
-            QDoubleSpinBox:focus, QSpinBox:focus, QLineEdit:focus { border: 1px solid #38bdf8; }
-            QPushButton { background-color: #1e293b; color: #cbd5e1; border: 1px solid #334155; padding: 8px 16px; font-weight: bold; font-family: 'Consolas', monospace; border-radius: 6px; }
-            QPushButton:hover { background-color: #334155; color: white; border: 1px solid #38bdf8; }
-            QPushButton:checked { background-color: #0284c7; border: 1px solid #38bdf8; color: white; }
-            QGroupBox { color: #38bdf8; border: 1px solid #1e293b; margin-top: 12px; background-color: #0b0f19; font-family: 'Consolas', monospace; border-radius: 8px; font-weight: bold; font-size: 13px; }
-            QGroupBox::title { subcontrol-origin: margin; left: 15px; padding: 0 5px 0 5px; color: #38bdf8; }
-            QListWidget { background-color: #0f172a; color: #38bdf8; font-family: 'Consolas', monospace; border: 1px solid #1e293b; border-radius: 6px; padding: 5px; font-size: 13px; outline: none; }
-            QListWidget::item:selected { background-color: #1e293b; color: #38bdf8; }
-            QTextEdit { background-color: #0f172a; color: #10b981; font-family: 'Consolas', monospace; border: 1px solid #1e293b; border-radius: 6px; padding: 5px; font-size: 13px; }
-            QComboBox { background-color: #0f172a; color: #f59e0b; font-weight: bold; padding: 6px; border: 1px solid #334155; border-radius: 4px; font-family: 'Consolas', monospace; }
-            QTabWidget::pane { border: 1px solid #1e293b; border-radius: 6px; }
-            QTabBar::tab { background-color: #0f172a; color: #94a3b8; padding: 10px 20px; border: 1px solid #1e293b; border-top-left-radius: 6px; border-top-right-radius: 6px; font-weight: bold; }
-            QTabBar::tab:selected { background-color: #1e293b; color: #38bdf8; border-bottom: 2px solid #38bdf8; }
-            QSlider::groove:horizontal { border: 1px solid #334155; height: 6px; background: #0f172a; border-radius: 3px; }
-            QSlider::handle:horizontal { background: #38bdf8; border: 1px solid #0284c7; width: 14px; margin: -4px 0; border-radius: 7px; }
+            QToolTip {
+                background-color: #0f172a;
+                color: #38bdf8;
+                border: 1px solid #0284c7;
+                padding: 6px;
+                font-family: 'Consolas', monospace;
+                font-size: 10pt;
+                border-radius: 4px;
+            }
+            QMainWindow { background-color: #070a13; }
+            QLabel {
+                color: #cbd5e1;
+                font-weight: bold;
+                font-family: 'Consolas', 'Segoe UI', monospace;
+                font-size: 10pt;
+                background-color: transparent;
+            }
+            QDoubleSpinBox, QSpinBox, QLineEdit {
+                background-color: #0f172a;
+                color: #38bdf8;
+                border: 1px solid #334155;
+                border-radius: 4px;
+                padding: 4px 6px;
+                font-family: 'Consolas', monospace;
+                font-size: 10pt;
+                font-weight: bold;
+            }
+            QDoubleSpinBox:focus, QSpinBox:focus, QLineEdit:focus {
+                border: 1px solid #38bdf8;
+                background-color: #131d35;
+            }
+            QPushButton {
+                background-color: #1e293b;
+                color: #cbd5e1;
+                border: 1px solid #334155;
+                padding: 5px 10px;
+                font-weight: bold;
+                font-family: 'Consolas', monospace;
+                border-radius: 4px;
+                font-size: 10pt;
+            }
+            QPushButton:hover {
+                background-color: #334155;
+                color: #f8fafc;
+                border: 1px solid #38bdf8;
+            }
+            QPushButton:checked {
+                background-color: #0284c7;
+                border: 1px solid #38bdf8;
+                color: #ffffff;
+            }
+            QGroupBox {
+                color: #38bdf8;
+                border: 1px solid #1e293b;
+                margin-top: 10px;
+                background-color: #0b0f19;
+                font-family: 'Consolas', monospace;
+                border-radius: 6px;
+                font-weight: bold;
+                font-size: 10pt;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px 0 5px;
+                color: #38bdf8;
+            }
+            QListWidget, QTreeWidget {
+                background-color: #0b0f19;
+                color: #38bdf8;
+                font-family: 'Consolas', monospace;
+                border: 1px solid #1e293b;
+                border-radius: 4px;
+                padding: 4px;
+                font-size: 10pt;
+                outline: none;
+            }
+            QListWidget::item:selected, QTreeWidget::item:selected {
+                background-color: #1e293b;
+                color: #38bdf8;
+                border-radius: 2px;
+            }
+            QTextEdit {
+                background-color: #0b0f19;
+                color: #10b981;
+                font-family: 'Consolas', monospace;
+                border: 1px solid #1e293b;
+                border-radius: 4px;
+                padding: 5px;
+                font-size: 10pt;
+            }
+            QComboBox {
+                background-color: #0f172a;
+                color: #f59e0b;
+                font-weight: bold;
+                padding: 4px 6px;
+                border: 1px solid #334155;
+                border-radius: 4px;
+                font-family: 'Consolas', monospace;
+                font-size: 10pt;
+            }
+            QComboBox:hover {
+                border: 1px solid #f59e0b;
+            }
+            QTabWidget::pane {
+                border: 1px solid #1e293b;
+                border-radius: 4px;
+                background-color: #0b0f19;
+            }
+            QTabBar::tab {
+                background-color: #0f172a;
+                color: #94a3b8;
+                padding: 6px 12px;
+                border: 1px solid #1e293b;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+                font-weight: bold;
+                font-size: 9.5pt;
+            }
+            QTabBar::tab:selected {
+                background-color: #1e293b;
+                color: #38bdf8;
+                border-bottom: 2px solid #38bdf8;
+            }
+            QTabBar::tab:hover:!selected {
+                color: #e2e8f0;
+                background-color: #162032;
+            }
+            QSlider::groove:horizontal {
+                border: 1px solid #334155;
+                height: 6px;
+                background: #0f172a;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: #38bdf8;
+                border: 1px solid #0284c7;
+                width: 14px;
+                margin: -4px 0;
+                border-radius: 7px;
+            }
+            QSlider::handle:horizontal:hover {
+                background: #7dd3fc;
+            }
+            QScrollBar:vertical {
+                background: #070a13;
+                width: 8px;
+                margin: 0px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:vertical {
+                background: #334155;
+                min-height: 20px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #38bdf8;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+            QScrollBar:horizontal {
+                background: #070a13;
+                height: 8px;
+                margin: 0px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:horizontal {
+                background: #334155;
+                min-width: 20px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: #38bdf8;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
+            }
+            QTableWidget {
+                background-color: #0b0f19;
+                alternate-background-color: #0f172a;
+                gridline-color: #1e293b;
+                border: 1px solid #1e293b;
+                color: #e2e8f0;
+                selection-background-color: #1e293b;
+                selection-color: #38bdf8;
+                font-family: 'Consolas', monospace;
+            }
+            QHeaderView::section {
+                background-color: #0f172a;
+                color: #38bdf8;
+                font-weight: bold;
+                font-family: 'Consolas', monospace;
+                padding: 4px 6px;
+                border: 1px solid #1e293b;
+            }
         """)
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
 
-        # Control Panel
-        control_group = QGroupBox("SDR Parameters")
-        control_group.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
-        control_layout = QHBoxLayout()
+        # Control Panel (Responsive 2-Row Grid)
+        control_group = QGroupBox("SDR & Hardware Parameters")
+        control_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        control_layout = QGridLayout(control_group)
+        control_layout.setContentsMargins(6, 4, 6, 4)
+        control_layout.setSpacing(6)
         
         self.mode_selector = QComboBox()
         self.mode_selector.addItems(["STARE MODE (2MHz)", "SWEEP MODE (Wideband)"])
@@ -1158,6 +2342,29 @@ class CEMAApp(QMainWindow):
         self.sweep_end_input.setDecimals(1)
         self.sweep_end_input.hide()
         self.sweep_end_input.setToolTip("End Frequency of the Wideband Sweep (MHz).")
+
+        self.sweep_bin_label = QLabel("Bin Res:")
+        self.sweep_bin_combo = QComboBox()
+        self.sweep_bin_combo.addItems([
+            "100 kHz (High-Res)",
+            "250 kHz (High-Res)",
+            "500 kHz (Balanced)",
+            "1 MHz (Default)",
+            "2 MHz (Turbo)",
+            "5 MHz (Ultra)"
+        ])
+        self.sweep_bin_combo.setCurrentText("1 MHz (Default)")
+        self.sweep_bin_combo.currentIndexChanged.connect(self.on_sweep_bin_changed)
+        self.sweep_bin_combo.setToolTip("Wideband Sweep FFT Bin Resolution (-w parameter for hackrf_sweep).")
+        self.sweep_bin_label.hide()
+        self.sweep_bin_combo.hide()
+        self.sweep_bin_width_hz = 1000000
+
+        self.palette_combo = QComboBox()
+        self.palette_combo.addItems(list(TACTICAL_COLORMAPS.keys()))
+        self.palette_combo.setCurrentText("Inferno (Default)")
+        self.palette_combo.currentTextChanged.connect(self.on_palette_changed)
+        self.palette_combo.setToolTip("Tactical Waterfall Color Palette.")
         
         self.lna_input = QSpinBox()
         self.lna_input.setRange(0, 40)
@@ -1172,100 +2379,163 @@ class CEMAApp(QMainWindow):
         self.vga_input.setToolTip("VGA Gain (IF Gain): Fine-tunes the signal strength before digital conversion.")
         
         self.apply_btn = QPushButton("APPLY / RESTART")
+        self.apply_btn.setStyleSheet("background-color: #1e293b; color: #38bdf8; border: 1px solid #38bdf8; font-weight: bold; border-radius: 4px; padding: 5px 10px;")
         self.apply_btn.clicked.connect(self.start_sdr)
         self.apply_btn.setToolTip("Restart the SDR with the new parameters.")
         
         self.mask_mode_btn = QPushButton("MASK MODE: OFF")
         self.mask_mode_btn.setCheckable(True)
-        self.mask_mode_btn.setStyleSheet("background-color: #475569; color: white;")
+        self.mask_mode_btn.setStyleSheet("background-color: #475569; color: white; border-radius: 4px; padding: 5px 10px;")
         self.mask_mode_btn.toggled.connect(self.toggle_mask_mode)
-        self.mask_mode_btn.setToolTip("ON: Left-click and drag on the FFT to draw a grey mask over continuous signals to ignore them.\nOFF: Left-click and drag to pan the spectrum.")
+        self.mask_mode_btn.setToolTip("ON: Left-click and drag on the FFT to draw a grey mask over continuous signals to ignore them.\nOFF: Left-click and drag to pan the spectrum (Shortcut: Ctrl+M).")
         
         self.decode_video_btn = QPushButton(" DECODE FPV VIDEO")
         self.decode_video_btn.setCheckable(True)
-        self.decode_video_btn.setStyleSheet("background-color: #475569; color: white;")
+        self.decode_video_btn.setStyleSheet("background-color: #475569; color: white; border-radius: 4px; padding: 5px 10px;")
         self.decode_video_btn.toggled.connect(self.toggle_video_mode)
-        self.decode_video_btn.setToolTip("Decodes 5.8GHz Analog FPV signals by ripping the raw 20MS/s FM phase array and slicing it via HSync matrix reshaping into a CRT video frame.")
+        self.decode_video_btn.setToolTip("Decodes 5.8GHz Analog FPV signals by ripping the raw 20MS/s FM phase array and slicing it via HSync matrix reshaping into a CRT video frame (Shortcut: Ctrl+V).")
         
         self.toggle_sidebar_btn = QPushButton(" SIDEBAR")
+        self.toggle_sidebar_btn.setStyleSheet("background-color: #1e293b; color: #cbd5e1; border: 1px solid #334155; border-radius: 4px; padding: 5px 10px;")
         self.toggle_sidebar_btn.clicked.connect(self.toggle_sidebar)
-        self.toggle_sidebar_btn.setToolTip("Hide or show the Intelligence Sidebar.")
+        self.toggle_sidebar_btn.setToolTip("Hide or show the Intelligence Sidebar (Shortcut: Ctrl+B).")
         
         self.wf_sens_slider = QSlider(Qt.Orientation.Horizontal)
         self.wf_sens_slider.setRange(1, 255)
         self.wf_sens_slider.setValue(120)
-        self.wf_sens_slider.setFixedWidth(120)
+        self.wf_sens_slider.setFixedWidth(80)
         self.wf_sens_slider.setToolTip("Waterfall Sensitivity: Slide left to make faint signals visible, slide right to reduce noise floor clutter.")
         
-        self.freeze_btn = QPushButton(" FREEZE")
-        self.freeze_btn.setCheckable(True)
-        self.freeze_btn.setStyleSheet("background-color: #475569; color: white;")
-        self.freeze_btn.toggled.connect(self.toggle_freeze)
-        self.freeze_btn.setToolTip("Freeze the display updates so you can analyze the waterfall and spectrum without it moving.")
-        
         self.clock_label = QLabel("00:00:00Z")
-        self.clock_label.setStyleSheet("color: #10b981; font-size: 16px; font-weight: bold; background: #111; padding: 4px; border: 1px solid #222; border-radius: 4px;")
+        self.clock_label.setStyleSheet("color: #10b981; font-size: 11pt; font-weight: bold; background: #111; padding: 3px 6px; border: 1px solid #222; border-radius: 4px;")
         self.clock_label.setToolTip("ZULU (UTC) Time")
         
         self.mod_label = QLabel("Modulation: UNKNOWN")
-        self.mod_label.setStyleSheet("color: #fbbf24; font-size: 16px; font-weight: bold;")
+        self.mod_label.setStyleSheet("color: #fbbf24; font-size: 11pt; font-weight: bold;")
 
-        control_layout.addWidget(QLabel("Mode:"))
-        control_layout.addWidget(self.mode_selector)
-        control_layout.addSpacing(10)
-        
-        self.freq_label = QLabel("Center Freq:")
-        control_layout.addWidget(self.freq_label)
-        control_layout.addWidget(self.freq_input)
-        control_layout.addWidget(self.sweep_start_input)
-        control_layout.addWidget(self.sweep_end_input)
-        
-        control_layout.addSpacing(10)
-        control_layout.addWidget(QLabel("LNA Gain:"))
-        control_layout.addWidget(self.lna_input)
-        control_layout.addSpacing(10)
-        control_layout.addWidget(QLabel("VGA Gain:"))
-        control_layout.addWidget(self.vga_input)
-        control_layout.addSpacing(10)
-        control_layout.addWidget(self.apply_btn)
-        control_layout.addSpacing(10)
-        control_layout.addWidget(self.mask_mode_btn)
-        control_layout.addWidget(self.decode_video_btn)
-        control_layout.addSpacing(10)
-        control_layout.addWidget(self.toggle_sidebar_btn)
-        control_layout.addSpacing(10)
-        control_layout.addWidget(QLabel("WF Sens:"))
-        control_layout.addWidget(self.wf_sens_slider)
-        control_layout.addSpacing(10)
         self.freeze_btn = QPushButton(" FREEZE")
         self.freeze_btn.setCheckable(True)
-        self.freeze_btn.setStyleSheet("background-color: #475569; color: white;")
+        self.freeze_btn.setStyleSheet("background-color: #475569; color: white; border-radius: 4px; padding: 5px 10px;")
         self.freeze_btn.toggled.connect(self.toggle_freeze)
-        self.freeze_btn.setToolTip("Freeze the display updates so you can analyze the waterfall and spectrum without it moving.")
-        control_layout.addWidget(self.freeze_btn)
-        
-        control_layout.addSpacing(10)
+        self.freeze_btn.setToolTip("Freeze display updates to analyze waterfall/spectrum without motion (Shortcut: Space).")
+
         self.heltec_port_combo = QComboBox()
         self.heltec_port_combo.addItems(get_available_com_ports())
         self.heltec_port_combo.setToolTip("Select COM Port for Heltec WiFi LoRa 32 V3 sniffer.")
-        self.heltec_connect_btn = QPushButton("🚁 HELTEC V3")
-        self.heltec_connect_btn.setStyleSheet("background-color: #1e293b; color: #38bdf8; border: 1px solid #38bdf8;")
+        self.heltec_connect_btn = QPushButton("HELTEC V3")
+        self.heltec_connect_btn.setStyleSheet("background-color: #1e293b; color: #38bdf8; border: 1px solid #38bdf8; border-radius: 4px; padding: 5px 10px;")
         self.heltec_connect_btn.clicked.connect(self.restart_heltec)
         self.heltec_connect_btn.setToolTip("Connect or Reconnect to Heltec WiFi LoRa 32 V3 sniffer hardware.")
-        control_layout.addWidget(self.heltec_port_combo)
-        control_layout.addWidget(self.heltec_connect_btn)
 
-        control_layout.addStretch()
-        control_layout.addWidget(self.mod_label)
-        control_layout.addSpacing(10)
-        control_layout.addWidget(self.clock_label)
-        
-        control_group.setLayout(control_layout)
+        self.settings_btn = QPushButton("SETTINGS")
+        self.settings_btn.setStyleSheet("background-color: #1e293b; color: #38bdf8; border: 1px solid #0284c7; font-weight: bold; border-radius: 4px; padding: 5px 10px;")
+        self.settings_btn.clicked.connect(self.open_settings_dialog)
+        self.settings_btn.setToolTip("Open Centralized Hardware & System Configuration (Shortcut: F1).")
+
+        # Row 0: SDR Tuning & Reception Controls
+        r0 = QHBoxLayout()
+        r0.setContentsMargins(0, 0, 0, 0)
+        r0.setSpacing(6)
+        r0.addWidget(QLabel("Mode:"))
+        r0.addWidget(self.mode_selector)
+        r0.addSpacing(6)
+        self.freq_label = QLabel("Center Freq:")
+        r0.addWidget(self.freq_label)
+        r0.addWidget(self.freq_input)
+        r0.addWidget(self.sweep_start_input)
+        r0.addWidget(self.sweep_end_input)
+        r0.addWidget(self.sweep_bin_label)
+        r0.addWidget(self.sweep_bin_combo)
+        r0.addSpacing(6)
+        r0.addWidget(QLabel("LNA:"))
+        r0.addWidget(self.lna_input)
+        r0.addSpacing(6)
+        r0.addWidget(QLabel("VGA:"))
+        r0.addWidget(self.vga_input)
+        r0.addSpacing(6)
+        r0.addWidget(self.apply_btn)
+        r0.addWidget(self.freeze_btn)
+        r0.addSpacing(6)
+        r0.addWidget(QLabel("WF Sens:"))
+        r0.addWidget(self.wf_sens_slider)
+        r0.addStretch()
+        r0.addWidget(self.mod_label)
+        r0.addSpacing(8)
+        r0.addWidget(self.clock_label)
+        control_layout.addLayout(r0, 0, 0)
+
+        # Row 1: Tactical Modes, Aux Hardware, and System Dialogs
+        r1 = QHBoxLayout()
+        r1.setContentsMargins(0, 0, 0, 0)
+        r1.setSpacing(6)
+        r1.addWidget(self.mask_mode_btn)
+        r1.addWidget(self.decode_video_btn)
+        r1.addWidget(self.toggle_sidebar_btn)
+        r1.addSpacing(6)
+        r1.addWidget(QLabel("Palette:"))
+        r1.addWidget(self.palette_combo)
+        r1.addSpacing(10)
+        r1.addWidget(QLabel("Heltec Port:"))
+        r1.addWidget(self.heltec_port_combo)
+        r1.addWidget(self.heltec_connect_btn)
+        r1.addSpacing(6)
+        r1.addWidget(self.settings_btn)
+        r1.addStretch()
+        control_layout.addLayout(r1, 1, 0)
+
         main_layout.addWidget(control_group)
 
+        # Real-Time Tactical Hardware Telemetry Strip
+        status_bar_frame = QFrame()
+        status_bar_frame.setStyleSheet("background-color: #060913; border: 1px solid #1e293b; border-radius: 4px; padding: 2px;")
+        status_bar_frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        status_bar_frame.setFixedHeight(34)
+        status_bar_layout = QHBoxLayout(status_bar_frame)
+        status_bar_layout.setContentsMargins(6, 2, 6, 2)
+        status_bar_layout.setSpacing(8)
+
+        self.badge_sdr = QLabel("[ SDR: HACKRF ONE (20 MS/s) ]")
+        self.badge_sdr.setStyleSheet("color: #10b981; background: #060e1a; font-family: 'Consolas', monospace; font-size: 9.5pt; font-weight: bold; padding: 2px 8px; border: 1px solid #10b981; border-radius: 3px;")
+
+        self.badge_heltec = QLabel("[ HELTEC V3: STANDBY ]")
+        self.badge_heltec.setStyleSheet("color: #38bdf8; background: #060e1a; font-family: 'Consolas', monospace; font-size: 9.5pt; font-weight: bold; padding: 2px 8px; border: 1px solid #0284c7; border-radius: 3px;")
+
+        self.badge_kraken = QLabel("[ KRAKENSDR: STANDBY ]")
+        self.badge_kraken.setStyleSheet("color: #f59e0b; background: #060e1a; font-family: 'Consolas', monospace; font-size: 9.5pt; font-weight: bold; padding: 2px 8px; border: 1px solid #f59e0b; border-radius: 3px;")
+
+        self.badge_copilot = QLabel("[ AI COPILOT: ONLINE ]")
+        self.badge_copilot.setStyleSheet("color: #a78bfa; background: #060e1a; font-family: 'Consolas', monospace; font-size: 9.5pt; font-weight: bold; padding: 2px 8px; border: 1px solid #7c3aed; border-radius: 3px;")
+
+        status_bar_layout.addWidget(self.badge_sdr)
+        status_bar_layout.addWidget(self.badge_heltec)
+        status_bar_layout.addWidget(self.badge_kraken)
+        status_bar_layout.addWidget(self.badge_copilot)
+        status_bar_layout.addStretch()
+
+        main_layout.addWidget(status_bar_frame)
+
+        # Global Tactical Keyboard Shortcuts
+        QShortcut(QKeySequence("F1"), self, self.open_settings_dialog)
+        QShortcut(QKeySequence("Space"), self, self.freeze_btn.toggle)
+        QShortcut(QKeySequence("Ctrl+M"), self, self.mask_mode_btn.toggle)
+        QShortcut(QKeySequence("Ctrl+V"), self, self.decode_video_btn.toggle)
+        QShortcut(QKeySequence("Ctrl+B"), self, self.toggle_sidebar)
+        QShortcut(QKeySequence("Ctrl+E"), self, self.export_log)
+        QShortcut(QKeySequence("Ctrl+H"), self, lambda: self.sidebar_tabs.setCurrentIndex(7))
+        QShortcut(QKeySequence("Ctrl+1"), self, lambda: self.sidebar_tabs.setCurrentIndex(0))
+        QShortcut(QKeySequence("Ctrl+2"), self, lambda: self.sidebar_tabs.setCurrentIndex(1))
+        QShortcut(QKeySequence("Ctrl+3"), self, lambda: self.sidebar_tabs.setCurrentIndex(2))
+        QShortcut(QKeySequence("Ctrl+4"), self, lambda: self.sidebar_tabs.setCurrentIndex(3))
+        QShortcut(QKeySequence("Ctrl+5"), self, lambda: self.sidebar_tabs.setCurrentIndex(4))
+        QShortcut(QKeySequence("Ctrl+6"), self, lambda: self.sidebar_tabs.setCurrentIndex(5))
+        QShortcut(QKeySequence("Ctrl+7"), self, lambda: self.sidebar_tabs.setCurrentIndex(6))
+        QShortcut(QKeySequence("Ctrl+8"), self, lambda: self.sidebar_tabs.setCurrentIndex(7))
+        QShortcut(QKeySequence("Ctrl+9"), self, lambda: self.sidebar_tabs.setCurrentIndex(8))
+        QShortcut(QKeySequence("Ctrl+I"), self, lambda: self.sidebar_tabs.setCurrentIndex(8))
+
         self.body_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.body_splitter.setStyleSheet("QSplitter::handle { background-color: #333; width: 6px; border-radius: 3px; }")
-        main_layout.addWidget(self.body_splitter)
+        self.body_splitter.setStyleSheet("QSplitter::handle { background-color: #1e293b; width: 6px; border-radius: 3px; }")
+        main_layout.addWidget(self.body_splitter, 1)
         
         graph_widget = QWidget()
         self.graph_layout = QGridLayout(graph_widget)
@@ -1276,6 +2546,17 @@ class CEMAApp(QMainWindow):
         sidebar_layout = QVBoxLayout(self.sidebar_widget)
         sidebar_layout.setContentsMargins(0,0,0,0)
         self.sidebar_tabs = QTabWidget()
+        self.sidebar_tabs.setUsesScrollButtons(True)
+        self.sidebar_tabs.setElideMode(Qt.TextElideMode.ElideRight)
+
+        def make_tab_scroll(w):
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            scroll.setStyleSheet("background-color: transparent;")
+            scroll.setWidget(w)
+            return scroll
         
         # Tab 1: Tactical Event Log
         tab_log = QWidget()
@@ -1289,14 +2570,14 @@ class CEMAApp(QMainWindow):
         clear_btn.clicked.connect(self.log_text.clear)
         export_btn = QPushButton("EXPORT SITREP")
         export_btn.clicked.connect(self.export_log)
-        export_btn.setToolTip("Save the current log to a text file for intelligence reporting.")
+        export_btn.setToolTip("Save the current log to a text file for intelligence reporting (Shortcut: Ctrl+E).")
         
         log_btn_layout.addWidget(clear_btn)
         log_btn_layout.addWidget(export_btn)
         
         log_layout.addWidget(self.log_text)
         log_layout.addLayout(log_btn_layout)
-        self.sidebar_tabs.addTab(tab_log, "Events")
+        self.sidebar_tabs.addTab(tab_log, "SITREP Log")
         
         # Tab 2: Intelligence & Emitters
         tab_intel = QWidget()
@@ -1380,7 +2661,7 @@ class CEMAApp(QMainWindow):
         self.fhss_ui.setToolTip("FHSS Tracker: Operates in Sweep Mode. Mathematically calculates the hop-rate of evasive Frequency Hopping spread spectrum military networks.")
         intel_layout.addWidget(self.fhss_ui)
         
-        self.sidebar_tabs.addTab(tab_intel, "Intel DB")
+        self.sidebar_tabs.addTab(make_tab_scroll(tab_intel), "Intel DB")
         
         # Tab 3: Masks
         tab_mask = QWidget()
@@ -1403,24 +2684,46 @@ class CEMAApp(QMainWindow):
         tab_geo = QWidget()
         geo_layout = QVBoxLayout(tab_geo)
         geo_layout.addWidget(self.create_geolocation_ui())
-        self.sidebar_tabs.addTab(tab_geo, "Geolocation")
+        self.sidebar_tabs.addTab(tab_geo, "Geolocation & Map")
 
         # Tab 5: Drone Telemetry (Heltec V3)
         tab_drone = QWidget()
         drone_layout = QVBoxLayout(tab_drone)
         drone_layout.addWidget(self.create_drone_telemetry_ui())
-        self.sidebar_tabs.addTab(tab_drone, "Drone Telemetry")
+        self.sidebar_tabs.addTab(make_tab_scroll(tab_drone), "Drone Telemetry")
 
-        # Tab 6: Drone Video Feed (Experimental)
+        # Tab 6: Drone Video Feed
         tab_video = QWidget()
         video_layout = QVBoxLayout(tab_video)
         video_layout.addWidget(self.create_drone_video_ui())
-        self.sidebar_tabs.addTab(tab_video, "⚠️ Drone Video (Exp)")
+        self.sidebar_tabs.addTab(make_tab_scroll(tab_video), "FPV Video Demod")
+        
+        # Tab 7: Direction Finding (KrakenSDR)
+        tab_kraken = QWidget()
+        kraken_layout = QVBoxLayout(tab_kraken)
+        kraken_layout.addWidget(self.create_kraken_doa_ui())
+        self.sidebar_tabs.addTab(make_tab_scroll(tab_kraken), "Kraken DoA / DF")
+
+        # Tab 8: Autonomous Hunter-Killer Engine
+        tab_hk = QWidget()
+        hk_layout = QVBoxLayout(tab_hk)
+        hk_layout.addWidget(self.create_hunter_killer_ui())
+        self.sidebar_tabs.addTab(make_tab_scroll(tab_hk), "Hunter-Killer Engine")
+
+        # Tab 9: Tactical AI Copilot & INTSUM
+        tab_copilot = QWidget()
+        copilot_layout = QVBoxLayout(tab_copilot)
+        copilot_layout.addWidget(self.create_tactical_copilot_ui())
+        self.sidebar_tabs.addTab(make_tab_scroll(tab_copilot), "AI Copilot & INTSUM")
         
         # State
+        self.kraken_thread = None
+        self.last_bearing_deg = 0.0
+        self.bearing_history = []
         self.global_masks = []
         self.whitelist_regions = {}
         self.active_events = {}
+        self.active_fhss_bands = {}
         self.fingerprint_db = {}
         self.network_links = {}
         self.current_active_fingerprint = None
@@ -1432,6 +2735,15 @@ class CEMAApp(QMainWindow):
         self.current_mode = "STARE"
         self.watchlist = []
         self.flight_classifier = FlightDynamicsClassifier()
+
+        # Hunter-Killer Engine State
+        self.hk_active = False
+        self.hk_state = "IDLE"
+        self.hk_target_freq = 0.0
+        self.hk_stare_start_time = 0.0
+        self.hk_last_eval_time = {}
+        self.hk_priority_queue = {}
+        self.hk_resume_sweep_params = (850.0, 950.0)
         self.last_pilot_key = None
         self.pilot_rssi_history = []
         self.gps_breadcrumbs_count = 0
@@ -1463,6 +2775,21 @@ class CEMAApp(QMainWindow):
         self.bw_left.hide()
         self.bw_right.hide()
         
+        # Real-time Crosshair and Coordinate HUD
+        self.cursor_v_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('#38bdf8', width=1, style=Qt.PenStyle.DashLine))
+        self.cursor_h_line = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen('#38bdf8', width=1, style=Qt.PenStyle.DashLine))
+        self.cursor_v_line.setZValue(20)
+        self.cursor_h_line.setZValue(20)
+        self.cursor_v_line.hide()
+        self.cursor_h_line.hide()
+        self.fft_plot.addItem(self.cursor_v_line)
+        self.fft_plot.addItem(self.cursor_h_line)
+        
+        self.cursor_hud_text = pg.TextItem(text="", color='#38bdf8', anchor=(1, 0), fill=(15, 23, 42, 220), border='#0284c7')
+        self.cursor_hud_text.setZValue(30)
+        self.cursor_hud_text.hide()
+        self.fft_plot.addItem(self.cursor_hud_text)
+
         self.vfo_region = pg.LinearRegionItem([502, 522], brush=pg.mkBrush(34, 197, 94, 70), pen=pg.mkPen('#22c55e', width=2))
         self.vfo_region.setZValue(10)
         self.vfo_region.sigRegionChanged.connect(self.update_vfo_offset)
@@ -1473,21 +2800,23 @@ class CEMAApp(QMainWindow):
         self.fft_plot._original_mousePressEvent = self.fft_plot.mousePressEvent
         self.fft_plot._original_mouseMoveEvent = self.fft_plot.mouseMoveEvent
         self.fft_plot._original_mouseReleaseEvent = self.fft_plot.mouseReleaseEvent
+        self.fft_plot._original_mouseDoubleClickEvent = self.fft_plot.mouseDoubleClickEvent
+        self.fft_plot._original_leaveEvent = self.fft_plot.leaveEvent
         self.fft_plot.mousePressEvent = self.fft_mouse_press
         self.fft_plot.mouseMoveEvent = self.fft_mouse_move
         self.fft_plot.mouseReleaseEvent = self.fft_mouse_release
+        self.fft_plot.mouseDoubleClickEvent = self.fft_mouse_double_click
+        self.fft_plot.leaveEvent = self.fft_mouse_leave
         self.graph_layout.addWidget(self.fft_plot, 0, 0, 1, 2)
 
         self.waterfall_plot = pg.PlotWidget(title="Waterfall Spectrogram")
         self.waterfall_plot.setLabel('bottom', 'Frequency Offset', units='MHz')
+        self.waterfall_plot._original_mouseDoubleClickEvent = self.waterfall_plot.mouseDoubleClickEvent
+        self.waterfall_plot.mouseDoubleClickEvent = self.waterfall_mouse_double_click
         self.waterfall_image = pg.ImageItem()
         self.waterfall_plot.addItem(self.waterfall_image)
-        pos = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
-        color = np.array([
-            [0, 0, 0, 255], [30, 58, 138, 255], [6, 182, 212, 255], [250, 204, 21, 255], [220, 38, 38, 255]
-        ], dtype=np.ubyte)
-        cmap = pg.ColorMap(pos, color)
-        self.waterfall_image.setLookupTable(cmap.getLookupTable())
+        self.current_cmap = TACTICAL_COLORMAPS["Inferno (Default)"]
+        self.waterfall_image.setLookupTable(self.current_cmap.getLookupTable())
         self.waterfall_plot.hideAxis('left')
         self.waterfall_data = np.zeros((100, 1024))
         self.graph_layout.addWidget(self.waterfall_plot, 1, 0, 1, 1)
@@ -1533,23 +2862,34 @@ class CEMAApp(QMainWindow):
     def create_geolocation_ui(self):
         geo_widget = QWidget()
         geo_layout = QVBoxLayout(geo_widget)
+        self.geo_parent_layout = geo_layout
         
         # Dashboard Header
         header_layout = QHBoxLayout()
         self.geo_status_label = QLabel("[ TARGET TELEMETRY: AWAITING PROTOCOL LOCK ]")
-        self.geo_status_label.setStyleSheet("color: #ef4444; font-weight: bold; font-size: 15px;")
+        self.geo_status_label.setStyleSheet("color: #ef4444; font-weight: bold; font-size: 14px;")
         header_layout.addWidget(self.geo_status_label)
 
         self.geo_breadcrumbs_lbl = QLabel("[ TRACK POINTS: 0 ]")
-        self.geo_breadcrumbs_lbl.setStyleSheet("color: #38bdf8; font-weight: bold; font-size: 13px; font-family: monospace;")
+        self.geo_breadcrumbs_lbl.setStyleSheet("color: #38bdf8; font-weight: bold; font-size: 12px; font-family: monospace;")
         header_layout.addWidget(self.geo_breadcrumbs_lbl)
 
-        self.geo_clear_btn = QPushButton("🗑️ CLEAR TRACKS")
+        self.geo_clear_btn = QPushButton("CLEAR TRACKS")
         self.geo_clear_btn.setStyleSheet("background-color: #1e293b; color: #f87171; font-weight: bold; padding: 4px 8px; border: 1px solid #f87171; border-radius: 4px;")
         self.geo_clear_btn.clicked.connect(self.clear_tactical_tracks)
         header_layout.addWidget(self.geo_clear_btn)
 
+        self.geo_detach_btn = QPushButton("DETACH MAP")
+        self.geo_detach_btn.setStyleSheet("background-color: #1e293b; color: #38bdf8; font-weight: bold; padding: 4px 8px; border: 1px solid #0284c7; border-radius: 4px;")
+        self.geo_detach_btn.clicked.connect(self.detach_map_window)
+        header_layout.addWidget(self.geo_detach_btn)
+
         geo_layout.addLayout(header_layout)
+
+        # Container wrapper for detaching
+        self.geo_map_container = QWidget()
+        map_cont_layout = QVBoxLayout(self.geo_map_container)
+        map_cont_layout.setContentsMargins(0, 0, 0, 0)
         
         # Interactive Web Map (Leaflet.js)
         self.geo_map_view = QWebEngineView()
@@ -1630,12 +2970,98 @@ class CEMAApp(QMainWindow):
                     }
                 }
 
+                var bearingRay = null;
+                var triangulationMarkers = [];
+                var cepCircles = [];
+
+                function updateBearingLine(originLat, originLon, bearingDeg, lengthMeters, color) {
+                    var rayColor = color || '#f59e0b';
+                    var R = 6378137;
+                    var d = lengthMeters || 6000;
+                    var brng = bearingDeg * Math.PI / 180;
+                    var lat1 = originLat * Math.PI / 180;
+                    var lon1 = originLon * Math.PI / 180;
+
+                    var lat2 = Math.asin(Math.sin(lat1) * Math.cos(d / R) + Math.cos(lat1) * Math.sin(d / R) * Math.cos(brng));
+                    var lon2 = lon1 + Math.atan2(Math.sin(brng) * Math.sin(d / R) * Math.cos(lat1), Math.cos(d / R) - Math.sin(lat1) * Math.sin(lat2));
+
+                    var endLat = lat2 * 180 / Math.PI;
+                    var endLon = lon2 * 180 / Math.PI;
+
+                    if (!bearingRay) {
+                        bearingRay = L.polyline([[originLat, originLon], [endLat, endLon]], {
+                            color: rayColor,
+                            weight: 3,
+                            opacity: 0.9,
+                            dashArray: '6, 6'
+                        }).addTo(map);
+                    } else {
+                        bearingRay.setLatLngs([[originLat, originLon], [endLat, endLon]]);
+                        bearingRay.setStyle({color: rayColor});
+                    }
+                }
+
+                function clearBearingLine() {
+                    if (bearingRay) {
+                        map.removeLayer(bearingRay);
+                        bearingRay = null;
+                    }
+                }
+
+                function addTriangulationFix(lat, lon, label) {
+                    var fixHtml = '<div style="background-color: #ef4444; width: 16px; height: 16px; border-radius: 3px; border: 2px solid white; box-shadow: 0 0 14px #ef4444; transform: rotate(45deg);"></div>';
+                    var fixIcon = L.divIcon({
+                        className: 'tri-icon',
+                        html: fixHtml,
+                        iconSize: [20, 20],
+                        iconAnchor: [10, 10]
+                    });
+                    var marker = L.marker([lat, lon], {icon: fixIcon}).addTo(map);
+                    marker.bindPopup("<b>TRIANGULATED FIX: " + (label || "EMITTER") + "</b><br>" + lat.toFixed(5) + ", " + lon.toFixed(5));
+                    triangulationMarkers.push(marker);
+                }
+
+                function addCepFix(lat, lon, cepMeters, label) {
+                    var fixHtml = '<div style="background-color: #ef4444; width: 14px; height: 14px; border-radius: 2px; border: 2px solid white; box-shadow: 0 0 16px #ef4444; transform: rotate(45deg);"></div>';
+                    var fixIcon = L.divIcon({
+                        className: 'cep-icon',
+                        html: fixHtml,
+                        iconSize: [18, 18],
+                        iconAnchor: [9, 9]
+                    });
+                    var marker = L.marker([lat, lon], {icon: fixIcon}).addTo(map);
+                    marker.bindPopup("<b>ESTIMATED TARGET FIX (95% CEP)</b><br>" + lat.toFixed(5) + ", " + lon.toFixed(5) + "<br>Accuracy Radius: &plusmn;" + cepMeters.toFixed(1) + "m");
+                    triangulationMarkers.push(marker);
+
+                    var circle = L.circle([lat, lon], {
+                        radius: cepMeters,
+                        color: '#ef4444',
+                        fillColor: '#ef4444',
+                        fillOpacity: 0.18,
+                        weight: 2,
+                        dashArray: '5, 5'
+                    }).addTo(map);
+                    cepCircles.push(circle);
+                }
+
                 function clearTacticalTracks() {
                     droneTrail.setLatLngs([]);
                     if (rfCircle) {
                         map.removeLayer(rfCircle);
                         rfCircle = null;
                     }
+                    if (bearingRay) {
+                        map.removeLayer(bearingRay);
+                        bearingRay = null;
+                    }
+                    for (var i = 0; i < triangulationMarkers.length; i++) {
+                        map.removeLayer(triangulationMarkers[i]);
+                    }
+                    triangulationMarkers = [];
+                    for (var j = 0; j < cepCircles.length; j++) {
+                        map.removeLayer(cepCircles[j]);
+                    }
+                    cepCircles = [];
                 }
             </script>
         </body>
@@ -1643,7 +3069,8 @@ class CEMAApp(QMainWindow):
         """
         
         self.geo_map_view.setHtml(map_html)
-        geo_layout.addWidget(self.geo_map_view)
+        map_cont_layout.addWidget(self.geo_map_view)
+        geo_layout.addWidget(self.geo_map_container)
         
         # Coordinates readout & Manual plot
         readout_layout = QHBoxLayout()
@@ -1651,15 +3078,23 @@ class CEMAApp(QMainWindow):
         self.geo_lon_input = QLineEdit()
         self.geo_lat_input.setPlaceholderText("Latitude")
         self.geo_lon_input.setPlaceholderText("Longitude")
+        self.geo_lat_input.setText("51.5074")
+        self.geo_lon_input.setText("-0.1278")
+        
         self.geo_plot_btn = QPushButton("PLOT MANUALLY")
         self.geo_plot_btn.setStyleSheet("background-color: #0f172a; color: #38bdf8; font-weight: bold; border: 1px solid #1e293b; padding: 4px 8px; border-radius: 4px;")
         self.geo_plot_btn.clicked.connect(self.manual_plot_target)
+
+        self.solve_cep_btn = QPushButton("SOLVE CEP FIX")
+        self.solve_cep_btn.setStyleSheet("background-color: #0284c7; color: white; font-weight: bold; border: 1px solid #38bdf8; padding: 4px 8px; border-radius: 4px;")
+        self.solve_cep_btn.clicked.connect(self.solve_multibearing_cep)
         
-        readout_layout.addWidget(QLabel("Lat:"))
+        readout_layout.addWidget(QLabel("Observer Lat:"))
         readout_layout.addWidget(self.geo_lat_input)
         readout_layout.addWidget(QLabel("Lon:"))
         readout_layout.addWidget(self.geo_lon_input)
         readout_layout.addWidget(self.geo_plot_btn)
+        readout_layout.addWidget(self.solve_cep_btn)
         
         geo_layout.addLayout(readout_layout)
         return geo_widget
@@ -1675,12 +3110,83 @@ class CEMAApp(QMainWindow):
     def create_drone_telemetry_ui(self):
         drone_widget = QWidget()
         layout = QVBoxLayout(drone_widget)
-        layout.setSpacing(8)
+        layout.setSpacing(6)
+        self.drone_parent_layout = layout
 
-        # Header Status
+        # Header Status & Detach Bar
+        header_row = QHBoxLayout()
         self.drone_status_label = QLabel("[ HELTEC V3: SEARCHING FOR 915MHz PACKETS ]")
         self.drone_status_label.setStyleSheet("background-color: #090d16; color: #f59e0b; font-weight: bold; font-size: 13px; padding: 6px; border: 1px solid #1e293b; border-radius: 4px;")
-        layout.addWidget(self.drone_status_label)
+        
+        self.drone_detach_btn = QPushButton("DETACH COCKPIT")
+        self.drone_detach_btn.setStyleSheet("background-color: #1e293b; color: #38bdf8; font-weight: bold; padding: 4px 8px; border: 1px solid #0284c7; border-radius: 4px;")
+        self.drone_detach_btn.clicked.connect(self.detach_drone_window)
+        
+        header_row.addWidget(self.drone_status_label, 1)
+        header_row.addWidget(self.drone_detach_btn)
+        layout.addLayout(header_row)
+
+        self.drone_cockpit_container = QWidget()
+        cockpit_layout = QVBoxLayout(self.drone_cockpit_container)
+        cockpit_layout.setContentsMargins(0, 0, 0, 0)
+        cockpit_layout.setSpacing(6)
+
+        # Feature 0: ExpressLRS Packet Rate & Dynamic Demodulation Control
+        rate_group = QGroupBox("ExpressLRS Sniffer Packet Rate & Dynamic Demodulation")
+        rate_group.setStyleSheet("QGroupBox { color: #38bdf8; font-weight: bold; border: 1px solid #1e293b; border-radius: 6px; margin-top: 6px; padding-top: 10px; background-color: #0b0f19; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }")
+        rate_layout = QGridLayout(rate_group)
+        rate_layout.setContentsMargins(8, 8, 8, 8)
+
+        self.elrs_rate_mode_combo = QComboBox()
+        self.elrs_rate_mode_combo.addItems([
+            "Auto-Detect (Dynamic Auto-Rate Scanning)",
+            "50 Hz (Standard 915MHz - SF8 / 20ms)",
+            "25 Hz (Long Range - SF9 / 40ms)",
+            "100 Hz (Standard 8ch - SF7 / 10ms)",
+            "100 Hz Full (16ch Full Res - SF7 / 10ms)",
+            "D50 (Déjà Vu 50Hz - SF7 / 10ms)",
+            "150 Hz (SF7 / 6.6ms)",
+            "200 Hz (SF6 / 5ms)",
+            "250 Hz (SF6 / 4ms)",
+            "333 Hz Full (16ch Full Res - SF5 / 3ms)"
+        ])
+        self.elrs_rate_mode_combo.currentIndexChanged.connect(self.on_elrs_rate_selected)
+        rate_layout.addWidget(QLabel("Rate Selector:"), 0, 0)
+        rate_layout.addWidget(self.elrs_rate_mode_combo, 0, 1)
+
+        self.elrs_rate_badge = QLabel("[ ACTIVE DEMOD: 50Hz | SF8 | BW: 500kHz | Interval: 20000 µs ]")
+        self.elrs_rate_badge.setStyleSheet("background-color: #060a14; color: #38bdf8; font-family: monospace; font-size: 11px; font-weight: bold; padding: 5px; border: 1px solid #1e293b; border-radius: 4px;")
+        rate_layout.addWidget(self.elrs_rate_badge, 1, 0, 1, 2)
+        cockpit_layout.addWidget(rate_group)
+
+        # Feature 0.5: Multi-Pilot Airspace Discovery & Target Selection
+        pilot_group = QGroupBox("Pilot Target Selector & Airspace Surveillance")
+        pilot_group.setStyleSheet("QGroupBox { color: #38bdf8; font-weight: bold; border: 1px solid #1e293b; border-radius: 6px; margin-top: 6px; padding-top: 10px; background-color: #0b0f19; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }")
+        pilot_layout = QGridLayout(pilot_group)
+        pilot_layout.setContentsMargins(8, 8, 8, 8)
+
+        self.pilot_selector_combo = QComboBox()
+        self.pilot_selector_combo.addItem("Auto-Track Any Pilot (First / Strongest Sync)")
+        self.pilot_selector_combo.setToolTip("Select which pilot / transmitter UID to lock and demodulate over the air.")
+
+        self.pilot_lock_btn = QPushButton("LOCK PILOT")
+        self.pilot_lock_btn.setStyleSheet("background-color: #0284c7; color: white; font-weight: bold; border: 1px solid #38bdf8;")
+        self.pilot_lock_btn.clicked.connect(self.on_lock_pilot_clicked)
+
+        self.pilot_auto_btn = QPushButton("AUTO / ANY")
+        self.pilot_auto_btn.setStyleSheet("background-color: #1e293b; color: #cbd5e1; border: 1px solid #334155;")
+        self.pilot_auto_btn.clicked.connect(self.on_unlock_pilot_clicked)
+
+        self.pilot_target_badge = QLabel("[ ACTIVE TARGET: AUTO / ANY PILOT ]")
+        self.pilot_target_badge.setStyleSheet("background-color: #060a14; color: #38bdf8; font-family: monospace; font-size: 11px; font-weight: bold; padding: 5px; border: 1px solid #1e293b; border-radius: 4px;")
+
+        pilot_layout.addWidget(QLabel("Target Pilot:"), 0, 0)
+        pilot_layout.addWidget(self.pilot_selector_combo, 0, 1)
+        pilot_layout.addWidget(self.pilot_lock_btn, 0, 2)
+        pilot_layout.addWidget(self.pilot_auto_btn, 0, 3)
+        pilot_layout.addWidget(self.pilot_target_badge, 1, 0, 1, 4)
+
+        cockpit_layout.addWidget(pilot_group)
 
         # Feature 1: Mode 2 Visual 2D Gimbal HUD
         hud_box = QGroupBox("Live Pilot Control Gimbals (Mode 2)")
@@ -1695,7 +3201,7 @@ class CEMAApp(QMainWindow):
         self.drone_sticks_lbl.setStyleSheet("background-color: #050505; color: #10b981; font-family: monospace; font-size: 12px; padding: 6px; border: 1px solid #1e293b; border-radius: 4px;")
         self.drone_sticks_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         hud_layout.addWidget(self.drone_sticks_lbl)
-        layout.addWidget(hud_box)
+        cockpit_layout.addWidget(hud_box)
 
         # Feature 2: Tactical Flight Dynamics & Maneuver Classifier
         classifier_box = QGroupBox("Tactical Flight Dynamics & Maneuver Classifier")
@@ -1703,7 +3209,7 @@ class CEMAApp(QMainWindow):
         classifier_layout = QVBoxLayout(classifier_box)
         classifier_layout.setContentsMargins(6, 6, 6, 6)
 
-        self.maneuver_badge = QLabel("🛑 DISARMED / MOTOR SHUTDOWN")
+        self.maneuver_badge = QLabel("DISARMED / MOTOR SHUTDOWN")
         self.maneuver_badge.setStyleSheet("background-color: #1e293b; color: #94a3b8; font-weight: bold; font-size: 14px; padding: 8px; border-radius: 4px; border: 1px solid #334155;")
         self.maneuver_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         classifier_layout.addWidget(self.maneuver_badge)
@@ -1712,7 +3218,7 @@ class CEMAApp(QMainWindow):
         self.maneuver_detail_lbl.setStyleSheet("color: #64748b; font-family: monospace; font-size: 11px;")
         self.maneuver_detail_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         classifier_layout.addWidget(self.maneuver_detail_lbl)
-        layout.addWidget(classifier_box)
+        cockpit_layout.addWidget(classifier_box)
 
         # Feature 4: Dual-Link RF Proximity & Link Margin Gauge
         rf_box = QGroupBox("Dual-Link RF Proximity & Link Margin")
@@ -1721,7 +3227,7 @@ class CEMAApp(QMainWindow):
         rf_layout.setContentsMargins(8, 8, 8, 8)
 
         rf_layout.addWidget(QLabel("Pilot Proximity (Station-to-TX):"), 0, 0)
-        self.proximity_lbl = QLabel("🟡 MEDIUM TACTICAL RANGE (200m - 800m)")
+        self.proximity_lbl = QLabel("MEDIUM TACTICAL RANGE (200m - 800m)")
         self.proximity_lbl.setStyleSheet("color: #eab308; font-weight: bold; font-size: 12px;")
         rf_layout.addWidget(self.proximity_lbl, 0, 1)
 
@@ -1734,7 +3240,7 @@ class CEMAApp(QMainWindow):
         rf_layout.addWidget(self.sniffer_rssi_bar, 1, 0, 1, 2)
 
         rf_layout.addWidget(QLabel("Drone RF Link Quality:"), 2, 0)
-        self.link_margin_lbl = QLabel("🟢 NOMINAL LINK (100% RC Integrity)")
+        self.link_margin_lbl = QLabel("NOMINAL LINK (100% RC Integrity)")
         self.link_margin_lbl.setStyleSheet("color: #22c55e; font-weight: bold; font-size: 12px;")
         rf_layout.addWidget(self.link_margin_lbl, 2, 1)
 
@@ -1745,7 +3251,50 @@ class CEMAApp(QMainWindow):
         self.drone_lq_bar.setFixedHeight(8)
         self.drone_lq_bar.setStyleSheet("QProgressBar { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 4px; } QProgressBar::chunk { background-color: #22c55e; border-radius: 3px; }")
         rf_layout.addWidget(self.drone_lq_bar, 3, 0, 1, 2)
-        layout.addWidget(rf_box)
+        cockpit_layout.addWidget(rf_box)
+
+        # Feature 3: 16-Channel Live Diagnostic Matrix (ELRS / CRSF)
+        ch_box = QGroupBox("16-Channel Live Diagnostic Matrix (ELRS / CRSF)")
+        ch_box.setStyleSheet("QGroupBox { color: #38bdf8; font-weight: bold; border: 1px solid #1e293b; border-radius: 6px; margin-top: 6px; padding-top: 10px; background-color: #0b0f19; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }")
+        ch_layout = QGridLayout(ch_box)
+        ch_layout.setContentsMargins(6, 6, 6, 6)
+        ch_layout.setSpacing(4)
+
+        self.channel_bars = []
+        self.channel_labels = []
+        ch_names = [
+            "CH1 (Roll)", "CH2 (Pitch)", "CH3 (Throttle)", "CH4 (Yaw)",
+            "CH5 (AUX1/Arm)", "CH6 (AUX2/Mode)", "CH7 (AUX3/VTX)", "CH8 (AUX4/Rescue)",
+            "CH9 (AUX5)", "CH10 (AUX6)", "CH11 (AUX7)", "CH12 (AUX8)",
+            "CH13 (AUX9)", "CH14 (AUX10)", "CH15 (AUX11)", "CH16 (AUX12)"
+        ]
+
+        for idx, name in enumerate(ch_names):
+            row = idx // 2
+            col_offset = (idx % 2) * 3
+
+            lbl = QLabel(f"{name}:")
+            lbl.setStyleSheet("color: #94a3b8; font-size: 8.5pt; font-family: 'Consolas', monospace;")
+            
+            bar = QProgressBar()
+            bar.setRange(988, 2012)
+            bar.setValue(1500 if idx != 2 else 988)
+            bar.setTextVisible(False)
+            bar.setFixedHeight(6)
+            bar.setStyleSheet("QProgressBar { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 3px; } QProgressBar::chunk { background-color: #38bdf8; border-radius: 2px; }")
+            
+            val_lbl = QLabel("1500µs" if idx != 2 else "988µs")
+            val_lbl.setStyleSheet("color: #38bdf8; font-weight: bold; font-size: 8.5pt; font-family: 'Consolas', monospace;")
+            val_lbl.setFixedWidth(52)
+
+            ch_layout.addWidget(lbl, row, col_offset)
+            ch_layout.addWidget(bar, row, col_offset + 1)
+            ch_layout.addWidget(val_lbl, row, col_offset + 2)
+
+            self.channel_bars.append(bar)
+            self.channel_labels.append(val_lbl)
+
+        cockpit_layout.addWidget(ch_box)
 
         # Stats Grid (Telemetry Readouts)
         grid = QGridLayout()
@@ -1757,10 +3306,13 @@ class CEMAApp(QMainWindow):
         self.drone_curr_lbl = QLabel("Current Draw: -- A")
         self.drone_pilot_lbl = QLabel("Pilot Hash: --")
         self.drone_arm_lbl = QLabel("Arm State: DISARMED")
+        self.drone_att_lbl = QLabel("Attitude: P:--° | R:--° | Y:--°")
+        self.drone_fmode_lbl = QLabel("Flight Mode: --")
 
         for lbl in [self.drone_rssi_lbl, self.drone_snr_lbl, self.drone_lq_lbl, self.drone_remote_rssi_lbl,
-                    self.drone_vbat_lbl, self.drone_curr_lbl, self.drone_pilot_lbl, self.drone_arm_lbl]:
-            lbl.setStyleSheet("background-color: #0f172a; color: #38bdf8; border: 1px solid #1e293b; padding: 6px; border-radius: 4px; font-weight: bold; font-size: 12px;")
+                    self.drone_vbat_lbl, self.drone_curr_lbl, self.drone_pilot_lbl, self.drone_arm_lbl,
+                    self.drone_att_lbl, self.drone_fmode_lbl]:
+            lbl.setStyleSheet("background-color: #0f172a; color: #38bdf8; border: 1px solid #1e293b; padding: 6px; border-radius: 4px; font-weight: bold; font-size: 11px;")
 
         grid.addWidget(self.drone_rssi_lbl, 0, 0)
         grid.addWidget(self.drone_snr_lbl, 0, 1)
@@ -1770,8 +3322,11 @@ class CEMAApp(QMainWindow):
         grid.addWidget(self.drone_curr_lbl, 2, 1)
         grid.addWidget(self.drone_pilot_lbl, 3, 0)
         grid.addWidget(self.drone_arm_lbl, 3, 1)
-        layout.addLayout(grid)
+        grid.addWidget(self.drone_att_lbl, 4, 0)
+        grid.addWidget(self.drone_fmode_lbl, 4, 1)
+        cockpit_layout.addLayout(grid)
 
+        layout.addWidget(self.drone_cockpit_container)
         layout.addStretch()
         return drone_widget
 
@@ -1780,28 +3335,38 @@ class CEMAApp(QMainWindow):
         layout = QVBoxLayout(video_widget)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
+        self.video_parent_layout = layout
 
-        # Experimental Warning Banner
-        warning_card = QFrame()
-        warning_card.setStyleSheet("background-color: #2a1b0a; border: 1px solid #d97706; border-radius: 6px; padding: 4px;")
-        warn_layout = QVBoxLayout(warning_card)
-        warn_layout.setContentsMargins(8, 6, 8, 6)
-        warn_layout.setSpacing(2)
-        warn_title = QLabel("⚠️ EXPERIMENTAL FEATURE")
-        warn_title.setStyleSheet("color: #fbbf24; font-weight: bold; font-size: 11px;")
-        warn_desc = QLabel("Direct analog composite (CVBS) software demodulation is experimental. Signal lock depends heavily on USB transfer stability and RF SNR. For broadcast-stable feeds, the external UDP Stream Bridge is recommended.")
-        warn_desc.setStyleSheet("color: #fef3c7; font-size: 10px;")
-        warn_desc.setWordWrap(True)
-        warn_layout.addWidget(warn_title)
-        warn_layout.addWidget(warn_desc)
-        layout.addWidget(warning_card)
+        # Header Row & Detach Button
+        header_row = QHBoxLayout()
+        self.video_status_label = QLabel("[ FPV VIDEO DEMODULATOR: READY ]")
+        self.video_status_label.setStyleSheet("background-color: #090d16; color: #38bdf8; font-weight: bold; font-size: 13px; padding: 6px; border: 1px solid #1e293b; border-radius: 4px;")
+        
+        self.video_detach_btn = QPushButton("DETACH VIDEO")
+        self.video_detach_btn.setStyleSheet("background-color: #1e293b; color: #38bdf8; font-weight: bold; padding: 4px 8px; border: 1px solid #0284c7; border-radius: 4px;")
+        self.video_detach_btn.clicked.connect(self.detach_video_window)
+        
+        header_row.addWidget(self.video_status_label, 1)
+        header_row.addWidget(self.video_detach_btn)
+        layout.addLayout(header_row)
+
+        self.auto_fusion_sweep_video_cb = QCheckBox("Auto-Demodulate Video on Sweep VTX Carrier Detect")
+        self.auto_fusion_sweep_video_cb.setChecked(True)
+        self.auto_fusion_sweep_video_cb.setToolTip("When in Sweep mode, automatically tune and demodulate active 5.8GHz / 1.2GHz video carriers.")
+        layout.addWidget(self.auto_fusion_sweep_video_cb)
+
+        # Video container for popping out
+        self.video_display_container = QWidget()
+        video_cont_layout = QVBoxLayout(self.video_display_container)
+        video_cont_layout.setContentsMargins(0, 0, 0, 0)
+        video_cont_layout.setSpacing(6)
 
         # Tactical Video Display Screen (Resizable / Auto-Expanding)
         self.video_display = VideoDisplayWidget()
         self.video_display.setMinimumHeight(260)
         self.video_display.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.video_display.on_double_click_cb = self.toggle_floating_video
-        layout.addWidget(self.video_display)
+        video_cont_layout.addWidget(self.video_display)
 
         # Video Display Sizing & Floating Pop-Out Controls
         size_btn_layout = QHBoxLayout()
@@ -1809,22 +3374,22 @@ class CEMAApp(QMainWindow):
         
         self.video_size_combo = QComboBox()
         self.video_size_combo.addItems([
-            "📐 Embedded: Compact (240p)",
-            "📐 Embedded: Medium (320p)",
-            "📐 Embedded: Large (420p)",
-            "📐 Embedded: Full (Auto-Expand)"
+            "Embedded: Compact (240p)",
+            "Embedded: Medium (320p)",
+            "Embedded: Large (420p)",
+            "Embedded: Full (Auto-Expand)"
         ])
         self.video_size_combo.setCurrentIndex(1) # Default Medium (320p)
         self.video_size_combo.currentIndexChanged.connect(self.on_video_size_changed)
         
-        self.popout_video_btn = QPushButton("⛶ POP-OUT LARGE WINDOW")
+        self.popout_video_btn = QPushButton("POP-OUT LARGE WINDOW")
         self.popout_video_btn.setStyleSheet("background-color: #0284c7; color: white; font-weight: bold; padding: 6px 12px; border-radius: 4px;")
         self.popout_video_btn.setToolTip("Open video stream in a dedicated, freely resizable floating window (Double-click video screen to toggle).")
         self.popout_video_btn.clicked.connect(self.toggle_floating_video)
         
         size_btn_layout.addWidget(self.video_size_combo)
         size_btn_layout.addWidget(self.popout_video_btn)
-        layout.addLayout(size_btn_layout)
+        video_cont_layout.addLayout(size_btn_layout)
 
         # Source Selection Group
         source_group = QGroupBox("Video Stream Source")
@@ -1833,9 +3398,9 @@ class CEMAApp(QMainWindow):
 
         self.video_source_combo = QComboBox()
         self.video_source_combo.addItems([
-            "📡 Native HackRF Demod (5.8G / 1.2G)",
-            "🌐 SDRangel UDP Stream (udp://127.0.0.1:5005)",
-            "🌐 Custom RTSP / UDP / HTTP Stream"
+            "Native HackRF Demod (5.8G / 1.2G)",
+            "SDRangel UDP Stream (udp://127.0.0.1:5005)",
+            "Custom RTSP / UDP / HTTP Stream"
         ])
         self.video_source_combo.currentTextChanged.connect(self.on_video_source_changed)
         source_layout.addWidget(self.video_source_combo)
@@ -1867,7 +3432,7 @@ class CEMAApp(QMainWindow):
         source_layout.addWidget(self.stream_url_row)
         self.stream_url_row.hide()
 
-        layout.addWidget(source_group)
+        video_cont_layout.addWidget(source_group)
 
         # Demodulator Tuning & Display Controls (SDRangel Style)
         tuning_group = QGroupBox("Demodulator, H-Sync & V-Sync Controls")
@@ -1887,12 +3452,12 @@ class CEMAApp(QMainWindow):
         tuning_layout.addWidget(self.video_palette_combo, 1, 1)
 
         # H-Sync PLL and V-Sync Controls
-        self.auto_hsync_cb = QCheckBox("🔒 Auto H-Sync Lock (PLL)")
+        self.auto_hsync_cb = QCheckBox("Auto H-Sync Lock (PLL)")
         self.auto_hsync_cb.setChecked(True)
         self.auto_hsync_cb.toggled.connect(self.update_video_tuning)
         tuning_layout.addWidget(self.auto_hsync_cb, 2, 0)
 
-        self.auto_vsync_cb = QCheckBox("🔒 Auto V-Sync Lock (V-Hold)")
+        self.auto_vsync_cb = QCheckBox("Auto V-Sync Lock (V-Hold)")
         self.auto_vsync_cb.setChecked(True)
         self.auto_vsync_cb.toggled.connect(self.update_video_tuning)
         tuning_layout.addWidget(self.auto_vsync_cb, 2, 1)
@@ -1951,21 +3516,23 @@ class CEMAApp(QMainWindow):
         self.video_brightness_slider.valueChanged.connect(self.update_video_tuning)
         tuning_layout.addWidget(self.video_brightness_slider, 8, 1)
 
-        layout.addWidget(tuning_group)
+        video_cont_layout.addWidget(tuning_group)
 
         # Action Buttons
         btn_layout = QHBoxLayout()
-        self.toggle_video_btn = QPushButton("▶ START VIDEO STREAM")
+        self.toggle_video_btn = QPushButton("START VIDEO STREAM")
         self.toggle_video_btn.setStyleSheet("background-color: #10b981; color: white; font-weight: bold; padding: 8px;")
         self.toggle_video_btn.clicked.connect(self.toggle_video_stream)
         
-        self.video_snapshot_btn = QPushButton("📸 SNAPSHOT")
+        self.video_snapshot_btn = QPushButton("SNAPSHOT")
         self.video_snapshot_btn.setStyleSheet("background-color: #1e293b; color: #38bdf8; font-weight: bold; border: 1px solid #38bdf8;")
         self.video_snapshot_btn.clicked.connect(self.capture_video_snapshot)
         
         btn_layout.addWidget(self.toggle_video_btn)
         btn_layout.addWidget(self.video_snapshot_btn)
-        layout.addLayout(btn_layout)
+        video_cont_layout.addLayout(btn_layout)
+
+        layout.addWidget(self.video_display_container)
 
         layout.addStretch()
         return video_widget
@@ -2150,13 +3717,1577 @@ class CEMAApp(QMainWindow):
             self.log_event("Cannot snapshot: No video frame available.")
             return
             
-        os.makedirs("captures", exist_ok=True)
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        chan_mhz = self.fpv_channel_combo.currentData() if hasattr(self, 'fpv_channel_combo') else 5806
-        filepath = os.path.join("captures", f"FPV_Capture_{chan_mhz}MHz_{timestamp}.png")
-        
         self.video_display.current_pixmap.save(filepath, "PNG")
         self.log_event(f"Saved Video Snapshot: {filepath}")
+
+    def create_kraken_doa_ui(self):
+        kraken_widget = QWidget()
+        layout = QVBoxLayout(kraken_widget)
+        layout.setSpacing(6)
+        self.kraken_parent_layout = layout
+
+        # Header Status & Detach Button
+        header_row = QHBoxLayout()
+        self.kraken_status_label = QLabel("[ KRAKENSDR DoA: STANDBY / DISCONNECTED ]")
+        self.kraken_status_label.setStyleSheet("background-color: #060a14; color: #f59e0b; font-weight: bold; font-size: 13px; padding: 6px; border: 1px solid #1e293b; border-radius: 4px;")
+        
+        self.kraken_detach_btn = QPushButton("DETACH COMPASS")
+        self.kraken_detach_btn.setStyleSheet("background-color: #1e293b; color: #38bdf8; font-weight: bold; padding: 4px 8px; border: 1px solid #0284c7; border-radius: 4px;")
+        self.kraken_detach_btn.clicked.connect(self.detach_kraken_window)
+        
+        header_row.addWidget(self.kraken_status_label, 1)
+        header_row.addWidget(self.kraken_detach_btn)
+        layout.addLayout(header_row)
+
+        self.auto_fusion_heltec_kraken_cb = QCheckBox("Auto-Retune DoA Array to Locked Pilot (915 MHz)")
+        self.auto_fusion_heltec_kraken_cb.setChecked(True)
+        self.auto_fusion_heltec_kraken_cb.setToolTip("Automatically tune the KrakenSDR array to the active 915 MHz frequency whenever an ELRS pilot packet is received.")
+        layout.addWidget(self.auto_fusion_heltec_kraken_cb)
+
+        # DoA Compass Container for popping out
+        self.doa_compass_container = QWidget()
+        compass_cont_layout = QVBoxLayout(self.doa_compass_container)
+        compass_cont_layout.setContentsMargins(0, 0, 0, 0)
+        compass_cont_layout.setSpacing(6)
+
+        # 360 Tactical Compass HUD (Polar Rose + MUSIC Spectrum)
+        self.doa_compass = DoACompassWidget()
+        compass_cont_layout.addWidget(self.doa_compass)
+
+        # KrakenSDR Server Daemon & Health Control
+        service_group = QGroupBox("KrakenSDR Server Daemon & Health Control")
+        service_layout = QGridLayout(service_group)
+        service_layout.setContentsMargins(6, 6, 6, 6)
+
+        self.kraken_health_badge = QLabel("[ SERVER: CHECKING CONNECTION... ]")
+        self.kraken_health_badge.setStyleSheet("background-color: #060a14; color: #38bdf8; font-family: monospace; font-size: 11px; font-weight: bold; padding: 5px; border: 1px solid #1e293b; border-radius: 4px;")
+
+        self.kraken_start_btn = QPushButton("START")
+        self.kraken_start_btn.setStyleSheet("background-color: #065f46; color: #34d399; font-weight: bold; border: 1px solid #059669; padding: 5px;")
+        self.kraken_start_btn.clicked.connect(self.start_kraken_service)
+
+        self.kraken_stop_btn = QPushButton("STOP")
+        self.kraken_stop_btn.setStyleSheet("background-color: #7f1d1d; color: #f87171; font-weight: bold; border: 1px solid #dc2626; padding: 5px;")
+        self.kraken_stop_btn.clicked.connect(self.stop_kraken_service)
+
+        self.kraken_restart_btn = QPushButton("RESTART")
+        self.kraken_restart_btn.setStyleSheet("background-color: #1e293b; color: #fbbf24; font-weight: bold; border: 1px solid #d97706; padding: 5px;")
+        self.kraken_restart_btn.clicked.connect(self.restart_kraken_service)
+
+        self.kraken_check_btn = QPushButton("CHECK HEALTH")
+        self.kraken_check_btn.setStyleSheet("background-color: #1e293b; color: #38bdf8; font-weight: bold; border: 1px solid #0284c7; padding: 5px;")
+        self.kraken_check_btn.clicked.connect(self.check_kraken_health)
+
+        self.kraken_repair_btn = QPushButton("AUTO-REPAIR & FIX")
+        self.kraken_repair_btn.setStyleSheet("background-color: #0284c7; color: white; font-weight: bold; border: 1px solid #38bdf8; padding: 5px;")
+        self.kraken_repair_btn.clicked.connect(self.repair_kraken_sdr)
+
+        self.kraken_attach_btn = QPushButton("ATTACH USB (WSL)")
+        self.kraken_attach_btn.setStyleSheet("background-color: #1e293b; color: #cbd5e1; border: 1px solid #334155; padding: 5px;")
+        self.kraken_attach_btn.clicked.connect(self.attach_kraken_usb)
+
+        service_layout.addWidget(self.kraken_health_badge, 0, 0, 1, 4)
+        service_layout.addWidget(self.kraken_start_btn, 1, 0)
+        service_layout.addWidget(self.kraken_stop_btn, 1, 1)
+        service_layout.addWidget(self.kraken_restart_btn, 1, 2)
+        service_layout.addWidget(self.kraken_check_btn, 1, 3)
+        service_layout.addWidget(self.kraken_repair_btn, 2, 0, 1, 2)
+        service_layout.addWidget(self.kraken_attach_btn, 2, 2, 1, 2)
+
+        compass_cont_layout.addWidget(service_group)
+
+        # Connection & Stream Controls
+        conn_group = QGroupBox("KrakenSDR Data Stream Connection")
+        conn_layout = QGridLayout(conn_group)
+        conn_layout.setContentsMargins(6, 6, 6, 6)
+
+        self.kraken_mode_combo = QComboBox()
+        self.kraken_mode_combo.addItems([
+            "Local Kraken SDR (Automatic Fast Stream - Recommended)",
+            "Target Simulator (Test Mode)",
+            "Network IP (HTTP / Port 8081)",
+            "UDP Broadcast (Port 5005)"
+        ])
+        self.kraken_mode_combo.currentIndexChanged.connect(self.on_kraken_mode_changed)
+        conn_layout.addWidget(QLabel("Stream Mode:"), 0, 0)
+        conn_layout.addWidget(self.kraken_mode_combo, 0, 1)
+
+        # Host / IP Input
+        self.kraken_host_row = QWidget()
+        host_layout = QHBoxLayout(self.kraken_host_row)
+        host_layout.setContentsMargins(0, 0, 0, 0)
+        self.kraken_host_input = QLineEdit("127.0.0.1")
+        self.kraken_port_input = QSpinBox()
+        self.kraken_port_input.setRange(1, 65535)
+        self.kraken_port_input.setValue(8081)
+        host_layout.addWidget(QLabel("Host:"))
+        host_layout.addWidget(self.kraken_host_input)
+        host_layout.addWidget(QLabel("Port:"))
+        host_layout.addWidget(self.kraken_port_input)
+        conn_layout.addWidget(self.kraken_host_row, 1, 0, 1, 2)
+        self.kraken_host_row.hide()
+
+        compass_cont_layout.addWidget(conn_group)
+
+        # Antenna Array & Frequency Tuning
+        array_group = QGroupBox("Antenna Array & Frequency Tuning")
+        array_layout = QGridLayout(array_group)
+        array_layout.setContentsMargins(6, 6, 6, 6)
+
+        self.kraken_freq_spin = QDoubleSpinBox()
+        self.kraken_freq_spin.setRange(24.0, 1766.0)
+        self.kraken_freq_spin.setValue(915.000)
+        self.kraken_freq_spin.setDecimals(3)
+        self.kraken_freq_spin.setSuffix(" MHz")
+        self.kraken_freq_spin.setSingleStep(0.5)
+        self.kraken_freq_spin.setToolTip("KrakenSDR Hardware Limits: 24 MHz to 1766 MHz (R820T2 Tuners)")
+        self.kraken_freq_spin.valueChanged.connect(self.on_kraken_freq_changed)
+        array_layout.addWidget(QLabel("Target VFO:"), 0, 0)
+        array_layout.addWidget(self.kraken_freq_spin, 0, 1)
+
+        self.kraken_array_combo = QComboBox()
+        self.kraken_array_combo.addItems([
+            "5-Antenna Uniform Circular (UCA)",
+            "5-Antenna Uniform Linear (ULA)",
+            "Custom Array Geometry"
+        ])
+        self.kraken_array_combo.currentIndexChanged.connect(self.on_kraken_array_type_changed)
+        array_layout.addWidget(QLabel("Array Geometry:"), 1, 0)
+        array_layout.addWidget(self.kraken_array_combo, 1, 1)
+
+        # Fine-Grained Array Radius / Inter-Element Spacing Input
+        self.kraken_radius_spin = QDoubleSpinBox()
+        self.kraken_radius_spin.setRange(0.010, 5.000)
+        self.kraken_radius_spin.setValue(0.180)
+        self.kraken_radius_spin.setDecimals(3)
+        self.kraken_radius_spin.setSuffix(" m")
+        self.kraken_radius_spin.setSingleStep(0.005)
+        self.kraken_radius_spin.setToolTip("Array radius (UCA) or inter-element spacing (ULA) in meters. Configurable down to millimeter precision.")
+        self.kraken_radius_spin.valueChanged.connect(self.push_kraken_hardware_settings)
+        array_layout.addWidget(QLabel("Array Radius / Spacing:"), 2, 0)
+        array_layout.addWidget(self.kraken_radius_spin, 2, 1)
+
+        # Array Physics & Wavelength Info Badge
+        self.kraken_phys_lbl = QLabel("λ/2: 16.4 cm | Recommended Radius: 0.180 m")
+        self.kraken_phys_lbl.setStyleSheet("color: #38bdf8; font-size: 11px; font-weight: bold;")
+        array_layout.addWidget(self.kraken_phys_lbl, 3, 0, 1, 2)
+
+        # Gain Control
+        self.kraken_gain_spin = QDoubleSpinBox()
+        self.kraken_gain_spin.setRange(0.0, 49.6)
+        self.kraken_gain_spin.setValue(30.0)
+        self.kraken_gain_spin.setDecimals(1)
+        self.kraken_gain_spin.setSuffix(" dB")
+        self.kraken_gain_spin.setSingleStep(2.0)
+        self.kraken_gain_spin.valueChanged.connect(self.push_kraken_hardware_settings)
+        array_layout.addWidget(QLabel("Kraken Gain:"), 4, 0)
+        array_layout.addWidget(self.kraken_gain_spin, 4, 1)
+
+        # Quick Preset Buttons (Optimal Non-Ambiguous Radii)
+        presets_layout = QHBoxLayout()
+        btn_915 = QPushButton("915 MHz (0.135m)")
+        btn_915.setStyleSheet("background-color: #1e293b; color: #38bdf8; font-size: 11px; padding: 3px;")
+        btn_915.clicked.connect(lambda: (self.kraken_freq_spin.setValue(915.000), self.kraken_array_combo.setCurrentIndex(0), self.kraken_radius_spin.setValue(0.135), self.push_kraken_hardware_settings()))
+        btn_868 = QPushButton("868 MHz (0.140m)")
+        btn_868.setStyleSheet("background-color: #1e293b; color: #38bdf8; font-size: 11px; padding: 3px;")
+        btn_868.clicked.connect(lambda: (self.kraken_freq_spin.setValue(868.000), self.kraken_array_combo.setCurrentIndex(0), self.kraken_radius_spin.setValue(0.140), self.push_kraken_hardware_settings()))
+        btn_433 = QPushButton("433 MHz (0.285m)")
+        btn_433.setStyleSheet("background-color: #1e293b; color: #38bdf8; font-size: 11px; padding: 3px;")
+        btn_433.clicked.connect(lambda: (self.kraken_freq_spin.setValue(433.920), self.kraken_array_combo.setCurrentIndex(0), self.kraken_radius_spin.setValue(0.285), self.push_kraken_hardware_settings()))
+        btn_1280 = QPushButton("1280 MHz (0.095m)")
+        btn_1280.setStyleSheet("background-color: #1e293b; color: #38bdf8; font-size: 11px; padding: 3px;")
+        btn_1280.clicked.connect(lambda: (self.kraken_freq_spin.setValue(1280.000), self.kraken_array_combo.setCurrentIndex(0), self.kraken_radius_spin.setValue(0.095), self.push_kraken_hardware_settings()))
+        presets_layout.addWidget(btn_915)
+        presets_layout.addWidget(btn_868)
+        presets_layout.addWidget(btn_433)
+        presets_layout.addWidget(btn_1280)
+        array_layout.addLayout(presets_layout, 5, 0, 1, 2)
+
+        # Apply Retune Button
+        self.apply_kraken_btn = QPushButton("RETUNE & APPLY TO HARDWARE")
+        self.apply_kraken_btn.setStyleSheet("background-color: #1e293b; color: #f59e0b; font-weight: bold; border: 1px solid #f59e0b; padding: 5px;")
+        self.apply_kraken_btn.clicked.connect(self.push_kraken_hardware_settings)
+        array_layout.addWidget(self.apply_kraken_btn, 6, 0, 1, 2)
+
+        range_hint = QLabel("Kraken Hardware Range: 24 MHz - 1766 MHz (5.8 GHz VTX demodulated via HackRF Tab 5)")
+        range_hint.setStyleSheet("color: #64748b; font-size: 10px; font-style: italic;")
+        array_layout.addWidget(range_hint, 7, 0, 1, 2)
+
+        compass_cont_layout.addWidget(array_group)
+
+        # Tactical Map & Intel Actions
+        actions_group = QGroupBox("Tactical Bearing Actions")
+        actions_layout = QGridLayout(actions_group)
+        actions_layout.setContentsMargins(6, 6, 6, 6)
+
+        self.auto_cast_map_cb = QCheckBox("Real-Time Map Bearing Ray")
+        self.auto_cast_map_cb.setChecked(True)
+        actions_layout.addWidget(self.auto_cast_map_cb, 0, 0)
+
+        self.auto_tag_intel_cb = QCheckBox("Auto-Tag Active Intel Emitter")
+        self.auto_tag_intel_cb.setChecked(True)
+        actions_layout.addWidget(self.auto_tag_intel_cb, 0, 1)
+
+        self.cast_map_btn = QPushButton("PROJECT BEARING TO MAP")
+        self.cast_map_btn.setStyleSheet("background-color: #0f172a; color: #38bdf8; font-weight: bold; border: 1px solid #38bdf8; padding: 5px;")
+        self.cast_map_btn.clicked.connect(self.cast_bearing_to_map)
+        actions_layout.addWidget(self.cast_map_btn, 1, 0)
+
+        self.triangulate_btn = QPushButton("RECORD BEARING & FIX TARGET")
+        self.triangulate_btn.setStyleSheet("background-color: #0284c7; color: white; font-weight: bold; border: 1px solid #38bdf8; padding: 5px;")
+        self.triangulate_btn.clicked.connect(self.fix_triangulated_target)
+        actions_layout.addWidget(self.triangulate_btn, 1, 1)
+
+        compass_cont_layout.addWidget(actions_group)
+        layout.addWidget(self.doa_compass_container)
+
+        # Main Start / Stop Button
+        self.toggle_kraken_btn = QPushButton("▶ START DIRECTION FINDING")
+        self.toggle_kraken_btn.setStyleSheet("background-color: #10b981; color: white; font-weight: bold; padding: 8px; font-size: 13px;")
+        self.toggle_kraken_btn.clicked.connect(self.toggle_kraken_doa)
+        layout.addWidget(self.toggle_kraken_btn)
+
+        layout.addStretch()
+        return kraken_widget
+
+    def create_hunter_killer_ui(self):
+        hk_widget = QWidget()
+        layout = QVBoxLayout(hk_widget)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(6)
+
+        # Container for detach/popout capability
+        self.hk_container = QWidget()
+        self.hk_parent_layout = layout
+        hk_cont_layout = QVBoxLayout(self.hk_container)
+        hk_cont_layout.setContentsMargins(0, 0, 0, 0)
+        hk_cont_layout.setSpacing(6)
+
+        # 1. Master Status Badge & Cycle Breadcrumbs
+        status_group = QGroupBox("Autonomous Hunter-Killer Status")
+        status_layout = QVBoxLayout(status_group)
+        status_layout.setContentsMargins(6, 6, 6, 6)
+        status_layout.setSpacing(4)
+
+        self.hk_status_badge = QLabel("[ HUNTER-KILLER: STANDBY / INACTIVE ]")
+        self.hk_status_badge.setStyleSheet("background-color: #060a14; color: #94a3b8; font-family: monospace; font-size: 12px; font-weight: bold; padding: 6px; border: 1px solid #1e293b; border-radius: 4px;")
+        self.hk_status_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        status_layout.addWidget(self.hk_status_badge)
+
+        self.hk_cycle_breadcrumbs = QLabel("CYCLE: [ 1. HUNT ] ➔ [ 2. DETECT ] ➔ [ 3. STARE & FP ] ➔ [ 4. DoA VECTOR ] ➔ [ 5. THREAT EVAL ] ➔ [ 6. RESUME ]")
+        self.hk_cycle_breadcrumbs.setStyleSheet("color: #64748b; font-family: monospace; font-size: 10px; font-weight: bold;")
+        self.hk_cycle_breadcrumbs.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        status_layout.addWidget(self.hk_cycle_breadcrumbs)
+        hk_cont_layout.addWidget(status_group)
+
+        # 2. Mission Control & Configuration
+        ctrl_group = QGroupBox("Autonomous Mission Rules & Parameters")
+        ctrl_layout = QGridLayout(ctrl_group)
+        ctrl_layout.setContentsMargins(6, 6, 6, 6)
+        ctrl_layout.setSpacing(4)
+
+        ctrl_layout.addWidget(QLabel("Operating Mode:"), 0, 0)
+        self.hk_mode_combo = QComboBox()
+        self.hk_mode_combo.addItems([
+            "Full Autonomous (Hunt ➔ Stare ➔ DoA ➔ Map ➔ Resume)",
+            "Semi-Autonomous (Detect & Queue Intercept Candidates)",
+            "Target Intercept & Lock (Sustain Track on Target)"
+        ])
+        ctrl_layout.addWidget(self.hk_mode_combo, 0, 1, 1, 3)
+
+        ctrl_layout.addWidget(QLabel("Tactical Search Band:"), 1, 0)
+        self.hk_band_combo = QComboBox()
+        self.hk_band_combo.addItems([
+            "UAV Control Band (850.0 - 950.0 MHz)",
+            "ISM / OcuSync 2.4G (2400.0 - 2485.0 MHz)",
+            "FPV Video 5.8G (5640.0 - 5950.0 MHz)",
+            "FPV Video 1.2G (1080.0 - 1360.0 MHz)",
+            "Tactical VHF / UHF (136.0 - 470.0 MHz)",
+            "Full Wideband (100.0 - 6000.0 MHz)",
+            "Current Sweep Settings (from Top Toolbar)"
+        ])
+        ctrl_layout.addWidget(self.hk_band_combo, 1, 1, 1, 3)
+
+        ctrl_layout.addWidget(QLabel("Stare Dwell Time:"), 2, 0)
+        self.hk_dwell_spin = QSpinBox()
+        self.hk_dwell_spin.setRange(200, 5000)
+        self.hk_dwell_spin.setValue(1000)
+        self.hk_dwell_spin.setSuffix(" ms")
+        self.hk_dwell_spin.setToolTip("Duration the SDR dwells in Stare Mode for Kraken DoA calibration and CVA fingerprinting.")
+        ctrl_layout.addWidget(self.hk_dwell_spin, 2, 1)
+
+        ctrl_layout.addWidget(QLabel("SNR Threshold:"), 2, 2)
+        self.hk_snr_spin = QSpinBox()
+        self.hk_snr_spin.setRange(8, 50)
+        self.hk_snr_spin.setValue(22)
+        self.hk_snr_spin.setSuffix(" dB")
+        self.hk_snr_spin.setToolTip("Required burst amplitude above dynamic noise floor to trigger Killer stare intercept.")
+        ctrl_layout.addWidget(self.hk_snr_spin, 2, 3)
+
+        # Automation Checkboxes
+        self.hk_auto_kraken_cb = QCheckBox("Auto-Vector KrakenSDR Bearing (DoA)")
+        self.hk_auto_kraken_cb.setChecked(True)
+        self.hk_auto_kraken_cb.setToolTip("Automatically retune KrakenSDR and record Line of Bearing during stare intercept.")
+        ctrl_layout.addWidget(self.hk_auto_kraken_cb, 3, 0, 1, 2)
+
+        self.hk_auto_map_cb = QCheckBox("Auto-Plot Target & CEP Fix to Map")
+        self.hk_auto_map_cb.setChecked(True)
+        self.hk_auto_map_cb.setToolTip("Automatically plot intercept coordinates and CEP triangulation fix on Tactical Map.")
+        ctrl_layout.addWidget(self.hk_auto_map_cb, 3, 2, 1, 2)
+
+        self.hk_audio_alert_cb = QCheckBox("Audible Voice & Tactical Alert Cues")
+        self.hk_audio_alert_cb.setChecked(True)
+        self.hk_audio_alert_cb.setToolTip("Play voice synthesizer alert announcements when high-priority targets are intercepted.")
+        ctrl_layout.addWidget(self.hk_audio_alert_cb, 4, 0, 1, 2)
+
+        self.hk_popout_btn = QPushButton("DETACH H-K")
+        self.hk_popout_btn.setStyleSheet("background-color: #1e293b; color: #38bdf8; font-weight: bold; border: 1px solid #38bdf8; padding: 4px;")
+        self.hk_popout_btn.clicked.connect(self.detach_hk_window)
+        ctrl_layout.addWidget(self.hk_popout_btn, 4, 2, 1, 2)
+
+        hk_cont_layout.addWidget(ctrl_group)
+
+        # 3. Master Engagement Button
+        self.toggle_hk_btn = QPushButton("ENGAGE AUTONOMOUS HUNTER-KILLER")
+        self.toggle_hk_btn.setStyleSheet("background-color: #10b981; color: white; font-weight: bold; padding: 10px; font-size: 13px; border-radius: 4px;")
+        self.toggle_hk_btn.clicked.connect(self.toggle_hunter_killer)
+        hk_cont_layout.addWidget(self.toggle_hk_btn)
+
+        # 4. Live Threat Matrix & Target Priority Queue Table
+        queue_group = QGroupBox("Target Priority Queue & Active Intercepts")
+        queue_layout = QVBoxLayout(queue_group)
+        queue_layout.setContentsMargins(4, 4, 4, 4)
+        queue_layout.setSpacing(4)
+
+        self.hk_queue_table = QTableWidget()
+        self.hk_queue_table.setColumnCount(8)
+        self.hk_queue_table.setHorizontalHeaderLabels([
+            "PRIORITY", "FREQ (MHz)", "CLASSIFICATION", "THREAT", "FINGERPRINT", "BEARING", "RSSI", "ACTIONS"
+        ])
+        self.hk_queue_table.horizontalHeader().setStretchLastSection(True)
+        self.hk_queue_table.setStyleSheet("QTableWidget { background-color: #030712; color: #f8fafc; gridline-color: #1e293b; font-family: monospace; font-size: 11px; } QHeaderView::section { background-color: #0f172a; color: #94a3b8; font-weight: bold; border: 1px solid #1e293b; padding: 3px; }")
+        self.hk_queue_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.hk_queue_table.setMinimumHeight(160)
+        queue_layout.addWidget(self.hk_queue_table)
+
+        # Quick Queue Action Buttons
+        queue_btn_layout = QHBoxLayout()
+        self.hk_lock_sel_btn = QPushButton("LOCK SELECTED TARGET")
+        self.hk_lock_sel_btn.setStyleSheet("background-color: #0284c7; color: white; font-weight: bold; padding: 5px;")
+        self.hk_lock_sel_btn.clicked.connect(self.lock_selected_hk_target)
+
+        self.hk_wipe_queue_btn = QPushButton("CLEAR QUEUE")
+        self.hk_wipe_queue_btn.setStyleSheet("background-color: #ef4444; color: white; font-weight: bold; padding: 5px;")
+        self.hk_wipe_queue_btn.clicked.connect(self.clear_hk_queue)
+
+        self.hk_export_btn = QPushButton("EXPORT CSV")
+        self.hk_export_btn.setStyleSheet("background-color: #334155; color: white; font-weight: bold; padding: 5px;")
+        self.hk_export_btn.clicked.connect(self.export_hk_queue_csv)
+
+        queue_btn_layout.addWidget(self.hk_lock_sel_btn)
+        queue_btn_layout.addWidget(self.hk_wipe_queue_btn)
+        queue_btn_layout.addWidget(self.hk_export_btn)
+        queue_layout.addLayout(queue_btn_layout)
+
+        hk_cont_layout.addWidget(queue_group)
+
+        # 5. Live Intercept Telemetry Card
+        telemetry_group = QGroupBox("Last Intercept Metrics & DoA Telemetry")
+        telemetry_layout = QGridLayout(telemetry_group)
+        telemetry_layout.setContentsMargins(6, 6, 6, 6)
+        telemetry_layout.setSpacing(4)
+
+        self.hk_metric_freq = QLabel("Frequency: -- MHz")
+        self.hk_metric_freq.setStyleSheet("color: #38bdf8; font-family: monospace; font-size: 11px; font-weight: bold;")
+        self.hk_metric_bw = QLabel("Bandwidth: -- kHz")
+        self.hk_metric_bw.setStyleSheet("color: #94a3b8; font-family: monospace; font-size: 11px;")
+        self.hk_metric_snr = QLabel("Peak SNR: -- dB")
+        self.hk_metric_snr.setStyleSheet("color: #94a3b8; font-family: monospace; font-size: 11px;")
+        self.hk_metric_pulse = QLabel("Pulse Width: -- ms")
+        self.hk_metric_pulse.setStyleSheet("color: #94a3b8; font-family: monospace; font-size: 11px;")
+
+        self.hk_metric_bearing = QLabel("DoA Bearing: --°")
+        self.hk_metric_bearing.setStyleSheet("color: #10b981; font-family: monospace; font-size: 12px; font-weight: bold;")
+        self.hk_metric_fingerprint = QLabel("Hardware CVA: 0x----")
+        self.hk_metric_fingerprint.setStyleSheet("color: #f59e0b; font-family: monospace; font-size: 11px; font-weight: bold;")
+
+        telemetry_layout.addWidget(self.hk_metric_freq, 0, 0)
+        telemetry_layout.addWidget(self.hk_metric_bw, 0, 1)
+        telemetry_layout.addWidget(self.hk_metric_snr, 1, 0)
+        telemetry_layout.addWidget(self.hk_metric_pulse, 1, 1)
+        telemetry_layout.addWidget(self.hk_metric_bearing, 2, 0)
+        telemetry_layout.addWidget(self.hk_metric_fingerprint, 2, 1)
+
+        hk_cont_layout.addWidget(telemetry_group)
+
+        layout.addWidget(self.hk_container)
+        return hk_widget
+
+    def toggle_hunter_killer(self):
+        if not getattr(self, 'hk_active', False):
+            self.start_hunter_killer()
+        else:
+            self.stop_hunter_killer()
+
+    def start_hunter_killer(self):
+        self.hk_active = True
+        self.hk_state = "HUNTING"
+        self.toggle_hk_btn.setText("⏹ STOP HUNTER-KILLER")
+        self.toggle_hk_btn.setStyleSheet("background-color: #ef4444; color: white; font-weight: bold; padding: 10px; font-size: 13px; border-radius: 4px;")
+        
+        band_idx = self.hk_band_combo.currentIndex()
+        band_map = {
+            0: (850.0, 950.0),
+            1: (2400.0, 2485.0),
+            2: (5640.0, 5950.0),
+            3: (1080.0, 1360.0),
+            4: (136.0, 470.0),
+            5: (100.0, 6000.0)
+        }
+        if band_idx in band_map:
+            start_mhz, end_mhz = band_map[band_idx]
+            self.sweep_start_input.setValue(start_mhz)
+            self.sweep_end_input.setValue(end_mhz)
+            self.hk_resume_sweep_params = (start_mhz, end_mhz)
+        else:
+            self.hk_resume_sweep_params = (self.sweep_start_input.value(), self.sweep_end_input.value())
+
+        self.hk_status_badge.setText(f"[ HUNTER-KILLER: HUNTING SWEEP {self.hk_resume_sweep_params[0]:.0f} - {self.hk_resume_sweep_params[1]:.0f} MHz ]")
+        self.hk_status_badge.setStyleSheet("background-color: #060a14; color: #10b981; font-family: monospace; font-size: 12px; font-weight: bold; padding: 6px; border: 1px solid #10b981; border-radius: 4px;")
+        self.hk_cycle_breadcrumbs.setText("CYCLE: ▶ [ 1. HUNT ] ➔ [ 2. DETECT ] ➔ [ 3. STARE & FP ] ➔ [ 4. DoA VECTOR ] ➔ [ 5. THREAT EVAL ] ➔ [ 6. RESUME ]")
+        self.hk_cycle_breadcrumbs.setStyleSheet("color: #10b981; font-family: monospace; font-size: 10px; font-weight: bold;")
+        
+        if "SWEEP" not in self.mode_selector.currentText():
+            self.mode_selector.setCurrentText("SWEEP MODE (Wideband)")
+        self.start_sdr()
+        self.log_event(f"AUTONOMOUS HUNTER-KILLER: Engaged in {self.hk_mode_combo.currentText()} ({self.hk_resume_sweep_params[0]:.1f} - {self.hk_resume_sweep_params[1]:.1f} MHz).")
+
+    def stop_hunter_killer(self):
+        self.hk_active = False
+        self.hk_state = "IDLE"
+        self.toggle_hk_btn.setText("ENGAGE AUTONOMOUS HUNTER-KILLER")
+        self.toggle_hk_btn.setStyleSheet("background-color: #10b981; color: white; font-weight: bold; padding: 10px; font-size: 13px; border-radius: 4px;")
+        self.hk_status_badge.setText("[ HUNTER-KILLER: STANDBY / INACTIVE ]")
+        self.hk_status_badge.setStyleSheet("background-color: #060a14; color: #94a3b8; font-family: monospace; font-size: 12px; font-weight: bold; padding: 6px; border: 1px solid #1e293b; border-radius: 4px;")
+        self.hk_cycle_breadcrumbs.setText("CYCLE: [ 1. HUNT ] ➔ [ 2. DETECT ] ➔ [ 3. STARE & FP ] ➔ [ 4. DoA VECTOR ] ➔ [ 5. THREAT EVAL ] ➔ [ 6. RESUME ]")
+        self.hk_cycle_breadcrumbs.setStyleSheet("color: #64748b; font-family: monospace; font-size: 10px; font-weight: bold;")
+        self.log_event("AUTONOMOUS HUNTER-KILLER: Disengaged.")
+
+    def detach_hk_window(self):
+        if not hasattr(self, 'popout_windows'):
+            self.popout_windows = {}
+        if "hk" in self.popout_windows and self.popout_windows["hk"].isVisible():
+            self.popout_windows["hk"].raise_()
+            self.popout_windows["hk"].activateWindow()
+            return
+        win = PopOutWindow("Autonomous Hunter-Killer Engine", self.hk_container, self.hk_parent_layout, 7, self)
+        self.popout_windows["hk"] = win
+        win.closed.connect(lambda: self.popout_windows.pop("hk", None))
+        win.show()
+
+    def calculate_hk_threat_score(self, freq_mhz, rssi, bw_khz, mod_type, is_armed=False):
+        score = 20
+        if 850 <= freq_mhz <= 950:
+            score += 30
+        elif 2400 <= freq_mhz <= 2485:
+            score += 25
+        elif (5640 <= freq_mhz <= 5950) or (1080 <= freq_mhz <= 1360):
+            score += 30
+        elif 136 <= freq_mhz <= 470:
+            score += 15
+
+        if rssi > -60:
+            score += 25
+        elif rssi > -75:
+            score += 15
+        elif rssi > -90:
+            score += 5
+
+        if "LoRa" in mod_type or "CSS" in mod_type or "ELRS" in mod_type:
+            score += 25
+        elif "MATCH" in mod_type or "Orlan" in mod_type:
+            score += 30
+        elif "Video" in mod_type or "PAL" in mod_type or "NTSC" in mod_type or "OFDM" in mod_type or "QAM" in mod_type:
+            score += 25
+        elif "Crossfire" in mod_type or "FSK" in mod_type:
+            score += 20
+        elif "Digital" in mod_type or "PSK" in mod_type:
+            score += 15
+        elif "CW" in mod_type or "Carrier" in mod_type:
+            score += 15
+        elif "FM" in mod_type:
+            score += 10
+
+        if is_armed:
+            score += 15
+
+        return min(100, max(10, score))
+
+    def add_or_update_hk_fhss_cluster(self, band_key, f_min_mhz, f_max_mhz, hops_sec, protocol_name, rssi):
+        if not hasattr(self, 'hk_priority_queue'):
+            self.hk_priority_queue = {}
+        if not hasattr(self, 'active_fhss_bands'):
+            self.active_fhss_bands = {}
+
+        now_str = datetime.datetime.now().strftime("%H:%M:%S")
+        self.active_fhss_bands[band_key] = {
+            'f_min': f_min_mhz,
+            'f_max': f_max_mhz,
+            'last_seen': time.time(),
+            'hops_sec': hops_sec
+        }
+        
+        pilot_info = ""
+        fingerprint = "0x----"
+        if hasattr(self, 'discovered_pilots') and self.discovered_pilots:
+            for uid_str, p in self.discovered_pilots.items():
+                pilot_info = f" [Pilot {p['u3']}:{p['u4']}:{p['u5']}]"
+                fingerprint = f"0x{p['crc_init']}"
+                break
+        elif hasattr(self, 'last_pilot_key') and self.last_pilot_key:
+            pilot_info = f" [{self.last_pilot_key}]"
+
+        center_freq = 915.0 if ("900" in protocol_name or "860" in band_key or "900M" in band_key) else (2440.0 if "2.4" in protocol_name else round((f_min_mhz + f_max_mhz) / 2.0, 1))
+        bearing = getattr(self, 'last_bearing_deg', 0.0)
+
+        self.hk_priority_queue[band_key] = {
+            "priority": "P1 CRITICAL",
+            "p_color": "#ef4444",
+            "freq": center_freq,
+            "freq_display": f"{center_freq:.1f} (FHSS {f_min_mhz:.0f}-{f_max_mhz:.0f})",
+            "mod": f"{protocol_name} (~{hops_sec:.0f} h/s){pilot_info}",
+            "score": 85,
+            "fingerprint": fingerprint,
+            "bearing": bearing,
+            "rssi": rssi,
+            "last_seen": now_str,
+            "timestamp": time.time(),
+            "is_fhss": True
+        }
+
+        # RETROACTIVE CLEANUP: Purge any early transient discrete entries that fall within the FHSS bandwidth limits
+        stale_keys = []
+        for k, entry in self.hk_priority_queue.items():
+            if not entry.get("is_fhss", False):
+                t_freq = entry.get("freq", 0.0)
+                if (f_min_mhz - 3.0 <= t_freq <= f_max_mhz + 3.0):
+                    stale_keys.append(k)
+        if stale_keys:
+            for k in stale_keys:
+                self.hk_priority_queue.pop(k, None)
+
+        # RETROACTIVE INTEL & ANOMALY CLEANUP: Consolidate any transient fingerprints within FHSS limits
+        if hasattr(self, 'fingerprint_db') and self.fingerprint_db:
+            for fp, fp_data in self.fingerprint_db.items():
+                f_found = fp_data.get("found_at", 0.0)
+                if (f_min_mhz - 3.0 <= f_found <= f_max_mhz + 3.0):
+                    if "FHSS" not in fp_data.get("classification", ""):
+                        fp_data["classification"] = f"FHSS Emitter Node ({protocol_name})"
+                        fp_data["name"] = f"FHSS Node 0x{fp}"
+            self.refresh_fingerprint_ui()
+
+        if hasattr(self, 'active_events') and self.active_events:
+            self.active_events = {f_mhz: t for f_mhz, t in self.active_events.items() if not (f_min_mhz - 3.0 <= (f_mhz if isinstance(f_mhz, (int, float)) and f_mhz > 50 else self.bin_to_freq(f_mhz)/1e6) <= f_max_mhz + 3.0)}
+
+        self.refresh_hk_queue_ui()
+
+    def add_or_update_hk_queue(self, freq_mhz, mod_type, score, fingerprint, bearing, rssi):
+        now_str = datetime.datetime.now().strftime("%H:%M:%S")
+        
+        # Deduplication 1: Check active_fhss_bands dictionary
+        for b_key, b_info in getattr(self, 'active_fhss_bands', {}).items():
+            if (time.time() - b_info.get('last_seen', 0) < 6.0) and (b_info['f_min'] - 3.0 <= freq_mhz <= b_info['f_max'] + 3.0):
+                if hasattr(self, 'hk_priority_queue') and b_key in self.hk_priority_queue:
+                    self.hk_priority_queue[b_key]["last_seen"] = now_str
+                    self.hk_priority_queue[b_key]["rssi"] = rssi
+                    self.hk_priority_queue[b_key]["timestamp"] = time.time()
+                    self.refresh_hk_queue_ui()
+                return
+
+        # Deduplication 2: Check known standard drone FHSS ranges (860-930 MHz, 2400-2485 MHz)
+        if 860.0 <= freq_mhz <= 930.0:
+            self.add_or_update_hk_fhss_cluster("FHSS_900M", 860.0, 930.0, 50.0, "TBS Crossfire / ELRS 900M", rssi)
+            return
+        elif 2400.0 <= freq_mhz <= 2485.0:
+            self.add_or_update_hk_fhss_cluster("FHSS_2.4G", 2400.0, 2485.0, 50.0, "DJI OcuSync / ELRS 2.4G", rssi)
+            return
+
+        key = f"{freq_mhz:.3f}"
+        priority = "P3 ADVISORY"
+        p_color = "#38bdf8"
+        if score >= 70:
+            priority = "P1 CRITICAL"
+            p_color = "#ef4444"
+        elif score >= 45:
+            priority = "P2 HIGH"
+            p_color = "#f59e0b"
+
+        if not hasattr(self, 'hk_priority_queue'):
+            self.hk_priority_queue = {}
+
+        self.hk_priority_queue[key] = {
+            "priority": priority,
+            "p_color": p_color,
+            "freq": freq_mhz,
+            "freq_display": f"{freq_mhz:.3f}",
+            "mod": mod_type,
+            "score": score,
+            "fingerprint": fingerprint or "0x----",
+            "bearing": bearing,
+            "rssi": rssi,
+            "last_seen": now_str,
+            "timestamp": time.time(),
+            "is_fhss": False
+        }
+        self.refresh_hk_queue_ui()
+
+    def refresh_hk_queue_ui(self):
+        if not hasattr(self, 'hk_queue_table') or not hasattr(self, 'hk_priority_queue'):
+            return
+        
+        # Sort targets by threat score descending
+        sorted_targets = sorted(self.hk_priority_queue.values(), key=lambda x: x["score"], reverse=True)
+        self.hk_queue_table.setRowCount(len(sorted_targets))
+
+        for row, t in enumerate(sorted_targets):
+            p_item = QTableWidgetItem(t["priority"])
+            p_item.setForeground(QColor(t["p_color"]))
+            p_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.hk_queue_table.setItem(row, 0, p_item)
+
+            f_text = t.get("freq_display", f"{t['freq']:.3f}")
+            f_item = QTableWidgetItem(f_text)
+            f_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.hk_queue_table.setItem(row, 1, f_item)
+
+            m_item = QTableWidgetItem(t["mod"])
+            self.hk_queue_table.setItem(row, 2, m_item)
+
+            s_item = QTableWidgetItem(f"{t['score']}/100")
+            s_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            s_item.setForeground(QColor(t["p_color"]))
+            self.hk_queue_table.setItem(row, 3, s_item)
+
+            fp_item = QTableWidgetItem(t["fingerprint"])
+            fp_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            fp_item.setForeground(QColor("#f59e0b"))
+            self.hk_queue_table.setItem(row, 4, fp_item)
+
+            b_item = QTableWidgetItem(f"{t['bearing']:.1f}°")
+            b_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            b_item.setForeground(QColor("#10b981"))
+            self.hk_queue_table.setItem(row, 5, b_item)
+
+            r_item = QTableWidgetItem(f"{t['rssi']:.0f} dBFS")
+            r_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.hk_queue_table.setItem(row, 6, r_item)
+
+            action_btn = QPushButton("LOCK")
+            action_btn.setStyleSheet("background-color: #0284c7; color: white; font-weight: bold; padding: 2px 6px;")
+            target_freq = t['freq']
+            action_btn.clicked.connect(lambda _, f=target_freq: self.lock_hk_target(f))
+            self.hk_queue_table.setCellWidget(row, 7, action_btn)
+
+    def lock_selected_hk_target(self):
+        if not hasattr(self, 'hk_queue_table'):
+            return
+        row = self.hk_queue_table.currentRow()
+        if row < 0:
+            return
+        freq_item = self.hk_queue_table.item(row, 1)
+        if freq_item:
+            try:
+                freq = float(freq_item.text())
+                self.lock_hk_target(freq)
+            except Exception:
+                pass
+
+    def lock_hk_target(self, freq_mhz):
+        self.log_event(f"HUNTER-KILLER: Locking SDR into continuous stare on target {freq_mhz:.3f} MHz.")
+        self.hk_state = "TRACK_LOCKED"
+        self.hk_target_freq = freq_mhz
+        if hasattr(self, 'hk_status_badge'):
+            self.hk_status_badge.setText(f"[ TRACK LOCKED: CONTINUOUS INTERCEPT @ {freq_mhz:.3f} MHz ]")
+            self.hk_status_badge.setStyleSheet("background-color: #060a14; color: #ef4444; font-family: monospace; font-size: 12px; font-weight: bold; padding: 6px; border: 1px solid #ef4444; border-radius: 4px;")
+        
+        self.mode_selector.setCurrentText("STARE MODE (2MHz)")
+        self.freq_input.setValue(freq_mhz)
+        self.start_sdr()
+
+    def clear_hk_queue(self):
+        if hasattr(self, 'hk_priority_queue'):
+            self.hk_priority_queue.clear()
+            self.refresh_hk_queue_ui()
+            self.log_event("HUNTER-KILLER: Target Priority Queue cleared.")
+
+    def export_hk_queue_csv(self):
+        if not hasattr(self, 'hk_priority_queue') or not self.hk_priority_queue:
+            self.log_event("HUNTER-KILLER: Queue is empty. Nothing to export.")
+            return
+        filename = f"hk_intercepts_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write("Priority,Frequency_MHz,Classification,Threat_Score,Fingerprint,Bearing_Deg,RSSI_dBFS,Last_Seen\n")
+                for t in self.hk_priority_queue.values():
+                    f.write(f"{t['priority']},{t['freq']:.3f},{t['mod']},{t['score']},{t['fingerprint']},{t['bearing']:.1f},{t['rssi']:.1f},{t['last_seen']}\n")
+            self.log_event(f"HUNTER-KILLER: Exported intercept queue to {filename}")
+        except Exception as e:
+            self.log_event(f"HUNTER-KILLER export error: {e}")
+
+    def create_tactical_copilot_ui(self):
+        copilot_widget = QWidget()
+        layout = QVBoxLayout(copilot_widget)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(6)
+
+        # 1. Master Status Badge
+        status_group = QGroupBox("Tactical AI Intelligence Copilot")
+        status_layout = QVBoxLayout(status_group)
+        status_layout.setContentsMargins(6, 6, 6, 6)
+        status_layout.setSpacing(4)
+
+        self.copilot_status_badge = QLabel("[ AI COPILOT: ON-DEVICE EW INTELLIGENCE ENGINE (READY) ]")
+        self.copilot_status_badge.setStyleSheet("background-color: #060a14; color: #38bdf8; font-family: monospace; font-size: 11px; font-weight: bold; padding: 6px; border: 1px solid #0284c7; border-radius: 4px;")
+        self.copilot_status_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        status_layout.addWidget(self.copilot_status_badge)
+        layout.addWidget(status_group)
+
+        # 2. Action Control Panel
+        actions_group = QGroupBox("Automated Intelligence Actions")
+        actions_layout = QGridLayout(actions_group)
+        actions_layout.setContentsMargins(6, 6, 6, 6)
+        actions_layout.setSpacing(6)
+
+        self.copilot_sitrep_btn = QPushButton("GENERATE NATO SITREP / INTSUM")
+        self.copilot_sitrep_btn.setStyleSheet("background-color: #10b981; color: white; font-weight: bold; padding: 8px; font-size: 11pt;")
+        self.copilot_sitrep_btn.clicked.connect(self.generate_copilot_sitrep)
+        actions_layout.addWidget(self.copilot_sitrep_btn, 0, 0, 1, 2)
+
+        self.copilot_threats_btn = QPushButton("THREAT SUMMARY")
+        self.copilot_threats_btn.setStyleSheet("background-color: #1e293b; color: #38bdf8; font-weight: bold; padding: 6px;")
+        self.copilot_threats_btn.clicked.connect(lambda: self.copilot_quick_query("Summarize all active threats and priorities"))
+        actions_layout.addWidget(self.copilot_threats_btn, 1, 0)
+
+        self.copilot_pilots_btn = QPushButton("PILOT INTEL")
+        self.copilot_pilots_btn.setStyleSheet("background-color: #1e293b; color: #38bdf8; font-weight: bold; padding: 6px;")
+        self.copilot_pilots_btn.clicked.connect(lambda: self.copilot_quick_query("Summarize decoded pilots and armed telemetry"))
+        actions_layout.addWidget(self.copilot_pilots_btn, 1, 1)
+
+        self.copilot_ecm_btn = QPushButton("ECM ADVISORY")
+        self.copilot_ecm_btn.setStyleSheet("background-color: #1e293b; color: #f59e0b; font-weight: bold; padding: 6px;")
+        self.copilot_ecm_btn.clicked.connect(lambda: self.copilot_quick_query("Recommend electronic countermeasures and jamming vectors"))
+        actions_layout.addWidget(self.copilot_ecm_btn, 2, 0)
+
+        self.copilot_export_btn = QPushButton("EXPORT REPORT")
+        self.copilot_export_btn.setStyleSheet("background-color: #1e293b; color: #e2e8f0; font-weight: bold; padding: 6px;")
+        self.copilot_export_btn.clicked.connect(self.export_copilot_sitrep)
+        actions_layout.addWidget(self.copilot_export_btn, 2, 1)
+
+        layout.addWidget(actions_group)
+
+        # 3. Monospace Intelligence Report / Output Viewer
+        output_group = QGroupBox("Tactical Report & Intelligence Output")
+        output_layout = QVBoxLayout(output_group)
+        output_layout.setContentsMargins(6, 6, 6, 6)
+        output_layout.setSpacing(4)
+
+        self.copilot_output = QTextEdit()
+        self.copilot_output.setReadOnly(True)
+        self.copilot_output.setStyleSheet("background-color: #060a14; color: #38bdf8; font-family: 'Consolas', monospace; font-size: 9.5pt; border: 1px solid #1e293b; border-radius: 4px; padding: 6px;")
+        self.copilot_output.setMinimumHeight(240)
+        output_layout.addWidget(self.copilot_output)
+        layout.addWidget(output_group)
+
+        # 4. Interactive Natural Language Operator Query Console
+        query_group = QGroupBox("Operator Natural Language Query Console")
+        query_layout = QHBoxLayout(query_group)
+        query_layout.setContentsMargins(6, 6, 6, 6)
+        query_layout.setSpacing(6)
+
+        self.copilot_query_input = QLineEdit()
+        self.copilot_query_input.setPlaceholderText("Ask Copilot (e.g., 'What P1 threats are active?', 'Recommend ECM vector')...")
+        self.copilot_query_input.returnPressed.connect(self.on_copilot_query_submitted)
+        query_layout.addWidget(self.copilot_query_input)
+
+        self.copilot_send_btn = QPushButton("SEND QUERY")
+        self.copilot_send_btn.setStyleSheet("background-color: #0284c7; color: white; font-weight: bold; padding: 6px 12px;")
+        self.copilot_send_btn.clicked.connect(self.on_copilot_query_submitted)
+        query_layout.addWidget(self.copilot_send_btn)
+
+        layout.addWidget(query_group)
+
+        self.copilot_output.setText("Tactical AI Intelligence Copilot Initialized.\nClick 'GENERATE NATO SITREP / INTSUM' or submit an operator query.")
+
+        return copilot_widget
+
+    def _build_copilot_context(self):
+        lat = 51.5074
+        lon = -0.1278
+        if hasattr(self, 'geo_lat_input') and self.geo_lat_input.text():
+            try: lat = float(self.geo_lat_input.text())
+            except ValueError: pass
+        if hasattr(self, 'geo_lon_input') and self.geo_lon_input.text():
+            try: lon = float(self.geo_lon_input.text())
+            except ValueError: pass
+
+        return {
+            "station_callsign": "CEMA-STATION-ALPHA",
+            "station_loc": (lat, lon),
+            "hk_queue": getattr(self, 'hk_priority_queue', {}),
+            "pilots": getattr(self, 'discovered_pilots', {}),
+            "last_bearing": getattr(self, 'last_bearing_deg', 0.0),
+            "bearing_history": getattr(self, 'bearing_history', []),
+            "cep_fix": getattr(self, 'last_triangulation_fix', None)
+        }
+
+    def generate_copilot_sitrep(self):
+        from tactical_copilot import get_tactical_copilot
+        copilot = get_tactical_copilot()
+        ctx = self._build_copilot_context()
+        report = copilot.generate_nato_sitrep(ctx)
+        self.copilot_output.setText(report)
+        self.log_event("TACTICAL AI COPILOT: Generated automated NATO INTSUM / SITREP.")
+
+    def copilot_quick_query(self, prompt):
+        from tactical_copilot import get_tactical_copilot
+        copilot = get_tactical_copilot()
+        ctx = self._build_copilot_context()
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        self.copilot_output.setText(f"[{timestamp}] OPERATOR QUERY: {prompt}\n" + "="*50 + f"\n\n[ THINKING / REASONING ON RTX 3060 GPU... ]")
+        
+        def _worker():
+            resp = copilot.answer_operator_query(prompt, ctx)
+            self.copilot_response_signal.emit(prompt, resp)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_copilot_response_received(self, prompt, resp):
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        self.copilot_output.setText(f"[{timestamp}] OPERATOR QUERY: {prompt}\n" + "="*50 + f"\n\n{resp}")
+        
+        from tactical_copilot import get_tactical_copilot
+        copilot = get_tactical_copilot()
+        if hasattr(self, 'copilot_status_badge'):
+            if copilot.is_slm_ready():
+                self.copilot_status_badge.setText(f"[ AI COPILOT: {copilot.slm_status} | VRAM: 1.1GB ]")
+                self.copilot_status_badge.setStyleSheet("background-color: #060a14; color: #10b981; font-family: monospace; font-size: 11px; font-weight: bold; padding: 6px; border: 1px solid #10b981; border-radius: 4px;")
+
+    def on_copilot_query_submitted(self):
+        query = self.copilot_query_input.text().strip()
+        if not query:
+            return
+        self.copilot_query_input.clear()
+        self.copilot_quick_query(query)
+
+    def export_copilot_sitrep(self):
+        content = self.copilot_output.toPlainText()
+        if not content:
+            self.log_event("COPILOT: No report content to export.")
+            return
+        filename = f"INTSUM_SITREP_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(content)
+            self.log_event(f"COPILOT: Exported intelligence report to {filename}")
+        except Exception as e:
+            self.log_event(f"COPILOT: Export error: {e}")
+
+    def on_kraken_array_type_changed(self, idx):
+        freq = self.kraken_freq_spin.value()
+        wavelength = 299.792458 / freq if freq > 0 else 0.327
+        if idx == 0:
+            # UCA: Max unambiguous radius is 0.4253 * wavelength, recommend ~0.41 * wavelength
+            rec_radius = round(0.412 * wavelength, 3)
+            self.kraken_radius_spin.setValue(rec_radius)
+        elif idx == 1:
+            # ULA: Max unambiguous element spacing is 0.5 * wavelength, recommend ~0.48 * wavelength
+            rec_spacing = round(0.480 * (wavelength / 2.0), 3)
+            self.kraken_radius_spin.setValue(rec_spacing)
+        self.update_kraken_physics_hint()
+        self.push_kraken_hardware_settings()
+
+    def update_kraken_physics_hint(self):
+        if not hasattr(self, 'kraken_phys_lbl') or not hasattr(self, 'kraken_freq_spin'):
+            return
+        freq = self.kraken_freq_spin.value()
+        if freq <= 0: return
+        wavelength = 299.792458 / freq # in meters
+        radius = self.kraken_radius_spin.value() if hasattr(self, 'kraken_radius_spin') else 0.180
+        array_idx = self.kraken_array_combo.currentIndex() if hasattr(self, 'kraken_array_combo') else 0
+        
+        # Kraken's exact physical chord length formula (5-element array):
+        # chord = sqrt(2) * radius * sqrt(1 - cos(72°)) = 1.1755705 * radius
+        if array_idx == 0: # UCA
+            chord_spacing = 1.1755705 * radius
+            max_unambig_radius = 0.425325 * wavelength
+            max_phase_diff = chord_spacing / wavelength
+            phase_diff_deg = max_phase_diff * 360.0
+            
+            if max_phase_diff > 0.5:
+                self.kraken_phys_lbl.setText(f"[ WARNING: AMBIGUOUS (Phase Diff {phase_diff_deg:.1f} deg > 180 deg) ] Set Radius <= {max_unambig_radius:.3f}m")
+                self.kraken_phys_lbl.setStyleSheet("color: #ef4444; font-size: 11px; font-weight: bold;")
+            elif max_phase_diff < 0.1:
+                self.kraken_phys_lbl.setText(f"[ WARNING: ARRAY TOO SMALL (Phase Diff {phase_diff_deg:.1f} deg < 36 deg) ] Recommended: {max_unambig_radius*0.95:.3f}m")
+                self.kraken_phys_lbl.setStyleSheet("color: #f59e0b; font-size: 11px; font-weight: bold;")
+            else:
+                self.kraken_phys_lbl.setText(f"[ OPTIMAL UCA: Phase Diff {phase_diff_deg:.1f} deg (<= 180 deg) ] Max Limit: {max_unambig_radius:.3f}m")
+                self.kraken_phys_lbl.setStyleSheet("color: #10b981; font-size: 11px; font-weight: bold;")
+        else: # ULA
+            max_unambig_spacing = 0.5 * wavelength
+            max_phase_diff = radius / wavelength
+            phase_diff_deg = max_phase_diff * 360.0
+            if max_phase_diff > 0.5:
+                self.kraken_phys_lbl.setText(f"[ WARNING: AMBIGUOUS (Spacing {radius:.3f}m > Half-Wave {max_unambig_spacing:.3f}m) ] Phase: {phase_diff_deg:.1f} deg")
+                self.kraken_phys_lbl.setStyleSheet("color: #ef4444; font-size: 11px; font-weight: bold;")
+            else:
+                self.kraken_phys_lbl.setText(f"[ OPTIMAL ULA: Spacing {radius:.3f}m (<= {max_unambig_spacing:.3f}m) ] Phase: {phase_diff_deg:.1f} deg")
+                self.kraken_phys_lbl.setStyleSheet("color: #10b981; font-size: 11px; font-weight: bold;")
+
+    def _get_usbipd_path(self):
+        candidates = [
+            r"C:\Program Files\usbipd-win\usbipd.exe",
+            r"C:\Program Files\usbipd\usbipd.exe",
+            shutil.which("usbipd") if hasattr(shutil, 'which') else None
+        ]
+        for p in candidates:
+            if p and os.path.exists(p):
+                return p
+        return "usbipd"
+
+    def ensure_wsl_running(self):
+        try:
+            res = subprocess.run(["wsl.exe", "-l", "-v"], capture_output=True, text=True, timeout=3)
+            if "Ubuntu" in res.stdout and "Running" in res.stdout:
+                return True
+        except Exception:
+            pass
+        
+        # Start persistent background keepalive
+        try:
+            if not hasattr(self, '_wsl_keepalive') or self._wsl_keepalive is None or self._wsl_keepalive.poll() is not None:
+                self._wsl_keepalive = subprocess.Popen(
+                    ["wsl.exe", "-d", "Ubuntu", "-e", "sleep", "infinity"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                )
+                time.sleep(1.0)
+            return True
+        except Exception as e:
+            print(f"[WSL KEEPALIVE ERROR] {e}")
+            return False
+
+    def start_kraken_service(self):
+        self.log_event("KRAKENSDR SERVICE: Initiating startup in WSL2 Ubuntu...")
+        if hasattr(self, 'kraken_health_badge'):
+            self.kraken_health_badge.setText("[ SERVER: STARTING DAEMON IN WSL... ]")
+            self.kraken_health_badge.setStyleSheet("background-color: #060a14; color: #fbbf24; font-family: monospace; font-size: 11px; font-weight: bold; padding: 5px; border: 1px solid #d97706; border-radius: 4px;")
+        
+        def _run_start():
+            try:
+                self.ensure_wsl_running()
+                # Ensure tuners are attached before starting DAQ
+                usbipd = self._get_usbipd_path()
+                out = subprocess.run([usbipd, "list"], capture_output=True, text=True, timeout=5)
+                for line in out.stdout.splitlines():
+                    m = re.search(r'^\s*([0-9]+-[0-9]+)\s+0bda:2838', line)
+                    if m and "Attached" not in line:
+                        subprocess.run([usbipd, "bind", "--force", "--busid", m.group(1)], capture_output=True, timeout=3)
+                        subprocess.run([usbipd, "attach", "--wsl", "Ubuntu", "--busid", m.group(1)], capture_output=True, timeout=4)
+                
+                subprocess.Popen(
+                    ["wsl.exe", "-d", "Ubuntu", "-e", "bash", "-c", "cd /home/feeka/krakensdr_doa && ./kraken_doa_start.sh"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                )
+            except Exception as e:
+                print(f"[KRAKEN START ERROR] {e}")
+
+        threading.Thread(target=_run_start, daemon=True).start()
+        QTimer.singleShot(4000, self.check_kraken_health)
+
+    def stop_kraken_service(self):
+        self.log_event("KRAKENSDR SERVICE: Stopping DAQ & GUI processes...")
+        if hasattr(self, 'kraken_health_badge'):
+            self.kraken_health_badge.setText("[ SERVER: STOPPING PROCESSES... ]")
+            self.kraken_health_badge.setStyleSheet("background-color: #060a14; color: #f87171; font-family: monospace; font-size: 11px; font-weight: bold; padding: 5px; border: 1px solid #dc2626; border-radius: 4px;")
+        
+        def _run_stop():
+            try:
+                subprocess.run(
+                    ["wsl.exe", "-d", "Ubuntu", "-e", "bash", "-c", "cd /home/feeka/krakensdr_doa && ./kraken_doa_stop.sh; sudo pkill -9 -f 'daq|krakensdr|heimdall' 2>/dev/null"],
+                    capture_output=True,
+                    timeout=5
+                )
+            except Exception as e:
+                print(f"[KRAKEN STOP ERROR] {e}")
+
+        threading.Thread(target=_run_stop, daemon=True).start()
+        QTimer.singleShot(2000, self.check_kraken_health)
+
+    def restart_kraken_service(self):
+        self.log_event("KRAKENSDR SERVICE: Restarting DAQ & GUI processes...")
+        self.stop_kraken_service()
+        QTimer.singleShot(2500, self.start_kraken_service)
+
+    def check_kraken_health(self):
+        def _worker():
+            host = self.settings.get("kraken_host", "127.0.0.1")
+            api_port = int(self.settings.get("kraken_api_port", 8080))
+            doa_port = int(self.settings.get("kraken_doa_port", 8081))
+            
+            api_ok = False
+            doa_ok = False
+            latency = 0.0
+            tuners_found = 0
+            proc_running = False
+
+            # Ensure WSL is running
+            wsl_up = self.ensure_wsl_running()
+
+            # 1. Test HTTP API (Port 8080)
+            try:
+                t0 = time.time()
+                with urllib.request.urlopen(f"http://{host}:{api_port}/", timeout=1.2) as resp:
+                    if resp.status in [200, 302, 301]:
+                        api_ok = True
+                        latency = (time.time() - t0) * 1000.0
+            except Exception:
+                pass
+
+            # 2. Test Fast DoA Stream (Port 8081)
+            try:
+                with urllib.request.urlopen(f"http://{host}:{doa_port}/DOA_value.html", timeout=1.2) as resp:
+                    if resp.status == 200:
+                        doa_ok = True
+            except Exception:
+                pass
+
+            # 3. Check WSL Process & USB tuners
+            if wsl_up:
+                try:
+                    out = subprocess.run(
+                        ["wsl.exe", "-d", "Ubuntu", "-e", "/bin/bash", "-c", "ps -ef | grep -E '(daq|kraken|heimdall)' | grep -v grep | wc -l; lsusb | grep -c 0bda:2838"],
+                        capture_output=True,
+                        text=True,
+                        timeout=3
+                    )
+                    if out.returncode == 0:
+                        lines = out.stdout.strip().splitlines()
+                        if len(lines) >= 1:
+                            proc_running = (int(lines[0].strip()) > 0)
+                        if len(lines) >= 2:
+                            tuners_found = int(lines[1].strip())
+                except Exception:
+                    pass
+
+            # Determine health state
+            if doa_ok or (api_ok and tuners_found == 5):
+                msg = f"[ KRAKENSDR ONLINE | Web: {api_port} | DoA Stream: {doa_port} | Ping: {latency:.0f}ms | Tuners: {tuners_found}/5 ]"
+                color = "#10b981"
+                border = "#10b981"
+            elif tuners_found == 5 and proc_running:
+                msg = f"[ KRAKENSDR INITIALIZING | Daq Running | Tuners: 5/5 | Web GUI Starting... ]"
+                color = "#fbbf24"
+                border = "#d97706"
+            elif tuners_found > 0 and tuners_found < 5:
+                msg = f"[ KRAKENSDR DEGRADED | Tuners: {tuners_found}/5 Attached | Click Auto-Repair ]"
+                color = "#f59e0b"
+                border = "#d97706"
+            elif tuners_found == 0:
+                msg = f"[ KRAKENSDR OFFLINE | USB Tuners Detached (0/5) | Click Auto-Repair ]"
+                color = "#f87171"
+                border = "#dc2626"
+            else:
+                msg = f"[ KRAKENSDR OFFLINE / STOPPED | Host: {host} | Port {api_port} Unreachable ]"
+                color = "#f87171"
+                border = "#dc2626"
+            
+            self.kraken_health_signal.emit(msg, color, border)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_kraken_health_updated(self, msg, color, border):
+        if hasattr(self, 'kraken_health_badge'):
+            self.kraken_health_badge.setText(msg)
+            self.kraken_health_badge.setStyleSheet(f"background-color: #060a14; color: {color}; font-family: monospace; font-size: 11px; font-weight: bold; padding: 5px; border: 1px solid {border}; border-radius: 4px;")
+
+    def attach_kraken_usb(self):
+        self.log_event("KRAKENSDR USB: Scanning and attaching RTL-SDR tuners to WSL2...")
+        if hasattr(self, 'kraken_health_badge'):
+            self.kraken_health_badge.setText("[ USB: ATTACHING TUNERS TO WSL... ]")
+            self.kraken_health_badge.setStyleSheet("background-color: #060a14; color: #fbbf24; font-family: monospace; font-size: 11px; font-weight: bold; padding: 5px; border: 1px solid #d97706; border-radius: 4px;")
+
+        def _worker():
+            count = 0
+            try:
+                self.ensure_wsl_running()
+                usbipd = self._get_usbipd_path()
+                out = subprocess.run([usbipd, "list"], capture_output=True, text=True, timeout=6)
+                buses = []
+                for line in out.stdout.splitlines():
+                    m = re.search(r'^\s*([0-9]+-[0-9]+)\s+0bda:2838', line)
+                    if m:
+                        buses.append(m.group(1))
+                
+                for bus in buses:
+                    subprocess.run([usbipd, "bind", "--force", "--busid", bus], capture_output=True, timeout=3)
+                    res = subprocess.run([usbipd, "attach", "--wsl", "Ubuntu", "--busid", bus], capture_output=True, text=True, timeout=5)
+                    if res.returncode == 0:
+                        count += 1
+            except Exception as e:
+                print(f"[USB ATTACH ERROR] {e}")
+
+            def _done():
+                self.log_event(f"KrakenSDR USB: Successfully attached {count} RTL-SDR tuner(s) to Ubuntu WSL2.")
+                self.check_kraken_health()
+
+            QTimer.singleShot(0, _done)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def repair_kraken_sdr(self):
+        self.log_event("KRAKENSDR AUTO-REPAIR: Initiating full diagnosis and self-healing sequence...")
+        if hasattr(self, 'kraken_health_badge'):
+            self.kraken_health_badge.setText("[ AUTO-REPAIR: DIAGNOSING & HEALING... ]")
+            self.kraken_health_badge.setStyleSheet("background-color: #060a14; color: #38bdf8; font-family: monospace; font-size: 11px; font-weight: bold; padding: 5px; border: 1px solid #0284c7; border-radius: 4px;")
+
+        def _heal_worker():
+            log_steps = []
+            
+            # Step 1: Ensure Ubuntu WSL is running with persistent keepalive
+            try:
+                self.ensure_wsl_running()
+                log_steps.append("1. Verified Ubuntu WSL2 runtime environment active.")
+            except Exception as e:
+                log_steps.append(f"1. WSL Boot error: {e}")
+
+            # Step 2: Unload interfering DVB kernel drivers and clear stale shared memory locks
+            try:
+                subprocess.run(
+                    ["wsl.exe", "-d", "Ubuntu", "-e", "bash", "-c", "sudo rm -f /dev/shm/sem.* /dev/shm/*kraken* /dev/shm/*daq* /dev/shm/*heimdall* 2>/dev/null; sudo rmmod dvb_usb_rtl28xxu rtl2832 rtl2830 2>/dev/null"],
+                    capture_output=True,
+                    timeout=5
+                )
+                log_steps.append("2. Cleared stale shared memory /dev/shm/* & unloaded conflicting DVB drivers.")
+            except Exception as e:
+                log_steps.append(f"2. Shared memory cleanup error: {e}")
+
+            # Step 3: Hard kill zombie DAQ & GUI processes
+            try:
+                subprocess.run(
+                    ["wsl.exe", "-d", "Ubuntu", "-e", "bash", "-c", "cd /home/feeka/krakensdr_doa && ./kraken_doa_stop.sh; sudo pkill -9 -f 'daq|krakensdr|heimdall' 2>/dev/null"],
+                    capture_output=True,
+                    timeout=5
+                )
+                log_steps.append("3. Terminated old/zombie DAQ and GUI processes.")
+            except Exception as e:
+                log_steps.append(f"3. Process stop error: {e}")
+
+            # Step 4: Scan and re-attach all 5 RTL-SDR tuners via usbipd
+            try:
+                usbipd = self._get_usbipd_path()
+                out = subprocess.run([usbipd, "list"], capture_output=True, text=True, timeout=5)
+                attached_count = 0
+                for line in out.stdout.splitlines():
+                    m = re.search(r'^\s*([0-9]+-[0-9]+)\s+0bda:2838', line)
+                    if m:
+                        subprocess.run([usbipd, "bind", "--force", "--busid", m.group(1)], capture_output=True, timeout=3)
+                        r = subprocess.run([usbipd, "attach", "--wsl", "Ubuntu", "--busid", m.group(1)], capture_output=True, timeout=5)
+                        if r.returncode == 0:
+                            attached_count += 1
+                log_steps.append(f"4. Attached {attached_count}/5 RTL-SDR tuners to Ubuntu WSL2.")
+            except Exception as e:
+                log_steps.append(f"4. USB scan error: {e}")
+
+            # Step 5: Validate and repair settings.json
+            wsl_settings = r"\\wsl.localhost\Ubuntu\home\feeka\krakensdr_doa\krakensdr_doa\_share\settings.json"
+            if os.path.exists(wsl_settings):
+                try:
+                    with open(wsl_settings, 'r', encoding='utf-8') as f:
+                        cfg = json.load(f)
+                except Exception:
+                    cfg = {}
+                
+                freq = self.kraken_freq_spin.value() if hasattr(self, 'kraken_freq_spin') else 915.0
+                arr_r = self.kraken_radius_spin.value() if hasattr(self, 'kraken_radius_spin') else 0.135
+                cfg["center_freq"] = float(freq)
+                cfg["vfo_freq_0"] = float(freq * 1e6)
+                cfg["uniform_gain"] = 30.0
+                cfg["en_doa"] = True
+                cfg["ant_arrangement"] = "UCA"
+                cfg["ant_spacing_meters"] = float(arr_r)
+                cfg["ext_upd_flag"] = True
+                try:
+                    with open(wsl_settings, 'w', encoding='utf-8') as f:
+                        json.dump(cfg, f, indent=2)
+                    log_steps.append("5. Repaired settings.json (VFO & Array geometry sanitized).")
+                except Exception as e:
+                    log_steps.append(f"5. Settings write error: {e}")
+
+            time.sleep(1.0)
+
+            # Step 6: Clean start DAQ and Web GUI
+            try:
+                subprocess.Popen(
+                    ["wsl.exe", "-d", "Ubuntu", "-e", "bash", "-c", "cd /home/feeka/krakensdr_doa && ./kraken_doa_start.sh"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                )
+                log_steps.append("6. KrakenSDR DAQ & Web GUI restarted cleanly.")
+            except Exception as e:
+                log_steps.append(f"6. Start error: {e}")
+
+            def _finish():
+                for s in log_steps:
+                    self.log_event(f"REPAIR: {s}")
+                self.check_kraken_health()
+                # Restart DoA stream thread to immediately acquire live stream
+                if hasattr(self, 'start_kraken_doa'):
+                    self.start_kraken_doa()
+
+            QTimer.singleShot(4000, _finish)
+
+        threading.Thread(target=_heal_worker, daemon=True).start()
+
+    def push_kraken_hardware_settings(self, force=False):
+        freq_mhz = round(self.kraken_freq_spin.value(), 3)
+        gain_val = round(self.kraken_gain_spin.value() if hasattr(self, 'kraken_gain_spin') else 30.0, 1)
+        arr_spacing = round(self.kraken_radius_spin.value() if hasattr(self, 'kraken_radius_spin') else 0.135, 3)
+        array_idx = self.kraken_array_combo.currentIndex() if hasattr(self, 'kraken_array_combo') else 0
+        
+        arr_type = "UCA"
+        if array_idx == 1:
+            arr_type = "ULA"
+        elif array_idx == 2:
+            arr_type = "Custom"
+
+        self.update_kraken_physics_hint()
+
+        target_state = (freq_mhz, gain_val, arr_spacing, arr_type)
+        if not force and getattr(self, '_last_kraken_pushed_state', None) == target_state:
+            return
+
+        wsl_paths = [
+            r"\\wsl.localhost\Ubuntu\home\feeka\krakensdr_doa\krakensdr_doa\_share\settings.json",
+            r"\\wsl$\Ubuntu\home\feeka\krakensdr_doa\krakensdr_doa\_share\settings.json",
+            r"\\wsl.localhost\Ubuntu\home\feeka\krakensdr_doa\krakensdr_doa\_nodejs\settings.json",
+            r"\\wsl$\Ubuntu\home\feeka\krakensdr_doa\krakensdr_doa\_nodejs\settings.json"
+        ]
+        
+        cfg = {}
+        for p in wsl_paths:
+            if os.path.exists(p):
+                try:
+                    with open(p, 'r', encoding='utf-8') as f:
+                        cfg = json.load(f)
+                    if cfg:
+                        break
+                except Exception:
+                    pass
+        
+        if not cfg:
+            cfg = {
+                "center_freq": float(freq_mhz),
+                "uniform_gain": float(gain_val),
+                "data_interface": "shmem",
+                "default_ip": "0.0.0.0",
+                "en_remote_control": False,
+                "en_doa": True,
+                "ant_arrangement": arr_type,
+                "ula_direction": "Both",
+                "ant_spacing_meters": float(arr_spacing),
+                "doa_method": "MUSIC",
+                "active_vfos": 1,
+                "output_vfo": 0,
+                "vfo_freq_0": float(freq_mhz * 1e6),
+                "ext_upd_flag": True
+            }
+
+        # Safely update only target parameters
+        cfg["center_freq"] = float(freq_mhz)
+        cfg["uniform_gain"] = float(gain_val)
+        cfg["en_doa"] = True
+        cfg["ant_arrangement"] = arr_type
+        cfg["ant_spacing_meters"] = float(arr_spacing)
+        cfg["vfo_freq_0"] = float(freq_mhz * 1e6)
+        cfg["ext_upd_flag"] = True
+
+        # Write merged config back to all accessible WSL paths
+        written = False
+        for p in wsl_paths:
+            try:
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, 'w', encoding='utf-8') as f:
+                    json.dump(cfg, f, indent=2)
+                written = True
+            except Exception:
+                pass
+
+        # Trigger inotify inside WSL so DAQ hw_controller reloads immediately
+        def _touch_wsl():
+            try:
+                subprocess.run(
+                    ["wsl.exe", "-d", "Ubuntu", "-e", "bash", "-c", "touch /home/feeka/krakensdr_doa/krakensdr_doa/_share/settings.json"],
+                    capture_output=True,
+                    timeout=2
+                )
+            except Exception:
+                pass
+        threading.Thread(target=_touch_wsl, daemon=True).start()
+
+        self._last_kraken_pushed_state = target_state
+        if written:
+            self.log_event(f"Retuned Kraken Hardware: {freq_mhz:.3f} MHz | Gain {gain_val:.1f}dB | {arr_type} (Radius: {arr_spacing:.3f}m)")
+        else:
+            self.log_event(f"Kraken retune error: Could not write to WSL settings.json paths.")
+
+    def on_kraken_mode_changed(self, index):
+        if index == 0:
+            self.kraken_host_row.hide()
+            self.kraken_host_input.setText("127.0.0.1")
+            self.kraken_port_input.setValue(8081)
+        elif index == 1:
+            self.kraken_host_row.hide()
+        elif index == 2:
+            self.kraken_host_row.show()
+            self.kraken_port_input.setValue(8081)
+        elif index == 3:
+            self.kraken_host_row.show()
+            self.kraken_port_input.setValue(5005)
+
+    def on_kraken_freq_changed(self, freq):
+        if hasattr(self, 'doa_compass'):
+            self.doa_compass.freq_mhz = freq
+        if self.kraken_thread and self.kraken_thread.isRunning():
+            self.kraken_thread.freq_mhz = freq
+        self.push_kraken_hardware_settings()
+
+    def toggle_kraken_doa(self):
+        if self.kraken_thread and self.kraken_thread.isRunning():
+            self.stop_kraken_doa()
+        else:
+            self.start_kraken_doa()
+
+    def start_kraken_doa(self):
+        mode_idx = self.kraken_mode_combo.currentIndex()
+        if mode_idx == 0:
+            mode_str = "KRAKEN_POLL"
+            host = "127.0.0.1"
+            port = 8081
+        elif mode_idx == 1:
+            mode_str = "SIMULATOR"
+            host = "127.0.0.1"
+            port = 8081
+        elif mode_idx == 2:
+            mode_str = "KRAKEN_POLL"
+            host = self.kraken_host_input.text().strip()
+            port = self.kraken_port_input.value()
+        else:
+            mode_str = "UDP"
+            host = self.kraken_host_input.text().strip()
+            port = self.kraken_port_input.value()
+
+        freq = self.kraken_freq_spin.value()
+
+        if self.kraken_thread:
+            self.kraken_thread.stop()
+
+        self.kraken_thread = KrakenDoAThread(mode=mode_str, host=host, port=port, freq_mhz=freq, parent=self)
+        self.kraken_thread.bearing_signal.connect(self.on_kraken_bearing)
+        self.kraken_thread.status_signal.connect(self.on_kraken_status)
+        self.kraken_thread.start()
+
+        self.toggle_kraken_btn.setText("⏹ STOP DIRECTION FINDING")
+        self.toggle_kraken_btn.setStyleSheet("background-color: #ef4444; color: white; font-weight: bold; padding: 8px; font-size: 13px;")
+        self.log_event(f"Started KrakenSDR Direction Finding ({mode_str} on {host}:{port})")
+
+    def stop_kraken_doa(self):
+        if self.kraken_thread:
+            self.kraken_thread.stop()
+            self.kraken_thread = None
+
+        self.toggle_kraken_btn.setText("▶ START DIRECTION FINDING")
+        self.toggle_kraken_btn.setStyleSheet("background-color: #10b981; color: white; font-weight: bold; padding: 8px; font-size: 13px;")
+        self.kraken_status_label.setText("[ KRAKENSDR DoA: STANDBY / DISCONNECTED ]")
+        self.kraken_status_label.setStyleSheet("background-color: #060a14; color: #f59e0b; font-weight: bold; font-size: 13px; padding: 6px; border: 1px solid #1e293b; border-radius: 4px;")
+        
+        if hasattr(self, 'geo_map_view'):
+            self.geo_map_view.page().runJavaScript("clearBearingLine();")
+            
+        self.log_event("Stopped KrakenSDR Direction Finding.")
+
+    def on_kraken_status(self, msg, color):
+        if hasattr(self, 'kraken_status_label'):
+            self.kraken_status_label.setText(f"[ {msg.upper()} ]")
+            self.kraken_status_label.setStyleSheet(f"background-color: #060a14; color: {color}; font-weight: bold; font-size: 13px; padding: 6px; border: 1px solid {color}; border-radius: 4px;")
+
+    def on_kraken_bearing(self, data):
+        if hasattr(self, 'doa_compass'):
+            self.doa_compass.set_bearing_data(data)
+
+        bearing = data.get("doa_deg", 0.0)
+        confidence = data.get("confidence", 0.0)
+        self.last_bearing_deg = bearing
+        self.last_bearing_conf = confidence
+
+        if hasattr(self, 'kraken_status_label') and confidence > 40.0:
+            cardinals = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+            card_idx = int((bearing + 11.25) / 22.5) % 16
+            card_str = cardinals[card_idx]
+            self.kraken_status_label.setText(f"[ DoA LOCKED: {bearing:05.1f}° {card_str} | CONF: {confidence:.0f}% | SNR: {data.get('snr_db',0):.0f}dB ]")
+            self.kraken_status_label.setStyleSheet("background-color: #060a14; color: #10b981; font-weight: bold; font-size: 13px; padding: 6px; border: 1px solid #10b981; border-radius: 4px;")
+
+        # Real-time Hunter-Killer Live Bearing Injection
+        if hasattr(self, 'hk_priority_queue') and self.hk_priority_queue and confidence > 40.0:
+            k_freq = self.kraken_freq_spin.value() if hasattr(self, 'kraken_freq_spin') else 0.0
+            updated = False
+            for k, entry in self.hk_priority_queue.items():
+                e_freq = entry.get("freq", 0.0)
+                if abs(e_freq - k_freq) <= 5.0 or (entry.get("is_fhss", False) and abs(e_freq - k_freq) <= 25.0):
+                    entry["bearing"] = round(bearing, 1)
+                    entry["bearing_conf"] = round(confidence, 1)
+                    updated = True
+            if updated:
+                self.refresh_hk_queue_ui()
+            if hasattr(self, 'hk_metric_bearing'):
+                self.hk_metric_bearing.setText(f"DoA Bearing: {bearing:05.1f}° (Conf: {confidence:.0f}%)")
+                self.hk_metric_bearing.setStyleSheet("color: #10b981; font-family: monospace; font-size: 12px; font-weight: bold;")
+
+        if hasattr(self, 'auto_cast_map_cb') and self.auto_cast_map_cb.isChecked() and hasattr(self, 'geo_map_view') and confidence > 40.0:
+            lat = float(self.geo_lat_input.text()) if (hasattr(self, 'geo_lat_input') and self.geo_lat_input.text()) else 51.5074
+            lon = float(self.geo_lon_input.text()) if (hasattr(self, 'geo_lon_input') and self.geo_lon_input.text()) else -0.1278
+            js = f"if (typeof updateBearingLine === 'function') {{ updateBearingLine({lat}, {lon}, {bearing}, 6000, '#f59e0b'); }}"
+            self.geo_map_view.page().runJavaScript(js)
+
+        if hasattr(self, 'auto_tag_intel_cb') and self.auto_tag_intel_cb.isChecked() and self.current_active_fingerprint:
+            db_entry = self.fingerprint_db.get(self.current_active_fingerprint)
+            if db_entry and confidence > 65.0:
+                db_entry["last_bearing_deg"] = round(bearing, 1)
+                db_entry["bearing_confidence"] = round(confidence, 1)
+
+    def cast_bearing_to_map(self):
+        if not hasattr(self, 'geo_map_view'):
+            return
+        lat = float(self.geo_lat_input.text()) if (hasattr(self, 'geo_lat_input') and self.geo_lat_input.text()) else 51.5074
+        lon = float(self.geo_lon_input.text()) if (hasattr(self, 'geo_lon_input') and self.geo_lon_input.text()) else -0.1278
+        bearing = getattr(self, 'last_bearing_deg', 0.0)
+        js = f"if (typeof updateBearingLine === 'function') {{ updateBearingLine({lat}, {lon}, {bearing}, 8000, '#10b981'); }}"
+        self.geo_map_view.page().runJavaScript(js)
+        self.log_event(f"Cast Line-of-Bearing ({bearing:.1f}°) from {lat:.5f}, {lon:.5f} to Tactical Map.")
+
+    def fix_triangulated_target(self):
+        if not hasattr(self, 'geo_map_view'):
+            return
+        lat = float(self.geo_lat_input.text()) if (hasattr(self, 'geo_lat_input') and self.geo_lat_input.text()) else 51.5074
+        lon = float(self.geo_lon_input.text()) if (hasattr(self, 'geo_lon_input') and self.geo_lon_input.text()) else -0.1278
+        bearing = getattr(self, 'last_bearing_deg', 0.0)
+        
+        # Save bearing observation into history for multi-point CEP
+        if not hasattr(self, 'bearing_history'):
+            self.bearing_history = []
+        self.bearing_history.append((lat, lon, bearing, 90.0, time.time()))
+        
+        R = 6378137
+        d = 2500
+        brng = math.radians(bearing)
+        lat1 = math.radians(lat)
+        lon1 = math.radians(lon)
+        lat2 = math.asin(math.sin(lat1) * math.cos(d / R) + math.cos(lat1) * math.sin(d / R) * math.cos(brng))
+        lon2 = lon1 + math.atan2(math.sin(brng) * math.sin(d / R) * math.cos(lat1), math.cos(d / R) - math.sin(lat1) * math.sin(lat2))
+        
+        t_lat = math.degrees(lat2)
+        t_lon = math.degrees(lon2)
+        
+        freq = self.kraken_freq_spin.value() if hasattr(self, 'kraken_freq_spin') else 915.0
+        js = f"if (typeof addTriangulationFix === 'function') {{ addTriangulationFix({t_lat}, {t_lon}, '{freq:.2f}MHz'); }}"
+        self.geo_map_view.page().runJavaScript(js)
+        self.log_event(f"Recorded Bearing Observation #{len(self.bearing_history)}: {bearing:.1f}° from {lat:.5f}, {lon:.5f}")
+        
+        # If we have 2 or more bearings, automatically solve multi-bearing CEP fix as well!
+        if len(self.bearing_history) >= 2:
+            self.solve_multibearing_cep()
+
+    def solve_multibearing_cep(self):
+        if not hasattr(self, 'bearing_history') or len(self.bearing_history) < 2:
+            lat = float(self.geo_lat_input.text()) if (hasattr(self, 'geo_lat_input') and self.geo_lat_input.text()) else 51.5074
+            lon = float(self.geo_lon_input.text()) if (hasattr(self, 'geo_lon_input') and self.geo_lon_input.text()) else -0.1278
+            brng = getattr(self, 'last_bearing_deg', 0.0)
+            if not hasattr(self, 'bearing_history'):
+                self.bearing_history = []
+            self.bearing_history.append((lat, lon, brng, 80.0, time.time()))
+            self.log_event(f"Captured Line-of-Bearing observation #{len(self.bearing_history)} ({brng:.1f}°). Record another bearing from a different spot to solve CEP.")
+            return
+        
+        records = [(r[0], r[1], r[2], r[3]) for r in self.bearing_history[-8:]]
+        fix = calculate_cep_triangulation(records)
+        if fix:
+            t_lat = fix["lat"]
+            t_lon = fix["lon"]
+            cep = fix["cep_meters"]
+            n = fix["num_fixes"]
+            
+            if hasattr(self, 'geo_status_label'):
+                self.geo_status_label.setText(f"[ TRIANGULATED FIX: {t_lat:.5f}, {t_lon:.5f} | CEP-95: ±{cep:.1f}m | {n} Bearings ]")
+                self.geo_status_label.setStyleSheet("background-color: #060a14; color: #10b981; font-weight: bold; font-size: 13px; padding: 4px; border: 1px solid #10b981; border-radius: 4px;")
+            
+            if hasattr(self, 'geo_map_view'):
+                js = f"if (typeof addCepFix === 'function') {{ addCepFix({t_lat}, {t_lon}, {cep}, 'ESTIMATED TARGET FIX'); }}"
+                self.geo_map_view.page().runJavaScript(js)
+            
+            self.log_event(f"TRIANGULATION CEP: Computed Target Fix at {t_lat:.5f}, {t_lon:.5f} (95% CEP radius ±{cep:.1f}m across {n} bearings).")
+        else:
+            self.log_event("TRIANGULATION CEP: Bearings are parallel or collinear; move to a wider baseline and record again.")
+
+    def detach_map_window(self):
+        if not hasattr(self, 'popout_windows'):
+            self.popout_windows = {}
+        if "map" in self.popout_windows and self.popout_windows["map"].isVisible():
+            self.popout_windows["map"].raise_()
+            self.popout_windows["map"].activateWindow()
+            return
+        win = PopOutWindow("Tactical Geolocation & Map", self.geo_map_container, self.geo_parent_layout, 3, self)
+        self.popout_windows["map"] = win
+        win.closed.connect(lambda: self.popout_windows.pop("map", None))
+        win.show()
+
+    def detach_video_window(self):
+        if not hasattr(self, 'popout_windows'):
+            self.popout_windows = {}
+        if "video" in self.popout_windows and self.popout_windows["video"].isVisible():
+            self.popout_windows["video"].raise_()
+            self.popout_windows["video"].activateWindow()
+            return
+        win = PopOutWindow("FPV Analog Video Feed", self.video_display_container, self.video_parent_layout, 5, self)
+        self.popout_windows["video"] = win
+        win.closed.connect(lambda: self.popout_windows.pop("video", None))
+        win.show()
+
+    def detach_kraken_window(self):
+        if not hasattr(self, 'popout_windows'):
+            self.popout_windows = {}
+        if "kraken" in self.popout_windows and self.popout_windows["kraken"].isVisible():
+            self.popout_windows["kraken"].raise_()
+            self.popout_windows["kraken"].activateWindow()
+            return
+        win = PopOutWindow("Kraken 360 DoA Compass HUD", self.doa_compass_container, self.kraken_parent_layout, 6, self)
+        self.popout_windows["kraken"] = win
+        win.closed.connect(lambda: self.popout_windows.pop("kraken", None))
+        win.show()
+
+    def detach_drone_window(self):
+        if not hasattr(self, 'popout_windows'):
+            self.popout_windows = {}
+        if "drone" in self.popout_windows and self.popout_windows["drone"].isVisible():
+            self.popout_windows["drone"].raise_()
+            self.popout_windows["drone"].activateWindow()
+            return
+        win = PopOutWindow("Drone Telemetry & Pilot Surveillance", self.drone_cockpit_container, self.drone_parent_layout, 4, self)
+        self.popout_windows["drone"] = win
+        win.closed.connect(lambda: self.popout_windows.pop("drone", None))
+        win.show()
 
     def start_heltec(self):
         port = self.heltec_port_combo.currentText() if hasattr(self, 'heltec_port_combo') else "COM6"
@@ -2166,13 +5297,181 @@ class CEMAApp(QMainWindow):
         self.heltec_thread.rc_data_received.connect(self.on_heltec_rc)
         self.heltec_thread.telemetry_link_received.connect(self.on_heltec_tlm_link)
         self.heltec_thread.battery_received.connect(self.on_heltec_battery)
+        self.heltec_thread.attitude_received.connect(self.on_heltec_attitude)
+        self.heltec_thread.flight_mode_received.connect(self.on_heltec_flight_mode)
         self.heltec_thread.gps_received.connect(self.on_heltec_gps)
         self.heltec_thread.sync_discovered.connect(self.on_heltec_sync)
+        self.heltec_thread.rate_detected.connect(self.on_heltec_rate)
+        self.heltec_thread.pilot_discovered.connect(self.on_heltec_pilot_discovered)
         self.heltec_thread.status_changed.connect(self.on_heltec_status)
         self.heltec_thread.start()
 
+    def on_heltec_pilot_discovered(self, data):
+        uid_str = data.get("uid_str", "")
+        u3 = data.get("u3", 0)
+        u4 = data.get("u4", 0)
+        u5 = data.get("u5", 0)
+        crc = data.get("crc_init", "")
+        rssi = data.get("rssi", -100)
+        rate = data.get("rate", "50Hz")
+
+        if not hasattr(self, 'discovered_pilots'):
+            self.discovered_pilots = {}
+
+        is_new = uid_str not in self.discovered_pilots
+        self.discovered_pilots[uid_str] = {
+            "u3": u3,
+            "u4": u4,
+            "u5": u5,
+            "crc_init": crc,
+            "rssi": rssi,
+            "rate": rate,
+            "last_seen": time.time()
+        }
+
+        if hasattr(self, 'pilot_selector_combo'):
+            item_text = f"Pilot UID {u3}:{u4}:{u5} | Rate: {rate} | RSSI: {rssi:.0f} dBm"
+            found = False
+            for i in range(1, self.pilot_selector_combo.count()):
+                if self.pilot_selector_combo.itemData(i) == uid_str:
+                    self.pilot_selector_combo.setItemText(i, item_text)
+                    found = True
+                    break
+            if not found:
+                self.pilot_selector_combo.addItem(item_text, uid_str)
+
+        # Update active FHSS 900M entry in Hunter-Killer queue immediately with the discovered pilot UID
+        if hasattr(self, 'hk_priority_queue') and 'FHSS_900M' in self.hk_priority_queue:
+            self.hk_priority_queue['FHSS_900M']['mod'] = f"ELRS 900M ({rate}) [Pilot UID {u3}:{u4}:{u5}]"
+            self.hk_priority_queue['FHSS_900M']['fingerprint'] = f"0x{crc}"
+            self.hk_priority_queue['FHSS_900M']['rssi'] = rssi
+            self.refresh_hk_queue_ui()
+
+        if is_new:
+            self.log_event(f"New ELRS Pilot Discovered: UID {u3}:{u4}:{u5} (CRC: 0x{crc}, Rate: {rate}, RSSI: {rssi:.0f} dBm)")
+            # Auto-Fusion Hand-Off: Sync Kraken DoA to 915.000 MHz only on initial discovery
+            if hasattr(self, 'auto_fusion_heltec_kraken_cb') and self.auto_fusion_heltec_kraken_cb.isChecked():
+                if hasattr(self, 'kraken_freq_spin'):
+                    self.kraken_freq_spin.blockSignals(True)
+                    self.kraken_freq_spin.setValue(915.0)
+                    self.kraken_freq_spin.blockSignals(False)
+                if hasattr(self, 'kraken_radius_spin') and hasattr(self, 'kraken_array_combo') and self.kraken_array_combo.currentIndex() == 0:
+                    self.kraken_radius_spin.blockSignals(True)
+                    self.kraken_radius_spin.setValue(0.135)
+                    self.kraken_radius_spin.blockSignals(False)
+                self.push_kraken_hardware_settings()
+
+    def on_lock_pilot_clicked(self):
+        if not hasattr(self, 'pilot_selector_combo'):
+            return
+        idx = self.pilot_selector_combo.currentIndex()
+        if idx <= 0:
+            self.on_unlock_pilot_clicked()
+            return
+        uid_str = self.pilot_selector_combo.itemData(idx)
+        if not uid_str or uid_str not in getattr(self, 'discovered_pilots', {}):
+            return
+        p = self.discovered_pilots[uid_str]
+        cmd = f"LOCK_PILOT:{p['u3']},{p['u4']},{p['u5']}"
+        if self.heltec_thread:
+            self.heltec_thread.send_command(cmd)
+        if hasattr(self, 'pilot_target_badge'):
+            self.pilot_target_badge.setText(f"[ LOCKED TARGET: PILOT UID {p['u3']}:{p['u4']}:{p['u5']} | CRC 0x{p['crc_init']} ]")
+            self.pilot_target_badge.setStyleSheet("background-color: #060a14; color: #f59e0b; font-family: monospace; font-size: 11px; font-weight: bold; padding: 5px; border: 1px solid #f59e0b; border-radius: 4px;")
+        
+        # Update active FHSS 900M entry in Hunter-Killer queue immediately with the locked pilot
+        if hasattr(self, 'hk_priority_queue') and 'FHSS_900M' in self.hk_priority_queue:
+            self.hk_priority_queue['FHSS_900M']['mod'] = f"ELRS 900M [LOCKED UID {p['u3']}:{p['u4']}:{p['u5']}]"
+            self.hk_priority_queue['FHSS_900M']['fingerprint'] = f"0x{p['crc_init']}"
+            self.refresh_hk_queue_ui()
+
+        # Auto-Fusion Hand-Off: Sync Kraken DoA to 915.000 MHz
+        if hasattr(self, 'auto_fusion_heltec_kraken_cb') and self.auto_fusion_heltec_kraken_cb.isChecked():
+            if hasattr(self, 'kraken_freq_spin'):
+                self.kraken_freq_spin.blockSignals(True)
+                self.kraken_freq_spin.setValue(915.0)
+                self.kraken_freq_spin.blockSignals(False)
+            if hasattr(self, 'kraken_radius_spin') and hasattr(self, 'kraken_array_combo') and self.kraken_array_combo.currentIndex() == 0:
+                self.kraken_radius_spin.blockSignals(True)
+                self.kraken_radius_spin.setValue(0.135)
+                self.kraken_radius_spin.blockSignals(False)
+            self.push_kraken_hardware_settings()
+            self.log_event(f"SENSOR FUSION: Synced Kraken DoA Array to 915.000 MHz (Locked Target UID {p['u3']}:{p['u4']}:{p['u5']}).")
+                
+        self.log_event(f"Target pilot locked: UID {p['u3']}:{p['u4']}:{p['u5']}")
+
+    def on_unlock_pilot_clicked(self):
+        if self.heltec_thread:
+            self.heltec_thread.send_command("LOCK_PILOT:AUTO")
+        if hasattr(self, 'pilot_selector_combo'):
+            self.pilot_selector_combo.setCurrentIndex(0)
+        if hasattr(self, 'pilot_target_badge'):
+            self.pilot_target_badge.setText("[ ACTIVE TARGET: AUTO / ANY PILOT ]")
+            self.pilot_target_badge.setStyleSheet("background-color: #060a14; color: #38bdf8; font-family: monospace; font-size: 11px; font-weight: bold; padding: 5px; border: 1px solid #1e293b; border-radius: 4px;")
+        self.log_event("Target pilot filter set to Auto / Any.")
+
+    def on_elrs_rate_selected(self, index):
+        if not self.heltec_thread:
+            return
+        cmd_map = {
+            0: "SET_RATE:AUTO",
+            1: "SET_RATE:50HZ",
+            2: "SET_RATE:25HZ",
+            3: "SET_RATE:100HZ",
+            4: "SET_RATE:100HZ FULL",
+            5: "SET_RATE:D50",
+            6: "SET_RATE:150HZ",
+            7: "SET_RATE:200HZ",
+            8: "SET_RATE:250HZ",
+            9: "SET_RATE:333HZ FULL"
+        }
+        cmd = cmd_map.get(index, "SET_RATE:AUTO")
+        self.heltec_thread.send_command(cmd)
+        self.log_event(f"Sent ExpressLRS rate command to Heltec: {cmd}")
+
+    def on_heltec_rate(self, data):
+        rate_name = data.get('rate_name', '50Hz')
+        sf = data.get('sf', 8)
+        bw = data.get('bw_khz', 500.0)
+        interval = data.get('interval_us', 20000)
+        if hasattr(self, 'elrs_rate_badge'):
+            self.elrs_rate_badge.setText(f"[ ACTIVE DEMOD: {rate_name} | SF{sf} | BW: {bw:.0f}kHz | Interval: {interval} µs ]")
+            self.elrs_rate_badge.setStyleSheet("background-color: #060a14; color: #10b981; font-family: monospace; font-size: 11px; font-weight: bold; padding: 5px; border: 1px solid #10b981; border-radius: 4px;")
+        
+        # Suppress log event when Auto-Detect scanning is active to prevent event log flooding
+        is_auto = hasattr(self, 'elrs_rate_mode_combo') and self.elrs_rate_mode_combo.currentIndex() == 0
+        if not is_auto:
+            self.log_event(f"Heltec locked ELRS rate: {rate_name} (SF{sf}, BW {bw:.0f}kHz, {interval} µs)")
+
     def restart_heltec(self):
         self.start_heltec()
+
+    def open_settings_dialog(self):
+        dlg = TacticalSettingsDialog(self)
+        dlg.exec()
+
+    def apply_runtime_settings(self, settings):
+        self.settings = settings
+        self.log_event("TACTICAL SETTINGS: Hardware & System configuration updated.")
+
+        # Update Heltec Port if changed
+        if hasattr(self, 'heltec_port_combo'):
+            idx = self.heltec_port_combo.findText(settings.get('heltec_port', 'COM6'))
+            if idx >= 0:
+                self.heltec_port_combo.setCurrentIndex(idx)
+        if self.heltec_thread and self.heltec_thread.port != settings.get('heltec_port', 'COM6'):
+            self.heltec_thread.set_port(settings.get('heltec_port', 'COM6'))
+            self.restart_heltec()
+
+        # Update Kraken DoA parameters
+        if hasattr(self, 'kraken_thread') and self.kraken_thread:
+            self.kraken_thread.wsl_share_path = settings.get('kraken_wsl_path', '')
+            host = settings.get('kraken_host', '127.0.0.1')
+            port = settings.get('kraken_doa_port', 8081)
+            self.kraken_thread.http_url = f"http://{host}:{port}/DOA_value.html"
+
+        if hasattr(self, 'kraken_radius_spin'):
+            self.kraken_radius_spin.setValue(settings.get('kraken_default_radius', 0.135))
 
     def on_heltec_status(self, msg, is_connected):
         if hasattr(self, 'heltec_connect_btn'):
@@ -2193,9 +5492,17 @@ class CEMAApp(QMainWindow):
         rssi = data['rssi']
         snr = data['snr']
         armed = data['armed']
+        channels = data.get('channels', [ch1, ch2, ch3, ch4] + [1500] * 12)
 
         if hasattr(self, 'heltec_connect_btn'):
             self.heltec_connect_btn.setText(f"🚁 HELTEC: {rssi:.0f}dBm")
+
+        pkt_rate = data.get('packet_rate', '50Hz')
+        if hasattr(self, 'elrs_rate_badge'):
+            if not hasattr(self, 'current_locked_elrs_rate') or self.current_locked_elrs_rate != pkt_rate:
+                self.current_locked_elrs_rate = pkt_rate
+                self.elrs_rate_badge.setText(f"[ ACTIVE DEMOD: {pkt_rate} (Synchronized) ]")
+                self.elrs_rate_badge.setStyleSheet("background-color: #060a14; color: #10b981; font-family: monospace; font-size: 11px; font-weight: bold; padding: 5px; border: 1px solid #10b981; border-radius: 4px;")
 
         # Feature 1: Update Mode 2 Gimbal HUD
         if self.gimbal_hud:
@@ -2204,6 +5511,23 @@ class CEMAApp(QMainWindow):
         thr_pct = max(0.0, min(100.0, (ch3 - 988.0) / 10.24))
         if hasattr(self, 'drone_sticks_lbl'):
             self.drone_sticks_lbl.setText(f"THR: {ch3} µs ({thr_pct:.0f}%) | YAW: {ch1} µs | PIT: {ch2} µs | ROL: {ch4} µs")
+
+        # Feature 3: Update 16-Channel Diagnostic Matrix
+        if hasattr(self, 'channel_bars') and len(self.channel_bars) == 16:
+            for idx in range(16):
+                val = channels[idx] if idx < len(channels) else 1500
+                self.channel_bars[idx].setValue(val)
+                self.channel_labels[idx].setText(f"{val}µs")
+                if idx == 4: # AUX1 Arm
+                    if val > 1500:
+                        self.channel_labels[idx].setStyleSheet("color: #ef4444; font-weight: bold; font-size: 8.5pt; font-family: 'Consolas', monospace;")
+                        self.channel_bars[idx].setStyleSheet("QProgressBar { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 3px; } QProgressBar::chunk { background-color: #ef4444; border-radius: 2px; }")
+                    else:
+                        self.channel_labels[idx].setStyleSheet("color: #10b981; font-weight: bold; font-size: 8.5pt; font-family: 'Consolas', monospace;")
+                        self.channel_bars[idx].setStyleSheet("QProgressBar { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 3px; } QProgressBar::chunk { background-color: #10b981; border-radius: 2px; }")
+                elif idx == 5: # AUX2 Flight Mode
+                    color = "#10b981" if val < 1300 else ("#f59e0b" if val < 1700 else "#ef4444")
+                    self.channel_labels[idx].setStyleSheet(f"color: {color}; font-weight: bold; font-size: 8.5pt; font-family: 'Consolas', monospace;")
 
         if hasattr(self, 'drone_rssi_lbl'):
             self.drone_rssi_lbl.setText(f"Sniffer RSSI: {rssi:.0f} dBm")
@@ -2317,6 +5641,24 @@ class CEMAApp(QMainWindow):
             self.drone_curr_lbl.setText(f"Current Draw: {data['current']:.1f} A")
         self.log_event(f"HELTEC DRONE BATTERY: {data['voltage']:.1f}V | {data['current']:.1f}A | {data['battery_pct']}%")
 
+    def on_heltec_attitude(self, data):
+        pitch = data.get("pitch", 0.0)
+        roll = data.get("roll", 0.0)
+        yaw = data.get("yaw", 0.0)
+        if hasattr(self, 'drone_att_lbl'):
+            self.drone_att_lbl.setText(f"Attitude: P:{pitch:+.0f}° | R:{roll:+.0f}° | Y:{yaw:.0f}°")
+        if not hasattr(self, 'last_att_log_time') or (time.time() - self.last_att_log_time > 5.0):
+            self.last_att_log_time = time.time()
+            self.log_event(f"HELTEC UAV ATTITUDE: Pitch={pitch:+.1f}° | Roll={roll:+.1f}° | Yaw={yaw:.1f}°")
+
+    def on_heltec_flight_mode(self, data):
+        mode = data.get("mode", "ANGLE")
+        if hasattr(self, 'drone_fmode_lbl'):
+            self.drone_fmode_lbl.setText(f"Flight Mode: {mode}")
+            color = "#10b981" if mode in ["ANGLE", "POSHOLD"] else ("#f59e0b" if mode == "HORIZON" else "#ef4444")
+            self.drone_fmode_lbl.setStyleSheet(f"background-color: #0f172a; color: {color}; border: 1px solid #1e293b; padding: 6px; border-radius: 4px; font-weight: bold; font-size: 11px;")
+        self.log_event(f"HELTEC UAV FLIGHT MODE: {mode}")
+
     def on_heltec_gps(self, data):
         lat = data["lat"]
         lon = data["lon"]
@@ -2405,11 +5747,27 @@ class CEMAApp(QMainWindow):
             except Exception as e:
                 self.log_event(f"Error loading topology: {e}")
 
-    def save_topology(self):
-        try:
-            with open('topology.json', 'w', encoding='utf-8') as f:
-                json.dump(self.network_links, f, indent=4)
-        except: pass
+    def save_topology(self, force=False):
+        self._topology_dirty = True
+        if force:
+            self.flush_dirty_state_to_disk()
+
+    def flush_dirty_state_to_disk(self):
+        if getattr(self, '_fingerprints_dirty', False):
+            try:
+                with open('fingerprints.json', 'w', encoding='utf-8') as f:
+                    json.dump(self.fingerprint_db, f, indent=4)
+                self._fingerprints_dirty = False
+            except Exception as e:
+                self.log_event(f"Error saving fingerprints: {e}")
+
+        if getattr(self, '_topology_dirty', False):
+            try:
+                with open('topology.json', 'w', encoding='utf-8') as f:
+                    json.dump(self.network_links, f, indent=4)
+                self._topology_dirty = False
+            except Exception:
+                pass
 
     def refresh_topology_ui(self):
         self.topology_ui.clear()
@@ -2467,12 +5825,10 @@ class CEMAApp(QMainWindow):
             except Exception as e:
                 self.log_event(f"Error loading fingerprints: {e}")
 
-    def save_fingerprints(self):
-        try:
-            with open('fingerprints.json', 'w', encoding='utf-8') as f:
-                json.dump(self.fingerprint_db, f, indent=4)
-        except Exception as e:
-            self.log_event(f"Error saving fingerprints: {e}")
+    def save_fingerprints(self, force=False):
+        self._fingerprints_dirty = True
+        if force:
+            self.flush_dirty_state_to_disk()
 
     def refresh_fingerprint_ui(self):
         self.fingerprint_ui.clear()
@@ -2608,22 +5964,42 @@ class CEMAApp(QMainWindow):
 
     def mode_changed(self, text):
         if "SWEEP" in text:
+            self.current_mode = "SWEEP"
             self.freq_input.hide()
             self.freq_label.setText("Sweep Range:")
             self.sweep_start_input.show()
             self.sweep_end_input.show()
+            if hasattr(self, 'sweep_bin_label'): self.sweep_bin_label.show()
+            if hasattr(self, 'sweep_bin_combo'): self.sweep_bin_combo.show()
             self.const_plot.hide()
             self.vfo_region.hide()
             self.graph_layout.addWidget(self.waterfall_plot, 1, 0, 1, 2)
         else:
+            self.current_mode = "STARE"
             self.freq_input.show()
             self.freq_label.setText("Center Freq:")
             self.sweep_start_input.hide()
             self.sweep_end_input.hide()
+            if hasattr(self, 'sweep_bin_label'): self.sweep_bin_label.hide()
+            if hasattr(self, 'sweep_bin_combo'): self.sweep_bin_combo.hide()
             self.graph_layout.addWidget(self.const_plot, 1, 1)
             self.graph_layout.addWidget(self.waterfall_plot, 1, 0)
             self.vfo_region.show()
             self.const_plot.show()
+
+    def on_sweep_bin_changed(self, idx):
+        bin_widths = [100000, 250000, 500000, 1000000, 2000000, 5000000]
+        if 0 <= idx < len(bin_widths):
+            self.sweep_bin_width_hz = bin_widths[idx]
+            self.log_event(f"Sweep bin resolution set to {self.sweep_bin_width_hz/1e3:.0f} kHz")
+            if self.current_mode == "SWEEP":
+                self.start_sdr()
+
+    def on_palette_changed(self, name):
+        if name in TACTICAL_COLORMAPS:
+            self.current_cmap = TACTICAL_COLORMAPS[name]
+            self.waterfall_image.setLookupTable(self.current_cmap.getLookupTable())
+            self.log_event(f"Waterfall palette switched to {name}")
 
     def toggle_mask_mode(self, checked):
         if checked:
@@ -2653,17 +6029,19 @@ class CEMAApp(QMainWindow):
 
     def bin_to_freq(self, bin_idx):
         if self.current_mode == "SWEEP":
-            return self.sweep_start_input.value() * 1e6 + bin_idx * 1000000
+            bin_w = getattr(self, 'sweep_bin_width_hz', 1000000)
+            return self.sweep_start_input.value() * 1e6 + bin_idx * bin_w
         else:
             center_hz = self.freq_input.value() * 1e6
-            return center_hz + (bin_idx - 512) * (2000000 / 1024)
+            return center_hz + (bin_idx - 512) * (20000000 / 1024)
 
     def freq_to_bin(self, freq_hz):
         if self.current_mode == "SWEEP":
-            return (freq_hz - self.sweep_start_input.value() * 1e6) / 1000000
+            bin_w = getattr(self, 'sweep_bin_width_hz', 1000000)
+            return (freq_hz - self.sweep_start_input.value() * 1e6) / bin_w
         else:
             center_hz = self.freq_input.value() * 1e6
-            return 512 + (freq_hz - center_hz) * 1024 / 2000000
+            return 512 + (freq_hz - center_hz) * 1024 / 20000000
 
     def save_masks(self):
         try:
@@ -2705,8 +6083,8 @@ class CEMAApp(QMainWindow):
             max_view_hz = self.sweep_end_input.value() * 1e6
         else:
             center_hz = self.freq_input.value() * 1e6
-            min_view_hz = center_hz - 1000000
-            max_view_hz = center_hz + 1000000
+            min_view_hz = center_hz - 10000000
+            max_view_hz = center_hz + 10000000
         
         for idx, m in enumerate(self.global_masks):
             if m["max_hz"] >= min_view_hz and m["min_hz"] <= max_view_hz:
@@ -2743,15 +6121,16 @@ class CEMAApp(QMainWindow):
             self.current_mode = "SWEEP"
             start_hz = self.sweep_start_input.value() * 1e6
             end_hz = self.sweep_end_input.value() * 1e6
-            num_bins = int((end_hz - start_hz) / 1000000)
+            bin_width_hz = getattr(self, 'sweep_bin_width_hz', 1000000)
+            num_bins = int((end_hz - start_hz) / bin_width_hz)
             if num_bins <= 0: num_bins = 1
             
             self.waterfall_data = np.zeros((100, num_bins))
             self.fft_plot.setXRange(0, num_bins)
             self.hop_history.clear()
             
-            self.hackrf_thread = HackRFSweepThread(start_hz, end_hz, lna, vga)
-            self.log_event(f"SWEEP MODE ENGAGED - {start_hz/1e6} to {end_hz/1e6} MHz")
+            self.hackrf_thread = HackRFSweepThread(start_hz, end_hz, lna, vga, bin_width_hz)
+            self.log_event(f"SWEEP MODE ENGAGED - {start_hz/1e6:.1f} to {end_hz/1e6:.1f} MHz (Bin Res: {bin_width_hz/1e3:.0f} kHz)")
         else:
             self.current_mode = "STARE"
             freq_hz = int(self.freq_input.value() * 1e6)
@@ -2762,7 +6141,7 @@ class CEMAApp(QMainWindow):
             self.hackrf_thread = HackRFThread(freq_hz, lna, vga)
             if hasattr(self, 'audio_playing') and self.audio_playing:
                 self.hackrf_thread.play_audio = True
-            self.log_event(f"STARE MODE ENGAGED - {freq_hz/1e6} MHz")
+            self.log_event(f"STARE MODE ENGAGED - {freq_hz/1e6:.2f} MHz (20MHz Passband)")
 
         self.waterfall_image.setImage(self.waterfall_data, autoLevels=False, levels=(0, self.wf_sens_slider.value()))
         self.mod_label.setText("Modulation: INITIALIZING...")
@@ -2778,20 +6157,35 @@ class CEMAApp(QMainWindow):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         self.log_text.append(f"[{timestamp}] {msg}")
 
+    def _handle_jump_to_stare(self, x_val):
+        if self.current_mode == "SWEEP":
+            freq_mhz = self.bin_to_freq(x_val) / 1e6
+            self.log_event(f"[TACTICAL] JUMP-TO-STARE: Tuning 20MHz Stare on {freq_mhz:.2f} MHz")
+            self.mode_selector.setCurrentText("STARE MODE (2MHz)")
+            self.freq_input.setValue(freq_mhz)
+            self.start_sdr()
+        elif self.current_mode == "STARE":
+            freq_mhz = self.bin_to_freq(x_val) / 1e6
+            if abs(freq_mhz - self.freq_input.value()) > 0.5:
+                self.log_event(f"[TACTICAL] STARE RETUNE: Centering 20MHz Stare on {freq_mhz:.2f} MHz")
+                self.freq_input.setValue(freq_mhz)
+                self.start_sdr()
+
+    def fft_mouse_double_click(self, event):
+        scene_pos = self.fft_plot.mapToScene(event.pos())
+        view_pos = self.fft_plot.plotItem.vb.mapSceneToView(scene_pos)
+        self._handle_jump_to_stare(view_pos.x())
+
+    def waterfall_mouse_double_click(self, event):
+        scene_pos = self.waterfall_plot.mapToScene(event.pos())
+        view_pos = self.waterfall_plot.plotItem.vb.mapSceneToView(scene_pos)
+        self._handle_jump_to_stare(view_pos.x())
+
     def fft_mouse_press(self, event):
         scene_pos = self.fft_plot.mapToScene(event.pos())
         items = self.fft_plot.scene().items(scene_pos)
         clicked_on_handle = any(isinstance(item, pg.InfiniteLine) for item in items)
         clicked_on_region = any(isinstance(item, pg.LinearRegionItem) for item in items)
-        
-        if self.current_mode == "SWEEP" and event.button() == Qt.MouseButton.LeftButton and not (clicked_on_handle or clicked_on_region):
-            view_pos = self.fft_plot.plotItem.vb.mapSceneToView(scene_pos)
-            freq_mhz = self.bin_to_freq(view_pos.x()) / 1e6
-            self.log_event(f"HUNTER-KILLER: Snapping to {freq_mhz:.2f} MHz")
-            self.mode_selector.setCurrentText("STARE MODE (2MHz)")
-            self.freq_input.setValue(freq_mhz)
-            self.start_sdr()
-            return
 
         if self.mask_mode_btn.isChecked() and event.button() == Qt.MouseButton.LeftButton and not (clicked_on_handle or clicked_on_region):
             view_pos = self.fft_plot.plotItem.vb.mapSceneToView(scene_pos)
@@ -2803,14 +6197,47 @@ class CEMAApp(QMainWindow):
             self.fft_plot._original_mousePressEvent(event)
 
     def fft_mouse_move(self, event):
+        scene_pos = self.fft_plot.mapToScene(event.pos())
+        if hasattr(self, 'cursor_v_line') and hasattr(self.fft_plot, 'plotItem') and self.fft_plot.plotItem.vb.sceneBoundingRect().contains(scene_pos):
+            view_pos = self.fft_plot.plotItem.vb.mapSceneToView(scene_pos)
+            x_val = view_pos.x()
+            y_val = view_pos.y()
+            freq_mhz = self.bin_to_freq(x_val) / 1e6
+
+            self.cursor_v_line.setPos(x_val)
+            self.cursor_h_line.setPos(y_val)
+            self.cursor_v_line.show()
+            self.cursor_h_line.show()
+
+            if hasattr(self, 'cursor_hud_text'):
+                vb_range = self.fft_plot.plotItem.vb.viewRange()
+                self.cursor_hud_text.setPos(vb_range[0][1], vb_range[1][1])
+                self.cursor_hud_text.setText(f" {freq_mhz:.3f} MHz | {y_val:.1f} dBFS ")
+                self.cursor_hud_text.show()
+        else:
+            if hasattr(self, 'cursor_v_line'):
+                self.cursor_v_line.hide()
+                self.cursor_h_line.hide()
+                self.cursor_hud_text.hide()
+
         if hasattr(self, 'current_drag_region') and self.current_drag_region is not None:
-            scene_pos = self.fft_plot.mapToScene(event.pos())
             view_pos = self.fft_plot.plotItem.vb.mapSceneToView(scene_pos)
             current_x = view_pos.x()
             self.current_drag_region.setRegion([min(self.drag_start_x, current_x), max(self.drag_start_x, current_x)])
             event.accept()
         else:
             self.fft_plot._original_mouseMoveEvent(event)
+
+    def fft_mouse_leave(self, event):
+        if hasattr(self, 'cursor_v_line'):
+            self.cursor_v_line.hide()
+            self.cursor_h_line.hide()
+            self.cursor_hud_text.hide()
+        if event is not None and hasattr(self.fft_plot, '_original_leaveEvent'):
+            try:
+                self.fft_plot._original_leaveEvent(event)
+            except Exception:
+                pass
 
     def fft_mouse_release(self, event):
         if event.button() == Qt.MouseButton.LeftButton and hasattr(self, 'current_drag_region') and self.current_drag_region is not None:
@@ -2883,6 +6310,44 @@ class CEMAApp(QMainWindow):
         zulu_time = datetime.datetime.utcnow().strftime("%H:%M:%SZ")
         self.clock_label.setText(zulu_time)
 
+        # 1. Real-Time SDR Telemetry Badge
+        if hasattr(self, 'badge_sdr'):
+            if self.hackrf_thread and getattr(self.hackrf_thread, 'running', False):
+                if self.current_mode == "SWEEP":
+                    bw_str = f"{getattr(self, 'sweep_bin_width_hz', 1000000)/1e3:.0f}k"
+                    self.badge_sdr.setText(f"[ SDR: HACKRF SWEEP ({self.sweep_start_input.value():.0f}-{self.sweep_end_input.value():.0f} MHz | {bw_str}) ]")
+                else:
+                    self.badge_sdr.setText(f"[ SDR: HACKRF STARE ({self.freq_input.value():.2f} MHz @ 20MSPS) ]")
+                self.badge_sdr.setStyleSheet("color: #10b981; background: #060e1a; font-family: 'Consolas', monospace; font-size: 9.5pt; font-weight: bold; padding: 2px 8px; border: 1px solid #10b981; border-radius: 3px;")
+            else:
+                self.badge_sdr.setText("[ SDR: HACKRF OFFLINE ]")
+                self.badge_sdr.setStyleSheet("color: #64748b; background: #060e1a; font-family: 'Consolas', monospace; font-size: 9.5pt; font-weight: bold; padding: 2px 8px; border: 1px solid #334155; border-radius: 3px;")
+
+        # 2. Heltec V3 LoRa Sniffer Telemetry Badge
+        if hasattr(self, 'badge_heltec'):
+            if self.heltec_thread and getattr(self.heltec_thread, 'running', False):
+                pilot_cnt = getattr(self, 'last_pilot_count', 0)
+                if pilot_cnt > 0:
+                    self.badge_heltec.setText(f"[ HELTEC V3: {pilot_cnt} PILOT(S) ACTIVE ]")
+                    self.badge_heltec.setStyleSheet("color: #38bdf8; background: #060e1a; font-family: 'Consolas', monospace; font-size: 9.5pt; font-weight: bold; padding: 2px 8px; border: 1px solid #0284c7; border-radius: 3px;")
+                else:
+                    self.badge_heltec.setText("[ HELTEC V3: SCANNING ]")
+                    self.badge_heltec.setStyleSheet("color: #10b981; background: #060e1a; font-family: 'Consolas', monospace; font-size: 9.5pt; font-weight: bold; padding: 2px 8px; border: 1px solid #10b981; border-radius: 3px;")
+            else:
+                self.badge_heltec.setText("[ HELTEC V3: STANDBY ]")
+                self.badge_heltec.setStyleSheet("color: #64748b; background: #060e1a; font-family: 'Consolas', monospace; font-size: 9.5pt; font-weight: bold; padding: 2px 8px; border: 1px solid #334155; border-radius: 3px;")
+
+        # 3. KrakenSDR Direction Finding Telemetry Badge
+        if hasattr(self, 'badge_kraken'):
+            if hasattr(self, 'kraken_thread') and self.kraken_thread and getattr(self.kraken_thread, 'running', False):
+                b_deg = getattr(self, 'last_bearing_deg', 0.0)
+                b_conf = getattr(self, 'last_bearing_conf', 0.0)
+                self.badge_kraken.setText(f"[ KRAKENSDR: {b_deg:05.1f}° TRUE (CONF {b_conf:.0f}%) ]")
+                self.badge_kraken.setStyleSheet("color: #f59e0b; background: #060e1a; font-family: 'Consolas', monospace; font-size: 9.5pt; font-weight: bold; padding: 2px 8px; border: 1px solid #f59e0b; border-radius: 3px;")
+            else:
+                self.badge_kraken.setText("[ KRAKENSDR: STANDBY ]")
+                self.badge_kraken.setStyleSheet("color: #64748b; background: #060e1a; font-family: 'Consolas', monospace; font-size: 9.5pt; font-weight: bold; padding: 2px 8px; border: 1px solid #334155; border-radius: 3px;")
+
     def poll_data(self):
         if self.hackrf_thread and self.hackrf_thread.latest_data:
             data = self.hackrf_thread.latest_data
@@ -2941,36 +6406,292 @@ class CEMAApp(QMainWindow):
                 fhss_candidates = [h for h in self.hop_history if freq_counts[h[1]] <= 3]
                 unique_freqs = set([h[1] for h in fhss_candidates])
                 
-                if len(unique_freqs) >= 8 and len(fhss_candidates) >= 12:
-                    if current_time - self.last_fhss_alert > 3.0:
-                        hops_sec = len(fhss_candidates) / 2.0
-                        f_min, f_max = min(unique_freqs), max(unique_freqs)
+                # Auto-Fusion Sweep -> FPV Video Carrier Snapping
+                if getattr(self, 'auto_fusion_sweep_video_cb', None) and self.auto_fusion_sweep_video_cb.isChecked():
+                    if not self.is_video_streaming and (current_time - getattr(self, 'last_vtx_auto_snap', 0) > 8.0):
+                        for h_time, h_freq in self.hop_history:
+                            h_mhz = h_freq / 1e6
+                            if (5640 <= h_mhz <= 5950) or (1080 <= h_mhz <= 1360):
+                                best_chan = None
+                                min_diff = 999.0
+                                for c_name, c_mhz in FPV_VIDEO_CHANNELS.items():
+                                    diff = abs(c_mhz - h_mhz)
+                                    if diff < min_diff:
+                                        min_diff = diff
+                                        best_chan = (c_name, c_mhz)
+                                if best_chan and min_diff <= 3.0:
+                                    self.last_vtx_auto_snap = current_time
+                                    self.log_event(f"SENSOR FUSION: Detected active VTX carrier at {h_mhz:.1f} MHz -> Auto-snapping to {best_chan[0]}.")
+                                    idx = self.fpv_channel_combo.findData(best_chan[1])
+                                    if idx >= 0:
+                                        self.fpv_channel_combo.setCurrentIndex(idx)
+                                    self.sidebar_tabs.setCurrentIndex(5)
+                                    self.start_video_stream()
+                                    break
+
+                # 1. FHSS Tracking & Band Aggregation (Runs First)
+                if len(unique_freqs) >= 6 and len(fhss_candidates) >= 10:
+                    hops_sec = len(fhss_candidates) / 2.0
+                    f_min, f_max = min(unique_freqs), max(unique_freqs)
+                    
+                    protocol = "Unknown FHSS Network"
+                    band_key = "FHSS_UNKNOWN"
+                    if 860e6 <= f_min <= 930e6:
+                        band_key = "FHSS_900M"
+                        protocol = "TBS Crossfire / ELRS 900M"
+                    elif 2400e6 <= f_min <= 2485e6:
+                        band_key = "FHSS_2.4G"
+                        protocol = "DJI OcuSync / ELRS 2.4G"
+                    elif 5700e6 <= f_min <= 5900e6:
+                        band_key = "FHSS_5.8G"
+                        protocol = "DJI Digital FPV / Walksnail"
                         
-                        protocol = " Unknown FHSS Network"
-                        if 860e6 <= f_min <= 930e6 and hops_sec >= 40:
-                            protocol = " TBS Crossfire / ELRS 900M"
-                        elif 2400e6 <= f_min <= 2485e6 and hops_sec >= 50:
-                            protocol = " DJI OcuSync / ELRS 2.4G"
-                        elif 5700e6 <= f_min <= 5900e6 and hops_sec >= 20:
-                            protocol = " DJI Digital FPV / Walksnail"
-                            
+                    if not hasattr(self, 'active_fhss_bands'):
+                        self.active_fhss_bands = {}
+                    self.active_fhss_bands[band_key] = {
+                        'f_min': f_min / 1e6,
+                        'f_max': f_max / 1e6,
+                        'last_seen': current_time,
+                        'hops_sec': hops_sec
+                    }
+
+                    # Consolidated FHSS threat update in Hunter-Killer Priority Queue
+                    self.add_or_update_hk_fhss_cluster(band_key, f_min / 1e6, f_max / 1e6, hops_sec, protocol, np.max(fft_data))
+
+                    if current_time - self.last_fhss_alert > 4.0:
                         net_name = f"{protocol} (~{hops_sec:.0f} hops/s) | {f_min/1e6:.1f}-{f_max/1e6:.1f} MHz"
                         self.log_event(f"DRONE TELEMETRY: {net_name}")
-                        
-                        items = [self.fhss_ui.item(i).text() for i in range(self.fhss_ui.count())]
-                        if net_name not in items:
+                        if hasattr(self, 'fhss_ui'):
+                            for idx in range(self.fhss_ui.count() - 1, -1, -1):
+                                item_txt = self.fhss_ui.item(idx).text()
+                                if ("860" in item_txt or "900M" in item_txt or "Crossfire" in item_txt or "ELRS" in item_txt) and ("900" in protocol or "860" in band_key):
+                                    self.fhss_ui.takeItem(idx)
+                                elif ("2.4G" in item_txt or "2400" in item_txt or "OcuSync" in item_txt) and ("2.4" in protocol):
+                                    self.fhss_ui.takeItem(idx)
+                                elif ("5.8G" in item_txt or "5700" in item_txt or "Walksnail" in item_txt) and ("5.8" in protocol):
+                                    self.fhss_ui.takeItem(idx)
                             self.fhss_ui.addItem(net_name)
-                            
                         self.last_fhss_alert = current_time
 
+                # 2. Autonomous Hunter-Killer Stare Intercept Trigger
+                if getattr(self, 'hk_active', False) and self.hk_state == "HUNTING":
+                    snr_thresh = self.hk_snr_spin.value() if hasattr(self, 'hk_snr_spin') else 18
+                    target_candidate = None
+                    max_candidate_snr = 0.0
+                    
+                    if not hasattr(self, 'hk_candidate_persistence'):
+                        self.hk_candidate_persistence = {}
+                    if not hasattr(self, 'hk_last_intercept_time'):
+                        self.hk_last_intercept_time = 0.0
+
+                    # 2.0-second refractory debounce cooldown between Stare Mode switches
+                    if current_time - self.hk_last_intercept_time >= 2.0:
+                        for i in range(1, len(fft_data) - 1):
+                            snr = fft_data[i] - noise_floor
+                            freq_hz = self.bin_to_freq(i)
+                            freq_mhz = round(freq_hz / 1e6, 3)
+
+                            # Dynamic SNR threshold: Wideband FPV Video signals spread energy over 8-16 MHz, so allow +10 dB SNR
+                            is_vtx_band = (5640.0 <= freq_mhz <= 5950.0) or (1080.0 <= freq_mhz <= 1360.0)
+                            effective_snr_thresh = max(10, snr_thresh - 6) if is_vtx_band else snr_thresh
+
+                            # Match sharp peaks or wideband VTX plateau centers
+                            is_peak = (fft_data[i] >= fft_data[i-1] and fft_data[i] >= fft_data[i+1] and (fft_data[i] > fft_data[i-1] or fft_data[i] > fft_data[i+1]))
+                            if not is_peak and is_vtx_band and snr >= effective_snr_thresh:
+                                is_peak = True
+
+                            if snr >= effective_snr_thresh and is_peak:
+                                masked = False
+                                for r_min, r_max in active_ranges:
+                                    if r_min <= i <= r_max:
+                                        masked = True
+                                        break
+                                if masked:
+                                    continue
+
+                                # FHSS DEDUPLICATION: Suppress stare interrupts for all active FHSS/LoRa bands (unless it's an FPV video band)
+                                is_in_active_fhss = False
+                                if not is_vtx_band:
+                                    for b_info in getattr(self, 'active_fhss_bands', {}).values():
+                                        if (current_time - b_info.get('last_seen', 0) < 6.0) and (b_info['f_min'] - 3.0 <= freq_mhz <= b_info['f_max'] + 3.0):
+                                            is_in_active_fhss = True
+                                            break
+                                if is_in_active_fhss:
+                                    continue
+
+                                last_t = self.hk_last_eval_time.get(freq_mhz, 0)
+                                if current_time - last_t < 6.0:
+                                    continue
+
+                                # M-of-N Candidate Persistence: Signal must appear across at least 2 sweep frames or SNR >= 24 dB or VTX channel match
+                                is_known_vtx_chan = False
+                                for cfreq in FPV_VIDEO_CHANNELS.values():
+                                    if abs(freq_mhz - cfreq) <= 2.5:
+                                        is_known_vtx_chan = True
+                                        break
+
+                                hits, prev_t = self.hk_candidate_persistence.get(freq_mhz, (0, 0))
+                                if current_time - prev_t <= 5.0: # 5.0s window accommodating wideband sweep cycle time
+                                    hits += 1
+                                else:
+                                    hits = 1
+                                self.hk_candidate_persistence[freq_mhz] = (hits, current_time)
+
+                                if (hits >= 2 or snr >= 24.0 or is_known_vtx_chan) and (snr > max_candidate_snr):
+                                    max_candidate_snr = snr
+                                    target_candidate = (freq_mhz, snr, fft_data[i])
+
+                        # Prune stale persistence records
+                        self.hk_candidate_persistence = {f: v for f, v in self.hk_candidate_persistence.items() if current_time - v[1] < 6.0}
+
+                        if target_candidate:
+                            c_freq, c_snr, c_pwr = target_candidate
+                            self.hk_last_eval_time[c_freq] = current_time
+                            self.hk_last_intercept_time = current_time
+                            self.hk_state = "STARE_INTERCEPT"
+                            self.hk_target_freq = c_freq
+                            self.hk_stare_start_time = current_time
+                            
+                            # Check if matching known FPV Video channel
+                            matched_vtx_str = ""
+                            for cname, cfreq in FPV_VIDEO_CHANNELS.items():
+                                if abs(c_freq - cfreq) <= 2.5:
+                                    matched_vtx_str = f" [{cname}]"
+                                    break
+
+                            if hasattr(self, 'hk_status_badge'):
+                                self.hk_status_badge.setText(f"[ KILLER ENGAGED: INTERCEPTING {c_freq:.3f} MHz{matched_vtx_str} (STARE DWELL) ]")
+                                self.hk_status_badge.setStyleSheet("background-color: #060a14; color: #f59e0b; font-family: monospace; font-size: 12px; font-weight: bold; padding: 6px; border: 1px solid #f59e0b; border-radius: 4px;")
+                            if hasattr(self, 'hk_cycle_breadcrumbs'):
+                                self.hk_cycle_breadcrumbs.setText("CYCLE: [ 1. HUNT ] ➔ ▶ [ 2. DETECT ] ➔ [ 3. STARE & FP ] ➔ [ 4. DoA VECTOR ] ➔ [ 5. THREAT EVAL ] ➔ [ 6. RESUME ]")
+                                self.hk_cycle_breadcrumbs.setStyleSheet("color: #f59e0b; font-family: monospace; font-size: 10px; font-weight: bold;")
+                            
+                            self.log_event(f"AUTONOMOUS HUNTER-KILLER: Verified continuous carrier at {c_freq:.3f} MHz{matched_vtx_str} (SNR +{c_snr:.1f} dB). Snapping to Stare Mode.")
+
+                            # Retune Kraken immediately so it synchronizes and computes DoA during the dwell window
+                            if hasattr(self, 'hk_auto_kraken_cb') and self.hk_auto_kraken_cb.isChecked():
+                                if hasattr(self, 'kraken_freq_spin'):
+                                    self.kraken_freq_spin.blockSignals(True)
+                                    self.kraken_freq_spin.setValue(c_freq)
+                                    self.kraken_freq_spin.blockSignals(False)
+                                self.push_kraken_hardware_settings()
+
+                            self.mode_selector.setCurrentText("STARE MODE (2MHz)")
+                            self.freq_input.setValue(c_freq)
+                            self.start_sdr()
+
             elif mode == "STARE":
+                current_time = time.time()
+                # Autonomous Hunter-Killer Stare & Intercept Evaluation
+                if getattr(self, 'hk_active', False) and self.hk_state == "STARE_INTERCEPT":
+                    dwell_sec = (self.hk_dwell_spin.value() if hasattr(self, 'hk_dwell_spin') else 1000) / 1000.0
+                    elapsed = current_time - self.hk_stare_start_time
+                    
+                    if elapsed >= dwell_sec:
+                        self.hk_state = "EVALUATING"
+                        
+                        # Real Signal Verification Gate: Check if an active carrier actually exists on this frequency
+                        is_vtx_freq = (5640.0 <= self.hk_target_freq <= 5950.0) or (1080.0 <= self.hk_target_freq <= 1360.0)
+                        
+                        matched_vtx_chan = None
+                        for cname, cfreq in FPV_VIDEO_CHANNELS.items():
+                            if abs(self.hk_target_freq - cfreq) <= 2.5:
+                                matched_vtx_chan = cname
+                                break
+
+                        if is_vtx_freq or matched_vtx_chan:
+                            is_real_signal = (peak_power > -88.0)
+                            if matched_vtx_chan:
+                                mod_type = f"FPV Video [{matched_vtx_chan}]"
+                            else:
+                                mod_type = f"FPV Video ({self.hk_target_freq:.1f} MHz)"
+                        else:
+                            is_real_signal = (peak_power > -82.0 and mod_type != "Noise/Inactive" and "Noise" not in mod_type)
+                        
+                        if not is_real_signal:
+                            self.log_event(f"AUTONOMOUS HUNTER-KILLER: Transient burst cleared @ {self.hk_target_freq:.3f} MHz (Noise floor / no sustained carrier). Resuming sweep.")
+                        else:
+                            score = self.calculate_hk_threat_score(self.hk_target_freq, peak_power, bw, mod_type)
+                            if matched_vtx_chan or is_vtx_freq:
+                                score = max(85, score) # Force high priority for detected video links!
+                            priority = "P3 ADVISORY"
+                            if score >= 70: priority = "P1 CRITICAL"
+                            elif score >= 45: priority = "P2 HIGH"
+
+                            # If FPV VTX detected, auto-tune FPV Video channel combo
+                            if matched_vtx_chan and hasattr(self, 'fpv_channel_combo'):
+                                for idx in range(self.fpv_channel_combo.count()):
+                                    if matched_vtx_chan in self.fpv_channel_combo.itemText(idx):
+                                        self.fpv_channel_combo.blockSignals(True)
+                                        self.fpv_channel_combo.setCurrentIndex(idx)
+                                        self.fpv_channel_combo.blockSignals(False)
+                                        break
+                                if hasattr(self, 'v_freq_spin'):
+                                    self.v_freq_spin.blockSignals(True)
+                                    self.v_freq_spin.setValue(self.hk_target_freq)
+                                    self.v_freq_spin.blockSignals(False)
+
+                            # Update metrics HUD
+                            if hasattr(self, 'hk_metric_freq'):
+                                self.hk_metric_freq.setText(f"Frequency: {self.hk_target_freq:.3f} MHz")
+                                self.hk_metric_bw.setText(f"Bandwidth: {bw:.1f} kHz" if bw > 0 else "Bandwidth: ~8.0 MHz (FPV VTX)")
+                                self.hk_metric_snr.setText(f"Peak Power: {peak_power:.1f} dBFS")
+                                self.hk_metric_pulse.setText(f"Pulse Width: {pulse_ms:.1f} ms" if pulse_ms > 0 else "Pulse: Continuous")
+                                self.hk_metric_fingerprint.setText(f"Hardware CVA: 0x{fingerprint}" if fingerprint else "Hardware CVA: 0x----")
+
+                            bearing = getattr(self, 'last_bearing_deg', 0.0)
+                            bearing_conf = getattr(self, 'last_bearing_conf', 0.0)
+                            if hasattr(self, 'hk_metric_bearing'):
+                                self.hk_metric_bearing.setText(f"DoA Bearing: {bearing:05.1f}° (Conf: {bearing_conf:.0f}%)" if bearing_conf > 30.0 else f"DoA Bearing: {bearing:05.1f}°")
+
+                            # Auto Plot to Map
+                            if hasattr(self, 'hk_auto_map_cb') and self.hk_auto_map_cb.isChecked() and hasattr(self, 'geo_map_view') and bearing_conf > 30.0:
+                                lat = float(self.geo_lat_input.text()) if (hasattr(self, 'geo_lat_input') and self.geo_lat_input.text()) else 51.5074
+                                lon = float(self.geo_lon_input.text()) if (hasattr(self, 'geo_lon_input') and self.geo_lon_input.text()) else -0.1278
+                                js = f"if (typeof updateBearingLine === 'function') {{ updateBearingLine({lat}, {lon}, {bearing}, 6000, '{'#ef4444' if score >= 70 else '#f59e0b'}'); }}"
+                                self.geo_map_view.page().runJavaScript(js)
+
+                            # Add/Update in Priority Queue Table
+                            self.add_or_update_hk_queue(self.hk_target_freq, mod_type, score, fingerprint, bearing, peak_power)
+
+                            # Voice / Speech Alert
+                            if hasattr(self, 'hk_audio_alert_cb') and self.hk_audio_alert_cb.isChecked() and score >= 60:
+                                speak_tactical_alert(f"Warning. Priority {priority} emitter intercepted on {int(self.hk_target_freq)} megahertz. Threat score {score}.")
+
+                            self.log_event(f"HUNTER-KILLER INTERCEPT: {self.hk_target_freq:.3f} MHz | {priority} (Score {score}/100) | {mod_type} | Bearing {bearing:.1f}°")
+
+                        # Operating Mode Next State Action
+                        hk_mode_idx = self.hk_mode_combo.currentIndex() if hasattr(self, 'hk_mode_combo') else 0
+                        if hk_mode_idx == 2 and is_real_signal: # Target Intercept & Lock
+                            self.hk_state = "TRACK_LOCKED"
+                            if hasattr(self, 'hk_status_badge'):
+                                self.hk_status_badge.setText(f"[ TRACK LOCKED: CONTINUOUS INTERCEPT @ {self.hk_target_freq:.3f} MHz ]")
+                                self.hk_status_badge.setStyleSheet("background-color: #060a14; color: #ef4444; font-family: monospace; font-size: 12px; font-weight: bold; padding: 6px; border: 1px solid #ef4444; border-radius: 4px;")
+                            # If FPV VTX locked, start video stream
+                            if (is_vtx_freq or matched_vtx_chan) and not getattr(self, 'is_video_streaming', False):
+                                self.start_video_stream()
+                        else: # Full Autonomous / Semi-Autonomous -> Resume Sweep
+                            self.hk_state = "HUNTING"
+                            s_min, s_max = getattr(self, 'hk_resume_sweep_params', (850.0, 950.0))
+                            if hasattr(self, 'hk_status_badge'):
+                                self.hk_status_badge.setText(f"[ HUNTER-KILLER: HUNTING SWEEP {s_min:.0f} - {s_max:.0f} MHz ]")
+                                self.hk_status_badge.setStyleSheet("background-color: #060a14; color: #10b981; font-family: monospace; font-size: 12px; font-weight: bold; padding: 6px; border: 1px solid #10b981; border-radius: 4px;")
+                            if hasattr(self, 'hk_cycle_breadcrumbs'):
+                                self.hk_cycle_breadcrumbs.setText("CYCLE: ▶ [ 1. HUNT ] ➔ [ 2. DETECT ] ➔ [ 3. STARE & FP ] ➔ [ 4. DoA VECTOR ] ➔ [ 5. THREAT EVAL ] ➔ [ 6. RESUME ]")
+                                self.hk_cycle_breadcrumbs.setStyleSheet("color: #10b981; font-family: monospace; font-size: 10px; font-weight: bold;")
+                            
+                            self.sweep_start_input.setValue(s_min)
+                            self.sweep_end_input.setValue(s_max)
+                            self.mode_selector.setCurrentText("SWEEP MODE (Wideband)")
+                            self.start_sdr()
+
                 # Watchlist Matching
                 if bw > 0:
                     for sig in self.watchlist:
                         if sig["min_bw"] <= bw <= sig["max_bw"] and sig["mod"] == mod_type:
                             mod_type = f" {sig['name']} MATCH"
                             break
-                # Peak Anomaly tracking
+                # Peak Anomaly tracking (Wideband unexpected anomaly detector)
                 for p in peaks:
                     masked = False
                     for r_min, r_max in active_ranges:
@@ -2982,20 +6703,40 @@ class CEMAApp(QMainWindow):
 
                 current_time = time.time()
                 for p in filtered_peaks:
+                    p_freq_mhz = self.bin_to_freq(p) / 1e6
+
+                    # 1. FHSS / LoRa Suppression: Suppress peak anomalies inside active FHSS networks
+                    is_in_fhss = False
+                    for b_info in getattr(self, 'active_fhss_bands', {}).values():
+                        if (current_time - b_info.get('last_seen', 0) < 6.0) and (b_info['f_min'] - 2.0 <= p_freq_mhz <= b_info['f_max'] + 2.0):
+                            is_in_fhss = True
+                            break
+                    if is_in_fhss:
+                        continue
+
+                    # 2. Standard UAV Drone Control Bands (860-930 MHz, 2400-2485 MHz): Auto-suppressed from anomaly spam
+                    if (860.0 <= p_freq_mhz <= 930.0) or (2400.0 <= p_freq_mhz <= 2485.0):
+                        continue
+
+                    # 3. In Stare Mode: The center carrier is the target being monitored, not an unexpected anomaly
+                    if mode == "STARE":
+                        center_f = self.freq_input.value()
+                        if abs(p_freq_mhz - center_f) <= 0.8:
+                            continue
+
                     is_new = True
-                    for active_p, last_time in self.active_events.items():
-                        # Spatial Debounce: +/- 15 bins (approx 30kHz)
-                        if abs(p - active_p) <= 15 and (current_time - last_time < 5.0):
+                    for active_freq, last_time in list(self.active_events.items()):
+                        # Wideband Spatial Debounce: +/- 1.0 MHz with a 15.0-second cooldown
+                        if abs(p_freq_mhz - active_freq) <= 1.0 and (current_time - last_time < 15.0):
                             is_new = False
-                            # Refresh the timer for this active cluster
-                            self.active_events[active_p] = current_time
+                            self.active_events[active_freq] = current_time
                             break
                             
                     if is_new:
-                        self.log_event(f"ANOMALY: Peak detected at {self.bin_to_freq(p)/1e6:.2f} MHz")
-                        self.active_events[p] = current_time
+                        self.log_event(f"ANOMALY: Unexpected spectral peak detected at {p_freq_mhz:.3f} MHz")
+                        self.active_events[p_freq_mhz] = current_time
                         
-                self.active_events = {k: v for k, v in self.active_events.items() if current_time - v < 10.0}
+                self.active_events = {k: v for k, v in self.active_events.items() if current_time - v < 20.0}
 
                 # Watchlist & Fingerprint
                 if "🚨" in mod_type and mod_type != self.last_mod_type:
@@ -3165,7 +6906,10 @@ class CEMAApp(QMainWindow):
                     pass
 
             if mode == "STARE":
-                self.mod_label.setText(f"Modulation: {mod_type} | Est. BW: {bw/1000:.0f} kHz")
+                if bw > 0 or (mod_type != "Noise/Inactive" and "Noise" not in mod_type):
+                    self.mod_label.setText(f"Modulation: {mod_type} | Est. BW: {bw/1000:.0f} kHz")
+                else:
+                    self.mod_label.setText("Modulation: Standby / Idle (Carrier Gate Active)")
             else:
                 self.mod_label.setText("Modulation: SWEEPING (Hop Tracker Active)")
 
@@ -3221,6 +6965,9 @@ class CEMAApp(QMainWindow):
         self.force_demod_btn.setText(" STOP AUDIO")
 
     def closeEvent(self, event):
+        self.flush_dirty_state_to_disk()
+        if hasattr(self, 'kraken_thread') and self.kraken_thread:
+            self.kraken_thread.stop()
         if hasattr(self, 'native_video_thread') and self.native_video_thread:
             self.native_video_thread.stop()
         if hasattr(self, 'external_video_thread') and self.external_video_thread:
@@ -3233,6 +6980,7 @@ class CEMAApp(QMainWindow):
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
+    app.setFont(QFont("Consolas", 10))
     window = CEMAApp()
     window.show()
     sys.exit(app.exec())
