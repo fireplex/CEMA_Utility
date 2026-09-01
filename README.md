@@ -58,6 +58,12 @@ The system synchronously fuses four independent sensor and processing domains:
 * **Multi-Baseline Triangulation:** Solves 95% Circular Error Probable (CEP) target geolocation fixes.
 * **Self-Healing Subsystem:** Background WSL2 keepalive daemon, dynamic `usbipd` path discovery, automated 5-tuner USB re-attachment, and stale shared memory cleanup (`/dev/shm`).
 
+### 7. Electromagnetic Battlespace Management (EMBM) & Terrain Shadowing
+* **4/3 Effective Earth Curvature & Refraction:** Models atmospheric RF ray curvature ($R_{eff} = 8,495\text{ km}$) across customizable mast heights ($1\text{m}\text{--}100\text{m}$).
+* **1st Fresnel Zone Knife-Edge Clearance:** Evaluates full Line-of-Sight ($>60\%$ Fresnel clearance), knife-edge diffraction zones, and terrain shadow blind spots.
+* **Real-Time Vectorized Ray Marching:** Sub-second $360^\circ$ viewshed calculations mapping hostile drone ingress corridors directly onto the Leaflet tactical map.
+* **AI Copilot Integration:** Ingests blind sector vectors into the Tactical Copilot to recommend forward scout sensor placement and alert on threat vectors masking behind topography.
+
 ---
 
 ## Hardware Configuration & Tuning

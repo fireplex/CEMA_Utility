@@ -2060,6 +2060,8 @@ class TacticalSettingsDialog(QDialog):
 class CEMAApp(QMainWindow):
     kraken_health_signal = pyqtSignal(str, str, str) # msg, color, border
     copilot_response_signal = pyqtSignal(str, str)   # prompt, response
+    copilot_stream_chunk_signal = pyqtSignal(str)    # text_chunk
+    embm_viewshed_ready_signal = pyqtSignal(dict)    # viewshed_result
 
     def __init__(self):
         super().__init__()
@@ -2070,10 +2072,13 @@ class CEMAApp(QMainWindow):
         self.hackrf_thread = None
         self.heltec_thread = None
         self.floating_video_window = None
+        self.last_viewshed_data = None
         
         self.setup_ui()
         self.kraken_health_signal.connect(self._on_kraken_health_updated)
         self.copilot_response_signal.connect(self._on_copilot_response_received)
+        self.copilot_stream_chunk_signal.connect(self._on_copilot_stream_chunk)
+        self.embm_viewshed_ready_signal.connect(self._on_viewshed_computed)
 
         self._fingerprints_dirty = False
         self._topology_dirty = False
@@ -3044,6 +3049,29 @@ class CEMAApp(QMainWindow):
                     cepCircles.push(circle);
                 }
 
+                var viewshedLayer = null;
+
+                function updateViewshedOverlay(imageUrl, southWestLat, southWestLon, northEastLat, northEastLon) {
+                    if (viewshedLayer) {
+                        map.removeLayer(viewshedLayer);
+                        viewshedLayer = null;
+                    }
+                    if (imageUrl) {
+                        var bounds = [[southWestLat, southWestLon], [northEastLat, northEastLon]];
+                        viewshedLayer = L.imageOverlay(imageUrl, bounds, {
+                            opacity: 0.60,
+                            interactive: false
+                        }).addTo(map);
+                    }
+                }
+
+                function clearViewshedOverlay() {
+                    if (viewshedLayer) {
+                        map.removeLayer(viewshedLayer);
+                        viewshedLayer = null;
+                    }
+                }
+
                 function clearTacticalTracks() {
                     droneTrail.setLatLngs([]);
                     if (rfCircle) {
@@ -3062,6 +3090,7 @@ class CEMAApp(QMainWindow):
                         map.removeLayer(cepCircles[j]);
                     }
                     cepCircles = [];
+                    clearViewshedOverlay();
                 }
             </script>
         </body>
@@ -3095,8 +3124,59 @@ class CEMAApp(QMainWindow):
         readout_layout.addWidget(self.geo_lon_input)
         readout_layout.addWidget(self.geo_plot_btn)
         readout_layout.addWidget(self.solve_cep_btn)
-        
         geo_layout.addLayout(readout_layout)
+
+        # EMBM & Tactical Terrain Shadowing Control Panel
+        embm_group = QGroupBox("EMBM & Tactical Terrain Shadowing (4/3 Earth & 1st Fresnel Engine)")
+        embm_layout = QGridLayout(embm_group)
+        embm_layout.setContentsMargins(6, 6, 6, 6)
+        embm_layout.setSpacing(6)
+
+        self.embm_mast_spin = QDoubleSpinBox()
+        self.embm_mast_spin.setRange(1.0, 100.0)
+        self.embm_mast_spin.setValue(10.0)
+        self.embm_mast_spin.setSuffix(" m")
+
+        self.embm_uav_alt_spin = QDoubleSpinBox()
+        self.embm_uav_alt_spin.setRange(5.0, 500.0)
+        self.embm_uav_alt_spin.setValue(25.0)
+        self.embm_uav_alt_spin.setSuffix(" m AGL")
+
+        self.embm_range_spin = QDoubleSpinBox()
+        self.embm_range_spin.setRange(1.0, 50.0)
+        self.embm_range_spin.setValue(15.0)
+        self.embm_range_spin.setSuffix(" km")
+
+        self.embm_freq_spin = QDoubleSpinBox()
+        self.embm_freq_spin.setRange(30.0, 6000.0)
+        self.embm_freq_spin.setValue(915.0)
+        self.embm_freq_spin.setSuffix(" MHz")
+
+        self.embm_compute_btn = QPushButton("COMPUTE TERRAIN VIEWSHED")
+        self.embm_compute_btn.setStyleSheet("background-color: #10b981; color: white; font-weight: bold; padding: 6px 12px; border-radius: 4px;")
+        self.embm_compute_btn.clicked.connect(self.compute_and_render_viewshed)
+
+        self.embm_clear_btn = QPushButton("CLEAR HEATMAP")
+        self.embm_clear_btn.setStyleSheet("background-color: #1e293b; color: #f87171; font-weight: bold; padding: 6px; border: 1px solid #f87171; border-radius: 4px;")
+        self.embm_clear_btn.clicked.connect(self.clear_viewshed_overlay)
+
+        self.embm_status_lbl = QLabel("[ EMBM: STANDBY | 4/3 EARTH & FRESNEL ENGINE READY ]")
+        self.embm_status_lbl.setStyleSheet("background-color: #060a14; color: #38bdf8; font-family: monospace; font-size: 11px; font-weight: bold; padding: 5px; border: 1px solid #1e293b; border-radius: 4px;")
+
+        embm_layout.addWidget(QLabel("Mast Height:"), 0, 0)
+        embm_layout.addWidget(self.embm_mast_spin, 0, 1)
+        embm_layout.addWidget(QLabel("Target Alt:"), 0, 2)
+        embm_layout.addWidget(self.embm_uav_alt_spin, 0, 3)
+        embm_layout.addWidget(QLabel("Max Horizon:"), 0, 4)
+        embm_layout.addWidget(self.embm_range_spin, 0, 5)
+        embm_layout.addWidget(QLabel("Frequency:"), 0, 6)
+        embm_layout.addWidget(self.embm_freq_spin, 0, 7)
+
+        embm_layout.addWidget(self.embm_compute_btn, 1, 0, 1, 4)
+        embm_layout.addWidget(self.embm_clear_btn, 1, 4, 1, 4)
+        embm_layout.addWidget(self.embm_status_lbl, 2, 0, 1, 8)
+
+        geo_layout.addWidget(embm_group)
         return geo_widget
 
     def clear_tactical_tracks(self):
@@ -4537,7 +4617,8 @@ class CEMAApp(QMainWindow):
             "pilots": getattr(self, 'discovered_pilots', {}),
             "last_bearing": getattr(self, 'last_bearing_deg', 0.0),
             "bearing_history": getattr(self, 'bearing_history', []),
-            "cep_fix": getattr(self, 'last_triangulation_fix', None)
+            "cep_fix": getattr(self, 'last_triangulation_fix', None),
+            "viewshed_data": getattr(self, 'last_viewshed_data', None)
         }
 
     def generate_copilot_sitrep(self):
@@ -4553,23 +4634,29 @@ class CEMAApp(QMainWindow):
         copilot = get_tactical_copilot()
         ctx = self._build_copilot_context()
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        self.copilot_output.setText(f"[{timestamp}] OPERATOR QUERY: {prompt}\n" + "="*50 + f"\n\n[ THINKING / REASONING ON RTX 3060 GPU... ]")
+        self.copilot_output.setText(f"[{timestamp}] OPERATOR QUERY: {prompt}\n" + "="*50 + "\n\n")
         
+        def _stream_cb(chunk):
+            self.copilot_stream_chunk_signal.emit(chunk)
+
         def _worker():
-            resp = copilot.answer_operator_query(prompt, ctx)
+            resp = copilot.answer_operator_query(prompt, ctx, stream_callback=_stream_cb)
             self.copilot_response_signal.emit(prompt, resp)
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _on_copilot_stream_chunk(self, chunk):
+        self.copilot_output.insertPlainText(chunk)
+        cursor = self.copilot_output.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        self.copilot_output.setTextCursor(cursor)
+
     def _on_copilot_response_received(self, prompt, resp):
-        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        self.copilot_output.setText(f"[{timestamp}] OPERATOR QUERY: {prompt}\n" + "="*50 + f"\n\n{resp}")
-        
         from tactical_copilot import get_tactical_copilot
         copilot = get_tactical_copilot()
         if hasattr(self, 'copilot_status_badge'):
             if copilot.is_slm_ready():
-                self.copilot_status_badge.setText(f"[ AI COPILOT: {copilot.slm_status} | VRAM: 1.1GB ]")
+                self.copilot_status_badge.setText(f"[ AI COPILOT: {copilot.slm_status} | VRAM: 2.9GB ]")
                 self.copilot_status_badge.setStyleSheet("background-color: #060a14; color: #10b981; font-family: monospace; font-size: 11px; font-weight: bold; padding: 6px; border: 1px solid #10b981; border-radius: 4px;")
 
     def on_copilot_query_submitted(self):
@@ -5241,6 +5328,63 @@ class CEMAApp(QMainWindow):
         else:
             self.log_event("TRIANGULATION CEP: Bearings are parallel or collinear; move to a wider baseline and record again.")
 
+    def compute_and_render_viewshed(self):
+        lat = 51.5074
+        lon = -0.1278
+        if hasattr(self, 'geo_lat_input') and self.geo_lat_input.text():
+            try: lat = float(self.geo_lat_input.text())
+            except ValueError: pass
+        if hasattr(self, 'geo_lon_input') and self.geo_lon_input.text():
+            try: lon = float(self.geo_lon_input.text())
+            except ValueError: pass
+
+        h_tx = self.embm_mast_spin.value() if hasattr(self, 'embm_mast_spin') else 10.0
+        h_rx = self.embm_uav_alt_spin.value() if hasattr(self, 'embm_uav_alt_spin') else 25.0
+        max_r = self.embm_range_spin.value() if hasattr(self, 'embm_range_spin') else 15.0
+        freq = self.embm_freq_spin.value() if hasattr(self, 'embm_freq_spin') else 915.0
+
+        if hasattr(self, 'embm_status_lbl'):
+            self.embm_status_lbl.setText(f"[ EMBM: COMPUTING 4/3 EARTH VIEWSHED ({max_r:.0f}km @ {freq:.0f}MHz)... ]")
+            self.embm_status_lbl.setStyleSheet("background-color: #060a14; color: #f59e0b; font-family: monospace; font-size: 11px; font-weight: bold; padding: 5px; border: 1px solid #f59e0b; border-radius: 4px;")
+
+        def _worker():
+            from terrain_engine import get_terrain_engine
+            te = get_terrain_engine()
+            res = te.compute_viewshed(lat, lon, h_tx=h_tx, h_rx=h_rx, freq_mhz=freq, max_range_km=max_r)
+            self.embm_viewshed_ready_signal.emit(res)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_viewshed_computed(self, data):
+        self.last_viewshed_data = data
+        bounds = data.get("bounds", [0, 0, 0, 0])
+        png_b64 = data.get("png_base64", "")
+        los_pct = data.get("los_pct", 0.0)
+        diff_pct = data.get("diff_pct", 0.0)
+        shadow_pct = data.get("shadow_pct", 0.0)
+        elev = data.get("station_elev_m", 0.0)
+        blind_sectors = data.get("blind_sectors", [])
+
+        if hasattr(self, 'geo_map_view') and png_b64:
+            js = f"if (typeof updateViewshedOverlay === 'function') {{ updateViewshedOverlay('{png_b64}', {bounds[0]}, {bounds[1]}, {bounds[2]}, {bounds[3]}); }}"
+            self.geo_map_view.page().runJavaScript(js)
+
+        if hasattr(self, 'embm_status_lbl'):
+            status_text = f"[ EMBM: {los_pct:.1f}% LOS | {diff_pct:.1f}% DIFFRACTION | {shadow_pct:.1f}% SHADOW BLIND ({elev:.1f}m MSL) | {len(blind_sectors)} INGRESS CORRIDORS ]"
+            self.embm_status_lbl.setText(status_text)
+            self.embm_status_lbl.setStyleSheet("background-color: #060a14; color: #10b981; font-family: monospace; font-size: 11px; font-weight: bold; padding: 5px; border: 1px solid #10b981; border-radius: 4px;")
+
+        self.log_event(f"EMBM TERRAIN: Computed {data.get('max_range_km')}km viewshed ({los_pct:.1f}% LOS, {shadow_pct:.1f}% Shadow, {len(blind_sectors)} Blind Corridors).")
+
+    def clear_viewshed_overlay(self):
+        self.last_viewshed_data = None
+        if hasattr(self, 'geo_map_view'):
+            self.geo_map_view.page().runJavaScript("if (typeof clearViewshedOverlay === 'function') { clearViewshedOverlay(); }")
+        if hasattr(self, 'embm_status_lbl'):
+            self.embm_status_lbl.setText("[ EMBM: STANDBY | 4/3 EARTH & FRESNEL ENGINE READY ]")
+            self.embm_status_lbl.setStyleSheet("background-color: #060a14; color: #38bdf8; font-family: monospace; font-size: 11px; font-weight: bold; padding: 5px; border: 1px solid #1e293b; border-radius: 4px;")
+        self.log_event("EMBM TERRAIN: Cleared terrain viewshed heatmap layer.")
+
     def detach_map_window(self):
         if not hasattr(self, 'popout_windows'):
             self.popout_windows = {}
@@ -5494,6 +5638,34 @@ class CEMAApp(QMainWindow):
         armed = data['armed']
         channels = data.get('channels', [ch1, ch2, ch3, ch4] + [1500] * 12)
 
+        # Synchronize live armed status & telemetry to discovered_pilots for AI Copilot & SITREP
+        if not hasattr(self, 'discovered_pilots'):
+            self.discovered_pilots = {}
+        
+        pilot_key = getattr(self, 'last_pilot_key', None) or "ACTIVE_PILOT"
+        if pilot_key not in self.discovered_pilots:
+            self.discovered_pilots[pilot_key] = {
+                "u3": 0, "u4": 0, "u5": 0,
+                "crc_init": "2156",
+                "rssi": rssi,
+                "rate_name": data.get('packet_rate', '50Hz'),
+                "armed": armed,
+                "channels": channels,
+                "last_seen": time.time()
+            }
+        else:
+            self.discovered_pilots[pilot_key]["armed"] = armed
+            self.discovered_pilots[pilot_key]["rssi"] = rssi
+            self.discovered_pilots[pilot_key]["rate_name"] = data.get('packet_rate', '50Hz')
+            self.discovered_pilots[pilot_key]["channels"] = channels
+            self.discovered_pilots[pilot_key]["last_seen"] = time.time()
+
+        for p in self.discovered_pilots.values():
+            p["armed"] = armed
+            p["rate_name"] = data.get('packet_rate', '50Hz')
+            p["rssi"] = rssi
+            p["last_seen"] = time.time()
+
         if hasattr(self, 'heltec_connect_btn'):
             self.heltec_connect_btn.setText(f"🚁 HELTEC: {rssi:.0f}dBm")
 
@@ -5660,8 +5832,22 @@ class CEMAApp(QMainWindow):
         self.log_event(f"HELTEC UAV FLIGHT MODE: {mode}")
 
     def on_heltec_gps(self, data):
-        lat = data["lat"]
-        lon = data["lon"]
+        lat = data.get("lat", 0.0)
+        lon = data.get("lon", 0.0)
+        alt = data.get("alt", 0.0)
+        spd = data.get("spd", 0.0)
+        sats = data.get("sats", 0)
+
+        # Synchronize GPS and kinematic state to discovered_pilots for AI Copilot
+        if hasattr(self, 'discovered_pilots'):
+            for p in self.discovered_pilots.values():
+                if lat != 0 or lon != 0:
+                    p["lat"] = lat
+                    p["lon"] = lon
+                p["alt"] = alt
+                p["spd"] = spd
+                p["sats"] = sats
+
         if lat != 0 or lon != 0:
             self.gps_breadcrumbs_count += 1
             if hasattr(self, 'geo_breadcrumbs_lbl'):
@@ -5677,7 +5863,7 @@ class CEMAApp(QMainWindow):
             js_ring = f"updateRfRangeRing({lat - 0.001}, {lon - 0.001}, 250, '#38bdf8');"
             self.geo_map_view.page().runJavaScript(js_ring)
 
-            self.log_event(f"HELTEC UAV GPS FIX: {lat:.5f}, {lon:.5f} | Alt: {data['alt']}m | Spd: {data['spd']}km/h | Sats: {data['sats']}")
+            self.log_event(f"HELTEC UAV GPS FIX: {lat:.5f}, {lon:.5f} | Alt: {alt}m | Spd: {spd}km/h | Sats: {sats}")
 
     def on_heltec_sync(self, data):
         crc_hex = data['crc_init']

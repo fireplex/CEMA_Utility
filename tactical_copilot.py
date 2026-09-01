@@ -41,34 +41,33 @@ class TacticalCopilot:
     def _init_slm_engine(self):
         try:
             import torch
-            from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+            from transformers import AutoModelForCausalLM, AutoTokenizer
             
             if not torch.cuda.is_available():
                 self.slm_status = "CPU_FALLBACK"
                 return
 
-            self.slm_status = "LOADING"
+            self.slm_status = "LOADING (FP16 SDPA)"
             model_id = "Qwen/Qwen2.5-1.5B-Instruct"
-
-            quant_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16
-            )
 
             tokenizer = AutoTokenizer.from_pretrained(model_id)
             model = AutoModelForCausalLM.from_pretrained(
                 model_id,
-                quantization_config=quant_config,
+                torch_dtype=torch.float16,
                 device_map="cuda",
-                torch_dtype=torch.float16
+                attn_implementation="sdpa"
             )
             model.eval()
+
+            # Warmup JIT kernels in background so operator queries are instant (<2s)
+            warmup_inputs = tokenizer("<|im_start|>system\nTactical EW.<|im_end|>\n<|im_start|>user\nWarmup.<|im_end|>\n<|im_start|>assistant\n", return_tensors="pt").to("cuda")
+            with torch.inference_mode():
+                _ = model.generate(**warmup_inputs, max_new_tokens=5, use_cache=True)
 
             with self.slm_lock:
                 self.slm_tokenizer = tokenizer
                 self.slm_model = model
-                self.slm_status = "ONLINE (RTX 3060 CUDA / 4-BIT)"
+                self.slm_status = "ONLINE (RTX 3060 CUDA FP16 SDPA)"
 
         except Exception as e:
             self.slm_status = f"ERROR: {e}"
@@ -77,12 +76,13 @@ class TacticalCopilot:
         with self.slm_lock:
             return self.slm_model is not None and self.slm_tokenizer is not None
 
-    def query_slm(self, query, context_data, max_new_tokens=300):
+    def query_slm(self, query, context_data, max_new_tokens=160, stream_callback=None):
         if not self.is_slm_ready():
             return None
 
         try:
             import torch
+            from transformers import TextIteratorStreamer
             queue = context_data.get("hk_queue", {})
             pilots = context_data.get("pilots", {})
             last_bearing = context_data.get("last_bearing", 0.0)
@@ -95,6 +95,14 @@ class TacticalCopilot:
             ctx_summary.append(f"Kraken DoA Line-of-Bearing: {last_bearing:05.1f}° True")
             if cep_fix:
                 ctx_summary.append(f"Triangulated Geolocation (95% CEP): {cep_fix['lat']:.5f}°N, {cep_fix['lon']:.5f}°W (±{cep_fix['cep']:.1f}m)")
+
+            viewshed = context_data.get("viewshed_data", None)
+            if viewshed:
+                ctx_summary.append(f"EMBM Terrain Coverage: LOS={viewshed.get('los_pct')}% | Shadow/Blind={viewshed.get('shadow_pct')}% (Mast={viewshed.get('h_tx')}m, Target Alt={viewshed.get('h_rx')}m AGL)")
+                blind_secs = viewshed.get("blind_sectors", [])
+                if blind_secs:
+                    sec_strs = [f"{s['start_deg']}°-{s['end_deg']}°" for s in blind_secs[:4]]
+                    ctx_summary.append(f"  - Key Ingress Shadow Corridors: {', '.join(sec_strs)}")
 
             ctx_summary.append(f"Active Emitters ({len(queue)} tracked):")
             for k, t in queue.items():
@@ -110,7 +118,7 @@ class TacticalCopilot:
             prompt = (
                 f"<|im_start|>system\n"
                 f"You are a military Electronic Warfare (EW), CEMA, and Tactical UAS Intelligence Officer AI Assistant.\n"
-                f"Analyze the live sensor telemetry below and answer the operator's query with concise, actionable military-grade analysis, flight phase intent, link correlation, or ECM jamming recommendations.\n\n"
+                f"Analyze the live sensor telemetry below and provide a direct, actionable military answer with concise bullet points.\n\n"
                 f"=== LIVE TACTICAL SENSOR CONTEXT ===\n"
                 f"{context_str}\n"
                 f"====================================\n<|im_end|>\n"
@@ -120,19 +128,50 @@ class TacticalCopilot:
 
             with self.slm_lock:
                 inputs = self.slm_tokenizer(prompt, return_tensors="pt").to("cuda")
-                with torch.no_grad():
-                    outputs = self.slm_model.generate(
+
+                if stream_callback:
+                    streamer = TextIteratorStreamer(self.slm_tokenizer, skip_prompt=True, skip_special_tokens=True)
+                    gen_kwargs = dict(
                         **inputs,
+                        streamer=streamer,
                         max_new_tokens=max_new_tokens,
-                        temperature=0.3,
+                        temperature=0.2,
                         do_sample=True,
-                        repetition_penalty=1.1
+                        repetition_penalty=1.1,
+                        use_cache=True
                     )
-                resp = self.slm_tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
-                return resp.strip()
+                    gen_thread = threading.Thread(target=self._run_inference_stream, args=(gen_kwargs,))
+                    gen_thread.start()
+
+                    full_text = []
+                    for text_chunk in streamer:
+                        full_text.append(text_chunk)
+                        try:
+                            stream_callback(text_chunk)
+                        except Exception:
+                            pass
+                    gen_thread.join()
+                    return "".join(full_text).strip()
+                else:
+                    with torch.inference_mode():
+                        outputs = self.slm_model.generate(
+                            **inputs,
+                            max_new_tokens=max_new_tokens,
+                            temperature=0.2,
+                            do_sample=True,
+                            repetition_penalty=1.1,
+                            use_cache=True
+                        )
+                    resp = self.slm_tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+                    return resp.strip()
 
         except Exception as e:
             return None
+
+    def _run_inference_stream(self, gen_kwargs):
+        import torch
+        with torch.inference_mode():
+            self.slm_model.generate(**gen_kwargs)
 
     def generate_nato_sitrep(self, context_data):
         now_utc = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -211,7 +250,7 @@ class TacticalCopilot:
         
         return "\n".join(lines)
 
-    def answer_operator_query(self, query, context_data):
+    def answer_operator_query(self, query, context_data, stream_callback=None):
         q = query.lower().strip()
         queue = context_data.get("hk_queue", {})
         pilots = context_data.get("pilots", {})
@@ -219,17 +258,21 @@ class TacticalCopilot:
         station_loc = context_data.get("station_loc", (51.5074, -0.1278))
         cep_fix = context_data.get("cep_fix", None)
         history = context_data.get("bearing_history", [])
+        viewshed = context_data.get("viewshed_data", None)
 
         if not q:
             return "Operator, enter a tactical query."
 
         # 1. GPU Neural SLM Inference (if online in VRAM)
         if self.is_slm_ready():
-            slm_resp = self.query_slm(query, context_data)
+            slm_resp = self.query_slm(query, context_data, stream_callback=stream_callback)
             if slm_resp and len(slm_resp.strip()) > 10:
                 return slm_resp
 
         # 2. Rule-Guided Multi-Domain Deterministic Fallback Engine
+        if any(w in q for w in ["terrain", "shadow", "blind", "viewshed", "dead zone", "horizon", "elevation", "embm", "fresnel", "los"]):
+            return self._reason_terrain_and_shadow_zones(viewshed, last_bearing, station_loc)
+
         if any(w in q for w in ["brief", "briefing", "sitrep", "intsum", "report", "overview"]):
             return self._reason_threat_overview(queue, pilots, last_bearing)
 
@@ -544,6 +587,46 @@ class TacticalCopilot:
             res.append("\n[OK] SECTOR SECURE: No active armed drone threats detected.")
             
         res.append("\nTip: Ask specific tactical questions regarding 'flight phase', 'correlation', 'operator location', 'ECM jamming', or click 'GENERATE NATO SITREP'.")
+        return "\n".join(res)
+
+    def _reason_terrain_and_shadow_zones(self, viewshed, last_bearing, station_loc):
+        res = ["=== EMBM TACTICAL TERRAIN & SHADOW ZONE ANALYSIS ==="]
+        res.append(f"• Station Position  : {station_loc[0]:.5f}°N, {station_loc[1]:.5f}°W")
+        
+        if not viewshed:
+            res.append("• Viewshed Status   : No terrain viewshed calculated yet.")
+            res.append("• Action Required   : Click 'COMPUTE TERRAIN VIEWSHED' in the Tactical Geolocation tab to generate 4/3 Earth viewshed.")
+            return "\n".join(res)
+
+        los_pct = viewshed.get("los_pct", 0.0)
+        diff_pct = viewshed.get("diff_pct", 0.0)
+        shadow_pct = viewshed.get("shadow_pct", 0.0)
+        h_tx = viewshed.get("h_tx", 10.0)
+        h_rx = viewshed.get("h_rx", 25.0)
+        max_r = viewshed.get("max_range_km", 15.0)
+        station_elev = viewshed.get("station_elev_m", 0.0)
+        blind_sectors = viewshed.get("blind_sectors", [])
+
+        res.append(f"• Station Elevation : {station_elev:.1f}m MSL (+ {h_tx:.1f}m Mast = {station_elev + h_tx:.1f}m ASL)")
+        res.append(f"• Target Altitude   : {h_rx:.1f}m AGL | Analysis Horizon: {max_r:.1f} km")
+        res.append(f"• Sector Coverage   : {los_pct:.1f}% Direct LOS | {diff_pct:.1f}% Diffraction | {shadow_pct:.1f}% Radar Shadow")
+        
+        if blind_sectors:
+            res.append(f"\n[!] IDENTIFIED HOSTILE INGRESS CORRIDORS ({len(blind_sectors)} Sectors):")
+            for idx, s in enumerate(blind_sectors[:5], 1):
+                res.append(f"  {idx}. Azimuth {s['start_deg']}° to {s['end_deg']}° ({s['width_deg']}° span) -> {s['severity']}")
+            res.append("\n• Tactical Advisory:")
+            res.append("  - Hostile drones ingressing along blind corridors will stay masked until close range.")
+            res.append("  - Position forward Heltec LoRa scout nodes along ridge lines to cover shadow dead zones.")
+        else:
+            res.append("\n[OK] HIGH TERRAIN CLEARANCE: No major terrain shadow blind spots detected in operational radius.")
+
+        # Check if current Kraken bearing falls inside a blind sector
+        for s in blind_sectors:
+            if s['start_deg'] <= last_bearing <= s['end_deg']:
+                res.append(f"\n[WARNING] Active DoA Bearing ({last_bearing:.1f}°) aligns directly with an ingress shadow corridor ({s['start_deg']}°-{s['end_deg']}°)!")
+                break
+
         return "\n".join(res)
 
 _copilot_instance = None
