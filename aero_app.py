@@ -204,6 +204,16 @@ class AeroTrackApp(QMainWindow):
         ctrl_group = QGroupBox("Hardware Sensors && Airspace Settings")
         ctrl_layout = QGridLayout(ctrl_group)
         ctrl_layout.setContentsMargins(6, 6, 6, 6)
+        ctrl_layout.setSpacing(6)
+
+        self.source_combo = QComboBox()
+        self.source_combo.addItems([
+            "Live OpenSky Network (Real-Time Internet Airspace)",
+            "HackRF One 1090 MHz SDR (Hardware RF)",
+            "Local Mode-S TCP Stream (127.0.0.1:30002)",
+            "Tactical Synthetic Simulation (Offline)"
+        ])
+        self.source_combo.currentIndexChanged.connect(self.start_adsb_receiver)
 
         self.ref_lat_input = QDoubleSpinBox()
         self.ref_lat_input.setRange(-90.0, 90.0)
@@ -215,18 +225,20 @@ class AeroTrackApp(QMainWindow):
         self.ref_lon_input.setValue(self.ref_lon)
         self.ref_lon_input.setDecimals(4)
 
-        self.restart_sdr_btn = QPushButton("RESTART 1090MHz SDR")
+        self.restart_sdr_btn = QPushButton("RESTART FEED RECEIVER")
         self.restart_sdr_btn.clicked.connect(self.start_adsb_receiver)
 
         self.restart_heltec_btn = QPushButton("RECONNECT HELTEC COM6")
         self.restart_heltec_btn.clicked.connect(self.start_heltec_receiver)
 
-        ctrl_layout.addWidget(QLabel("Station Lat:"), 0, 0)
-        ctrl_layout.addWidget(self.ref_lat_input, 0, 1)
-        ctrl_layout.addWidget(QLabel("Lon:"), 0, 2)
-        ctrl_layout.addWidget(self.ref_lon_input, 0, 3)
-        ctrl_layout.addWidget(self.restart_sdr_btn, 1, 0, 1, 2)
-        ctrl_layout.addWidget(self.restart_heltec_btn, 1, 2, 1, 2)
+        ctrl_layout.addWidget(QLabel("Feed Source:"), 0, 0)
+        ctrl_layout.addWidget(self.source_combo, 0, 1, 1, 3)
+        ctrl_layout.addWidget(QLabel("Station Lat:"), 1, 0)
+        ctrl_layout.addWidget(self.ref_lat_input, 1, 1)
+        ctrl_layout.addWidget(QLabel("Lon:"), 1, 2)
+        ctrl_layout.addWidget(self.ref_lon_input, 1, 3)
+        ctrl_layout.addWidget(self.restart_sdr_btn, 2, 0, 1, 2)
+        ctrl_layout.addWidget(self.restart_heltec_btn, 2, 2, 1, 2)
         right_layout.addWidget(ctrl_group)
 
         splitter.addWidget(right_panel)
@@ -382,8 +394,14 @@ class AeroTrackApp(QMainWindow):
         
         self.ref_lat = self.ref_lat_input.value()
         self.ref_lon = self.ref_lon_input.value()
+
+        mode_idx = self.source_combo.currentIndex() if hasattr(self, 'source_combo') else 0
+        modes = ["live_opensky", "hackrf_sdr", "tcp_beast", "simulation"]
+        mode = modes[mode_idx] if mode_idx < len(modes) else "live_opensky"
+
+        self.aircraft_db.clear()
         
-        self.adsb_thread = HackRFADSBThread(ref_lat=self.ref_lat, ref_lon=self.ref_lon)
+        self.adsb_thread = HackRFADSBThread(ref_lat=self.ref_lat, ref_lon=self.ref_lon, mode=mode)
         self.adsb_thread.aircraft_updated_signal.connect(self.on_aircraft_updated)
         self.adsb_thread.stats_updated_signal.connect(self.on_adsb_stats_updated)
         self.adsb_thread.start()
