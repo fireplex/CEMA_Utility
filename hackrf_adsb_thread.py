@@ -1,5 +1,5 @@
 """
-Multi-Source ADS-B Receiver Thread: HackRF 1090MHz SDR + Live OpenSky + Beast/AVR TCP
+Multi-Source ADS-B Receiver Thread: HackRF 1090MHz SDR (C DLL Slicer) + Live OpenSky + Beast/AVR TCP
 AeroTrack CEMA Tactical Airspace Intelligence Suite
 """
 
@@ -8,12 +8,15 @@ import sys
 import time
 import math
 import json
+import ctypes
 import socket
 import urllib.request
 import subprocess
 import threading
 from PyQt6.QtCore import QThread, pyqtSignal
 from adsb_decoder import ADSBDecoder
+
+CALLBACK_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_int)
 
 class HackRFADSBThread(QThread):
     aircraft_updated_signal = pyqtSignal(dict)
@@ -23,7 +26,7 @@ class HackRFADSBThread(QThread):
         super().__init__()
         self.ref_lat = ref_lat
         self.ref_lon = ref_lon
-        self.mode = mode # "auto", "live_opensky", "hackrf_sdr", "tcp_beast", "simulation"
+        self.mode = mode # "live_opensky", "hackrf_sdr", "tcp_beast", "simulation", "auto"
         self.sample_rate = sample_rate
         self.lna_gain = lna_gain
         self.vga_gain = vga_gain
@@ -32,6 +35,26 @@ class HackRFADSBThread(QThread):
         self.running = True
         self.decoder = ADSBDecoder(ref_lat=ref_lat, ref_lon=ref_lon)
         self.process = None
+
+        # Load native C Mode-S pulse slicer DLL
+        self.slicer_dll = None
+        try:
+            dll_path = os.path.join(os.path.dirname(__file__), "adsb_slicer.dll")
+            if os.path.exists(dll_path):
+                self.slicer_dll = ctypes.CDLL(dll_path)
+        except Exception:
+            self.slicer_dll = None
+
+        self._c_callback = CALLBACK_TYPE(self._on_c_frame_sliced)
+
+    def _on_c_frame_sliced(self, hex_frame_bytes, rssi_val):
+        try:
+            hex_str = hex_frame_bytes.decode('ascii', errors='ignore')
+            ac = self.decoder.decode_hex_frame(hex_str, rssi=-40.0)
+            if ac:
+                self.aircraft_updated_signal.emit(ac.to_dict())
+        except Exception:
+            pass
 
     def run(self):
         if self.mode == "live_opensky":
@@ -43,7 +66,6 @@ class HackRFADSBThread(QThread):
         elif self.mode == "simulation":
             self._run_simulation_loop()
         else: # "auto"
-            # Try live OpenSky first for immediate real traffic, then fallback
             try:
                 self._run_opensky_loop()
             except Exception:
@@ -51,12 +73,11 @@ class HackRFADSBThread(QThread):
 
     def _run_opensky_loop(self):
         """Streams real-time live commercial and military aircraft via OpenSky API."""
-        fps_timer = time.time()
         while self.running:
             try:
                 lat = self.ref_lat
                 lon = self.ref_lon
-                delta = 1.2 # ~130 km radius
+                delta = 1.2
                 url = f"https://opensky-network.org/api/states/all?lamin={lat-delta}&lomin={lon-delta}&lamax={lat+delta}&lomax={lon+delta}"
                 
                 req = urllib.request.Request(url, headers={"User-Agent": "AeroTrack-CEMA/1.0"})
@@ -108,10 +129,9 @@ class HackRFADSBThread(QThread):
                         "hardware": "LIVE OPENSKY FEED (100% REAL-TIME AIRCRAFT)"
                     })
 
-            except Exception as e:
+            except Exception:
                 time.sleep(2.0)
 
-            # OpenSky rate limit: query every 5-6 seconds for anonymous users
             for _ in range(50):
                 if not self.running:
                     break
@@ -149,7 +169,13 @@ class HackRFADSBThread(QThread):
                 time.sleep(2.0)
 
     def _run_hardware_loop(self):
-        """Runs hackrf_transfer stream at 1090 MHz."""
+        """Runs hackrf_transfer stream at 1090 MHz and feeds adsb_slicer.dll."""
+        # Ensure any stale hackrf_transfer process is killed
+        try:
+            subprocess.run(["taskkill", "/F", "/IM", "hackrf_transfer.exe"], capture_ok=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except Exception:
+            pass
+
         cmd = [
             "hackrf_transfer",
             "-r", "-",
@@ -164,15 +190,44 @@ class HackRFADSBThread(QThread):
             self.stats_updated_signal.emit({
                 "total_ac": 0,
                 "msg_rate": 0,
-                "hardware": "HACKRF ONE 1090 MHz SDR [ACTIVE]"
+                "hardware": "HACKRF ONE 1090 MHz SDR [LISTENING ON RF]"
             })
+            
+            buf = bytearray()
+            chunk_size = 32768
+            total_msgs = 0
+            t_rate = time.time()
+
             while self.running and self.process.poll() is None:
                 chunk = self.process.stdout.read(16384)
                 if not chunk:
                     break
-                time.sleep(0.005)
-        except Exception:
-            self._run_opensky_loop()
+                buf.extend(chunk)
+                if len(buf) >= chunk_size:
+                    raw_iq = bytes(buf[:chunk_size])
+                    del buf[:chunk_size]
+
+                    num_samples = len(raw_iq) // 2
+                    if self.slicer_dll:
+                        n_found = self.slicer_dll.process_iq_samples(raw_iq, num_samples, self._c_callback)
+                        total_msgs += n_found
+
+                if time.time() - t_rate >= 1.0:
+                    self.stats_updated_signal.emit({
+                        "total_ac": len(self.decoder.aircraft_db),
+                        "msg_rate": total_msgs,
+                        "hardware": f"HACKRF ONE 1090 MHz SDR [{total_msgs} msgs/s]"
+                    })
+                    total_msgs = 0
+                    t_rate = time.time()
+
+        except Exception as e:
+            self.stats_updated_signal.emit({
+                "total_ac": 0,
+                "msg_rate": 0,
+                "hardware": f"HACKRF SDR ERROR: {e}"
+            })
+            time.sleep(2.0)
 
     def _run_simulation_loop(self):
         """Generates realistic synthetic airspace traffic."""
