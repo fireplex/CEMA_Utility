@@ -776,7 +776,7 @@ class VideoDisplayWidget(QWidget):
             font.setBold(True)
             painter.setFont(font)
             painter.setPen(QPen(QColor("#64748b")))
-            painter.drawText(QRectF(0, 0, w, h), Qt.AlignmentFlag.AlignCenter, "NO ACTIVE VIDEO STREAM\n[ Select Channel & Click 'START VIDEO STREAM' ]")
+            painter.drawText(QRectF(0, 0, w, h), Qt.AlignmentFlag.AlignCenter, "NO ACTIVE VIDEO STREAM\n[ Select Channel && Click 'START VIDEO STREAM' ]")
 
         # Tactical OSD Overlay
         if self.show_osd:
@@ -1737,7 +1737,7 @@ def calculate_cep_triangulation(bearing_records):
 class TacticalSettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("CEMA Hardware & System Configuration")
+        self.setWindowTitle("CEMA Hardware && System Configuration")
         self.resize(650, 480)
         self.parent_app = parent
         self.settings = load_app_settings()
@@ -1767,7 +1767,7 @@ class TacticalSettingsDialog(QDialog):
         # --- TAB 1: KRAKEN SDR ---
         kraken_tab = QWidget()
         k_layout = QVBoxLayout(kraken_tab)
-        k_grp = QGroupBox("KrakenSDR Server & Hardware Settings")
+        k_grp = QGroupBox("KrakenSDR Server && Hardware Settings")
         k_grid = QGridLayout(k_grp)
 
         self.k_host = QLineEdit(str(self.settings.get("kraken_host", "127.0.0.1")))
@@ -1815,7 +1815,7 @@ class TacticalSettingsDialog(QDialog):
 
         k_layout.addWidget(k_grp)
 
-        k_svc_box = QGroupBox("Daemon & Hardware Service Controls")
+        k_svc_box = QGroupBox("Daemon && Hardware Service Controls")
         k_svc_layout = QHBoxLayout(k_svc_box)
         
         k_start_btn = QPushButton("Start")
@@ -1827,7 +1827,7 @@ class TacticalSettingsDialog(QDialog):
         k_restart_btn = QPushButton("Restart")
         k_restart_btn.clicked.connect(lambda: self.parent_app.restart_kraken_service() if self.parent_app else None)
         
-        k_repair_btn = QPushButton("Auto-Repair & Fix")
+        k_repair_btn = QPushButton("Auto-Repair && Fix")
         k_repair_btn.setStyleSheet("background-color: #0284c7; color: white; font-weight: bold; border: 1px solid #38bdf8;")
         k_repair_btn.clicked.connect(lambda: self.parent_app.repair_kraken_sdr() if self.parent_app else None)
         
@@ -1899,7 +1899,7 @@ class TacticalSettingsDialog(QDialog):
         # --- TAB 3: TACTICAL MAP ---
         map_tab = QWidget()
         m_layout = QVBoxLayout(map_tab)
-        m_grp = QGroupBox("Tactical Map, Geolocation & Bearing History")
+        m_grp = QGroupBox("Tactical Map, Geolocation && Bearing History")
         m_grid = QGridLayout(m_grp)
 
         self.m_provider = QComboBox()
@@ -1942,12 +1942,12 @@ class TacticalSettingsDialog(QDialog):
 
         m_layout.addWidget(m_grp)
         m_layout.addStretch()
-        tabs.addTab(map_tab, "Map & Tracking")
+        tabs.addTab(map_tab, "Map && Tracking")
 
         # --- TAB 4: UI & GENERAL ---
         ui_tab = QWidget()
         u_layout = QVBoxLayout(ui_tab)
-        u_grp = QGroupBox("User Interface & Telemetry Preferences")
+        u_grp = QGroupBox("User Interface && Telemetry Preferences")
         u_grid = QGridLayout(u_grp)
 
         self.u_theme = QComboBox()
@@ -1974,7 +1974,7 @@ class TacticalSettingsDialog(QDialog):
 
         u_layout.addWidget(u_grp)
         u_layout.addStretch()
-        tabs.addTab(ui_tab, "UI & General")
+        tabs.addTab(ui_tab, "UI && General")
 
         layout.addWidget(tabs)
 
@@ -1986,7 +1986,7 @@ class TacticalSettingsDialog(QDialog):
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
 
-        save_btn = QPushButton("Save & Apply")
+        save_btn = QPushButton("Save && Apply")
         save_btn.setStyleSheet("background-color: #0284c7; color: white; font-weight: bold; border: 1px solid #38bdf8;")
         save_btn.clicked.connect(self.save_and_apply)
 
@@ -2313,7 +2313,7 @@ class CEMAApp(QMainWindow):
         main_layout = QVBoxLayout(central_widget)
 
         # Control Panel (Responsive 2-Row Grid)
-        control_group = QGroupBox("SDR & Hardware Parameters")
+        control_group = QGroupBox("SDR && Hardware Parameters")
         control_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         control_layout = QGridLayout(control_group)
         control_layout.setContentsMargins(6, 4, 6, 4)
@@ -2435,7 +2435,7 @@ class CEMAApp(QMainWindow):
         self.settings_btn = QPushButton("SETTINGS")
         self.settings_btn.setStyleSheet("background-color: #1e293b; color: #38bdf8; border: 1px solid #0284c7; font-weight: bold; border-radius: 4px; padding: 5px 10px;")
         self.settings_btn.clicked.connect(self.open_settings_dialog)
-        self.settings_btn.setToolTip("Open Centralized Hardware & System Configuration (Shortcut: F1).")
+        self.settings_btn.setToolTip("Open Centralized Hardware && System Configuration (Shortcut: F1).")
 
         # Row 0: SDR Tuning & Reception Controls
         r0 = QHBoxLayout()
@@ -2655,7 +2655,7 @@ class CEMAApp(QMainWindow):
         demod_layout.addWidget(self.force_demod_btn)
         intel_layout.addLayout(demod_layout)
         
-        intel_layout.addWidget(QLabel("Network Topology (Call & Response):"))
+        intel_layout.addWidget(QLabel("Network Topology (Call && Response):"))
         self.topology_ui = QTreeWidget()
         self.topology_ui.setHeaderLabels(["Emitter Node", "Reply Count"])
         self.topology_ui.setToolTip("Network Topology: Analyzes transmission timings. If a radio consistently replies within 5 seconds of another finishing, the software draws a command link between them.")
@@ -2689,7 +2689,7 @@ class CEMAApp(QMainWindow):
         tab_geo = QWidget()
         geo_layout = QVBoxLayout(tab_geo)
         geo_layout.addWidget(self.create_geolocation_ui())
-        self.sidebar_tabs.addTab(tab_geo, "Geolocation & Map")
+        self.sidebar_tabs.addTab(tab_geo, "Geolocation && Map")
 
         # Tab 5: Drone Telemetry (Heltec V3)
         tab_drone = QWidget()
@@ -2719,7 +2719,7 @@ class CEMAApp(QMainWindow):
         tab_copilot = QWidget()
         copilot_layout = QVBoxLayout(tab_copilot)
         copilot_layout.addWidget(self.create_tactical_copilot_ui())
-        self.sidebar_tabs.addTab(make_tab_scroll(tab_copilot), "AI Copilot & INTSUM")
+        self.sidebar_tabs.addTab(make_tab_scroll(tab_copilot), "AI Copilot && INTSUM")
         
         # State
         self.kraken_thread = None
@@ -3127,7 +3127,7 @@ class CEMAApp(QMainWindow):
         geo_layout.addLayout(readout_layout)
 
         # EMBM & Tactical Terrain Shadowing Control Panel
-        embm_group = QGroupBox("EMBM & Tactical Terrain Shadowing (4/3 Earth & 1st Fresnel Engine)")
+        embm_group = QGroupBox("EMBM && Tactical Terrain Shadowing (4/3 Earth && 1st Fresnel Engine)")
         embm_layout = QGridLayout(embm_group)
         embm_layout.setContentsMargins(6, 6, 6, 6)
         embm_layout.setSpacing(6)
@@ -3160,7 +3160,7 @@ class CEMAApp(QMainWindow):
         self.embm_clear_btn.setStyleSheet("background-color: #1e293b; color: #f87171; font-weight: bold; padding: 6px; border: 1px solid #f87171; border-radius: 4px;")
         self.embm_clear_btn.clicked.connect(self.clear_viewshed_overlay)
 
-        self.embm_status_lbl = QLabel("[ EMBM: STANDBY | 4/3 EARTH & FRESNEL ENGINE READY ]")
+        self.embm_status_lbl = QLabel("[ EMBM: STANDBY | 4/3 EARTH && FRESNEL ENGINE READY ]")
         self.embm_status_lbl.setStyleSheet("background-color: #060a14; color: #38bdf8; font-family: monospace; font-size: 11px; font-weight: bold; padding: 5px; border: 1px solid #1e293b; border-radius: 4px;")
 
         embm_layout.addWidget(QLabel("Mast Height:"), 0, 0)
@@ -3212,7 +3212,7 @@ class CEMAApp(QMainWindow):
         cockpit_layout.setSpacing(6)
 
         # Feature 0: ExpressLRS Packet Rate & Dynamic Demodulation Control
-        rate_group = QGroupBox("ExpressLRS Sniffer Packet Rate & Dynamic Demodulation")
+        rate_group = QGroupBox("ExpressLRS Sniffer Packet Rate && Dynamic Demodulation")
         rate_group.setStyleSheet("QGroupBox { color: #38bdf8; font-weight: bold; border: 1px solid #1e293b; border-radius: 6px; margin-top: 6px; padding-top: 10px; background-color: #0b0f19; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }")
         rate_layout = QGridLayout(rate_group)
         rate_layout.setContentsMargins(8, 8, 8, 8)
@@ -3240,7 +3240,7 @@ class CEMAApp(QMainWindow):
         cockpit_layout.addWidget(rate_group)
 
         # Feature 0.5: Multi-Pilot Airspace Discovery & Target Selection
-        pilot_group = QGroupBox("Pilot Target Selector & Airspace Surveillance")
+        pilot_group = QGroupBox("Pilot Target Selector && Airspace Surveillance")
         pilot_group.setStyleSheet("QGroupBox { color: #38bdf8; font-weight: bold; border: 1px solid #1e293b; border-radius: 6px; margin-top: 6px; padding-top: 10px; background-color: #0b0f19; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }")
         pilot_layout = QGridLayout(pilot_group)
         pilot_layout.setContentsMargins(8, 8, 8, 8)
@@ -3283,8 +3283,8 @@ class CEMAApp(QMainWindow):
         hud_layout.addWidget(self.drone_sticks_lbl)
         cockpit_layout.addWidget(hud_box)
 
-        # Feature 2: Tactical Flight Dynamics & Maneuver Classifier
-        classifier_box = QGroupBox("Tactical Flight Dynamics & Maneuver Classifier")
+        # Feature 2: Tactical Flight Dynamics && Maneuver Classifier
+        classifier_box = QGroupBox("Tactical Flight Dynamics && Maneuver Classifier")
         classifier_box.setStyleSheet("QGroupBox { color: #38bdf8; font-weight: bold; border: 1px solid #1e293b; border-radius: 6px; margin-top: 6px; padding-top: 10px; background-color: #0b0f19; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }")
         classifier_layout = QVBoxLayout(classifier_box)
         classifier_layout.setContentsMargins(6, 6, 6, 6)
@@ -3300,8 +3300,8 @@ class CEMAApp(QMainWindow):
         classifier_layout.addWidget(self.maneuver_detail_lbl)
         cockpit_layout.addWidget(classifier_box)
 
-        # Feature 4: Dual-Link RF Proximity & Link Margin Gauge
-        rf_box = QGroupBox("Dual-Link RF Proximity & Link Margin")
+        # Feature 4: Dual-Link RF Proximity && Link Margin Gauge
+        rf_box = QGroupBox("Dual-Link RF Proximity && Link Margin")
         rf_box.setStyleSheet("QGroupBox { color: #38bdf8; font-weight: bold; border: 1px solid #1e293b; border-radius: 6px; margin-top: 6px; padding-top: 10px; background-color: #0b0f19; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }")
         rf_layout = QGridLayout(rf_box)
         rf_layout.setContentsMargins(8, 8, 8, 8)
@@ -3515,7 +3515,7 @@ class CEMAApp(QMainWindow):
         video_cont_layout.addWidget(source_group)
 
         # Demodulator Tuning & Display Controls (SDRangel Style)
-        tuning_group = QGroupBox("Demodulator, H-Sync & V-Sync Controls")
+        tuning_group = QGroupBox("Demodulator, H-Sync && V-Sync Controls")
         tuning_layout = QGridLayout(tuning_group)
         tuning_layout.setContentsMargins(6, 6, 6, 6)
 
@@ -3834,8 +3834,8 @@ class CEMAApp(QMainWindow):
         self.doa_compass = DoACompassWidget()
         compass_cont_layout.addWidget(self.doa_compass)
 
-        # KrakenSDR Server Daemon & Health Control
-        service_group = QGroupBox("KrakenSDR Server Daemon & Health Control")
+        # KrakenSDR Server Daemon && Health Control
+        service_group = QGroupBox("KrakenSDR Server Daemon && Health Control")
         service_layout = QGridLayout(service_group)
         service_layout.setContentsMargins(6, 6, 6, 6)
 
@@ -3858,7 +3858,7 @@ class CEMAApp(QMainWindow):
         self.kraken_check_btn.setStyleSheet("background-color: #1e293b; color: #38bdf8; font-weight: bold; border: 1px solid #0284c7; padding: 5px;")
         self.kraken_check_btn.clicked.connect(self.check_kraken_health)
 
-        self.kraken_repair_btn = QPushButton("AUTO-REPAIR & FIX")
+        self.kraken_repair_btn = QPushButton("AUTO-REPAIR && FIX")
         self.kraken_repair_btn.setStyleSheet("background-color: #0284c7; color: white; font-weight: bold; border: 1px solid #38bdf8; padding: 5px;")
         self.kraken_repair_btn.clicked.connect(self.repair_kraken_sdr)
 
@@ -3909,8 +3909,8 @@ class CEMAApp(QMainWindow):
 
         compass_cont_layout.addWidget(conn_group)
 
-        # Antenna Array & Frequency Tuning
-        array_group = QGroupBox("Antenna Array & Frequency Tuning")
+        # Antenna Array && Frequency Tuning
+        array_group = QGroupBox("Antenna Array && Frequency Tuning")
         array_layout = QGridLayout(array_group)
         array_layout.setContentsMargins(6, 6, 6, 6)
 
@@ -3984,7 +3984,7 @@ class CEMAApp(QMainWindow):
         array_layout.addLayout(presets_layout, 5, 0, 1, 2)
 
         # Apply Retune Button
-        self.apply_kraken_btn = QPushButton("RETUNE & APPLY TO HARDWARE")
+        self.apply_kraken_btn = QPushButton("RETUNE && APPLY TO HARDWARE")
         self.apply_kraken_btn.setStyleSheet("background-color: #1e293b; color: #f59e0b; font-weight: bold; border: 1px solid #f59e0b; padding: 5px;")
         self.apply_kraken_btn.clicked.connect(self.push_kraken_hardware_settings)
         array_layout.addWidget(self.apply_kraken_btn, 6, 0, 1, 2)
@@ -4013,7 +4013,7 @@ class CEMAApp(QMainWindow):
         self.cast_map_btn.clicked.connect(self.cast_bearing_to_map)
         actions_layout.addWidget(self.cast_map_btn, 1, 0)
 
-        self.triangulate_btn = QPushButton("RECORD BEARING & FIX TARGET")
+        self.triangulate_btn = QPushButton("RECORD BEARING && FIX TARGET")
         self.triangulate_btn.setStyleSheet("background-color: #0284c7; color: white; font-weight: bold; border: 1px solid #38bdf8; padding: 5px;")
         self.triangulate_btn.clicked.connect(self.fix_triangulated_target)
         actions_layout.addWidget(self.triangulate_btn, 1, 1)
@@ -4054,14 +4054,14 @@ class CEMAApp(QMainWindow):
         self.hk_status_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         status_layout.addWidget(self.hk_status_badge)
 
-        self.hk_cycle_breadcrumbs = QLabel("CYCLE: [ 1. HUNT ] ➔ [ 2. DETECT ] ➔ [ 3. STARE & FP ] ➔ [ 4. DoA VECTOR ] ➔ [ 5. THREAT EVAL ] ➔ [ 6. RESUME ]")
+        self.hk_cycle_breadcrumbs = QLabel("CYCLE: [ 1. HUNT ] ➔ [ 2. DETECT ] ➔ [ 3. STARE && FP ] ➔ [ 4. DoA VECTOR ] ➔ [ 5. THREAT EVAL ] ➔ [ 6. RESUME ]")
         self.hk_cycle_breadcrumbs.setStyleSheet("color: #64748b; font-family: monospace; font-size: 10px; font-weight: bold;")
         self.hk_cycle_breadcrumbs.setAlignment(Qt.AlignmentFlag.AlignCenter)
         status_layout.addWidget(self.hk_cycle_breadcrumbs)
         hk_cont_layout.addWidget(status_group)
 
         # 2. Mission Control & Configuration
-        ctrl_group = QGroupBox("Autonomous Mission Rules & Parameters")
+        ctrl_group = QGroupBox("Autonomous Mission Rules && Parameters")
         ctrl_layout = QGridLayout(ctrl_group)
         ctrl_layout.setContentsMargins(6, 6, 6, 6)
         ctrl_layout.setSpacing(4)
@@ -4070,8 +4070,8 @@ class CEMAApp(QMainWindow):
         self.hk_mode_combo = QComboBox()
         self.hk_mode_combo.addItems([
             "Full Autonomous (Hunt ➔ Stare ➔ DoA ➔ Map ➔ Resume)",
-            "Semi-Autonomous (Detect & Queue Intercept Candidates)",
-            "Target Intercept & Lock (Sustain Track on Target)"
+            "Semi-Autonomous (Detect && Queue Intercept Candidates)",
+            "Target Intercept && Lock (Sustain Track on Target)"
         ])
         ctrl_layout.addWidget(self.hk_mode_combo, 0, 1, 1, 3)
 
@@ -4110,12 +4110,12 @@ class CEMAApp(QMainWindow):
         self.hk_auto_kraken_cb.setToolTip("Automatically retune KrakenSDR and record Line of Bearing during stare intercept.")
         ctrl_layout.addWidget(self.hk_auto_kraken_cb, 3, 0, 1, 2)
 
-        self.hk_auto_map_cb = QCheckBox("Auto-Plot Target & CEP Fix to Map")
+        self.hk_auto_map_cb = QCheckBox("Auto-Plot Target && CEP Fix to Map")
         self.hk_auto_map_cb.setChecked(True)
         self.hk_auto_map_cb.setToolTip("Automatically plot intercept coordinates and CEP triangulation fix on Tactical Map.")
         ctrl_layout.addWidget(self.hk_auto_map_cb, 3, 2, 1, 2)
 
-        self.hk_audio_alert_cb = QCheckBox("Audible Voice & Tactical Alert Cues")
+        self.hk_audio_alert_cb = QCheckBox("Audible Voice && Tactical Alert Cues")
         self.hk_audio_alert_cb.setChecked(True)
         self.hk_audio_alert_cb.setToolTip("Play voice synthesizer alert announcements when high-priority targets are intercepted.")
         ctrl_layout.addWidget(self.hk_audio_alert_cb, 4, 0, 1, 2)
@@ -4134,7 +4134,7 @@ class CEMAApp(QMainWindow):
         hk_cont_layout.addWidget(self.toggle_hk_btn)
 
         # 4. Live Threat Matrix & Target Priority Queue Table
-        queue_group = QGroupBox("Target Priority Queue & Active Intercepts")
+        queue_group = QGroupBox("Target Priority Queue && Active Intercepts")
         queue_layout = QVBoxLayout(queue_group)
         queue_layout.setContentsMargins(4, 4, 4, 4)
         queue_layout.setSpacing(4)
@@ -4172,7 +4172,7 @@ class CEMAApp(QMainWindow):
         hk_cont_layout.addWidget(queue_group)
 
         # 5. Live Intercept Telemetry Card
-        telemetry_group = QGroupBox("Last Intercept Metrics & DoA Telemetry")
+        telemetry_group = QGroupBox("Last Intercept Metrics && DoA Telemetry")
         telemetry_layout = QGridLayout(telemetry_group)
         telemetry_layout.setContentsMargins(6, 6, 6, 6)
         telemetry_layout.setSpacing(4)
@@ -4234,7 +4234,7 @@ class CEMAApp(QMainWindow):
 
         self.hk_status_badge.setText(f"[ HUNTER-KILLER: HUNTING SWEEP {self.hk_resume_sweep_params[0]:.0f} - {self.hk_resume_sweep_params[1]:.0f} MHz ]")
         self.hk_status_badge.setStyleSheet("background-color: #060a14; color: #10b981; font-family: monospace; font-size: 12px; font-weight: bold; padding: 6px; border: 1px solid #10b981; border-radius: 4px;")
-        self.hk_cycle_breadcrumbs.setText("CYCLE: ▶ [ 1. HUNT ] ➔ [ 2. DETECT ] ➔ [ 3. STARE & FP ] ➔ [ 4. DoA VECTOR ] ➔ [ 5. THREAT EVAL ] ➔ [ 6. RESUME ]")
+        self.hk_cycle_breadcrumbs.setText("CYCLE: ▶ [ 1. HUNT ] ➔ [ 2. DETECT ] ➔ [ 3. STARE && FP ] ➔ [ 4. DoA VECTOR ] ➔ [ 5. THREAT EVAL ] ➔ [ 6. RESUME ]")
         self.hk_cycle_breadcrumbs.setStyleSheet("color: #10b981; font-family: monospace; font-size: 10px; font-weight: bold;")
         
         if "SWEEP" not in self.mode_selector.currentText():
@@ -4249,7 +4249,7 @@ class CEMAApp(QMainWindow):
         self.toggle_hk_btn.setStyleSheet("background-color: #10b981; color: white; font-weight: bold; padding: 10px; font-size: 13px; border-radius: 4px;")
         self.hk_status_badge.setText("[ HUNTER-KILLER: STANDBY / INACTIVE ]")
         self.hk_status_badge.setStyleSheet("background-color: #060a14; color: #94a3b8; font-family: monospace; font-size: 12px; font-weight: bold; padding: 6px; border: 1px solid #1e293b; border-radius: 4px;")
-        self.hk_cycle_breadcrumbs.setText("CYCLE: [ 1. HUNT ] ➔ [ 2. DETECT ] ➔ [ 3. STARE & FP ] ➔ [ 4. DoA VECTOR ] ➔ [ 5. THREAT EVAL ] ➔ [ 6. RESUME ]")
+        self.hk_cycle_breadcrumbs.setText("CYCLE: [ 1. HUNT ] ➔ [ 2. DETECT ] ➔ [ 3. STARE && FP ] ➔ [ 4. DoA VECTOR ] ➔ [ 5. THREAT EVAL ] ➔ [ 6. RESUME ]")
         self.hk_cycle_breadcrumbs.setStyleSheet("color: #64748b; font-family: monospace; font-size: 10px; font-weight: bold;")
         self.log_event("AUTONOMOUS HUNTER-KILLER: Disengaged.")
 
@@ -4566,7 +4566,7 @@ class CEMAApp(QMainWindow):
         layout.addWidget(actions_group)
 
         # 3. Monospace Intelligence Report / Output Viewer
-        output_group = QGroupBox("Tactical Report & Intelligence Output")
+        output_group = QGroupBox("Tactical Report && Intelligence Output")
         output_layout = QVBoxLayout(output_group)
         output_layout.setContentsMargins(6, 6, 6, 6)
         output_layout.setSpacing(4)
@@ -4795,7 +4795,7 @@ class CEMAApp(QMainWindow):
         QTimer.singleShot(4000, self.check_kraken_health)
 
     def stop_kraken_service(self):
-        self.log_event("KRAKENSDR SERVICE: Stopping DAQ & GUI processes...")
+        self.log_event("KRAKENSDR SERVICE: Stopping DAQ && GUI processes...")
         if hasattr(self, 'kraken_health_badge'):
             self.kraken_health_badge.setText("[ SERVER: STOPPING PROCESSES... ]")
             self.kraken_health_badge.setStyleSheet("background-color: #060a14; color: #f87171; font-family: monospace; font-size: 11px; font-weight: bold; padding: 5px; border: 1px solid #dc2626; border-radius: 4px;")
@@ -4814,7 +4814,7 @@ class CEMAApp(QMainWindow):
         QTimer.singleShot(2000, self.check_kraken_health)
 
     def restart_kraken_service(self):
-        self.log_event("KRAKENSDR SERVICE: Restarting DAQ & GUI processes...")
+        self.log_event("KRAKENSDR SERVICE: Restarting DAQ && GUI processes...")
         self.stop_kraken_service()
         QTimer.singleShot(2500, self.start_kraken_service)
 
@@ -4937,7 +4937,7 @@ class CEMAApp(QMainWindow):
     def repair_kraken_sdr(self):
         self.log_event("KRAKENSDR AUTO-REPAIR: Initiating full diagnosis and self-healing sequence...")
         if hasattr(self, 'kraken_health_badge'):
-            self.kraken_health_badge.setText("[ AUTO-REPAIR: DIAGNOSING & HEALING... ]")
+            self.kraken_health_badge.setText("[ AUTO-REPAIR: DIAGNOSING && HEALING... ]")
             self.kraken_health_badge.setStyleSheet("background-color: #060a14; color: #38bdf8; font-family: monospace; font-size: 11px; font-weight: bold; padding: 5px; border: 1px solid #0284c7; border-radius: 4px;")
 
         def _heal_worker():
@@ -4957,7 +4957,7 @@ class CEMAApp(QMainWindow):
                     capture_output=True,
                     timeout=5
                 )
-                log_steps.append("2. Cleared stale shared memory /dev/shm/* & unloaded conflicting DVB drivers.")
+                log_steps.append("2. Cleared stale shared memory /dev/shm/* && unloaded conflicting DVB drivers.")
             except Exception as e:
                 log_steps.append(f"2. Shared memory cleanup error: {e}")
 
@@ -5009,7 +5009,7 @@ class CEMAApp(QMainWindow):
                 try:
                     with open(wsl_settings, 'w', encoding='utf-8') as f:
                         json.dump(cfg, f, indent=2)
-                    log_steps.append("5. Repaired settings.json (VFO & Array geometry sanitized).")
+                    log_steps.append("5. Repaired settings.json (VFO && Array geometry sanitized).")
                 except Exception as e:
                     log_steps.append(f"5. Settings write error: {e}")
 
@@ -5023,7 +5023,7 @@ class CEMAApp(QMainWindow):
                     stderr=subprocess.DEVNULL,
                     creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
                 )
-                log_steps.append("6. KrakenSDR DAQ & Web GUI restarted cleanly.")
+                log_steps.append("6. KrakenSDR DAQ && Web GUI restarted cleanly.")
             except Exception as e:
                 log_steps.append(f"6. Start error: {e}")
 
@@ -5381,7 +5381,7 @@ class CEMAApp(QMainWindow):
         if hasattr(self, 'geo_map_view'):
             self.geo_map_view.page().runJavaScript("if (typeof clearViewshedOverlay === 'function') { clearViewshedOverlay(); }")
         if hasattr(self, 'embm_status_lbl'):
-            self.embm_status_lbl.setText("[ EMBM: STANDBY | 4/3 EARTH & FRESNEL ENGINE READY ]")
+            self.embm_status_lbl.setText("[ EMBM: STANDBY | 4/3 EARTH && FRESNEL ENGINE READY ]")
             self.embm_status_lbl.setStyleSheet("background-color: #060a14; color: #38bdf8; font-family: monospace; font-size: 11px; font-weight: bold; padding: 5px; border: 1px solid #1e293b; border-radius: 4px;")
         self.log_event("EMBM TERRAIN: Cleared terrain viewshed heatmap layer.")
 
@@ -5392,7 +5392,7 @@ class CEMAApp(QMainWindow):
             self.popout_windows["map"].raise_()
             self.popout_windows["map"].activateWindow()
             return
-        win = PopOutWindow("Tactical Geolocation & Map", self.geo_map_container, self.geo_parent_layout, 3, self)
+        win = PopOutWindow("Tactical Geolocation && Map", self.geo_map_container, self.geo_parent_layout, 3, self)
         self.popout_windows["map"] = win
         win.closed.connect(lambda: self.popout_windows.pop("map", None))
         win.show()
@@ -5428,7 +5428,7 @@ class CEMAApp(QMainWindow):
             self.popout_windows["drone"].raise_()
             self.popout_windows["drone"].activateWindow()
             return
-        win = PopOutWindow("Drone Telemetry & Pilot Surveillance", self.drone_cockpit_container, self.drone_parent_layout, 4, self)
+        win = PopOutWindow("Drone Telemetry && Pilot Surveillance", self.drone_cockpit_container, self.drone_parent_layout, 4, self)
         self.popout_windows["drone"] = win
         win.closed.connect(lambda: self.popout_windows.pop("drone", None))
         win.show()
@@ -5596,7 +5596,7 @@ class CEMAApp(QMainWindow):
 
     def apply_runtime_settings(self, settings):
         self.settings = settings
-        self.log_event("TACTICAL SETTINGS: Hardware & System configuration updated.")
+        self.log_event("TACTICAL SETTINGS: Hardware && System configuration updated.")
 
         # Update Heltec Port if changed
         if hasattr(self, 'heltec_port_combo'):
@@ -6749,7 +6749,7 @@ class CEMAApp(QMainWindow):
                                 self.hk_status_badge.setText(f"[ KILLER ENGAGED: INTERCEPTING {c_freq:.3f} MHz{matched_vtx_str} (STARE DWELL) ]")
                                 self.hk_status_badge.setStyleSheet("background-color: #060a14; color: #f59e0b; font-family: monospace; font-size: 12px; font-weight: bold; padding: 6px; border: 1px solid #f59e0b; border-radius: 4px;")
                             if hasattr(self, 'hk_cycle_breadcrumbs'):
-                                self.hk_cycle_breadcrumbs.setText("CYCLE: [ 1. HUNT ] ➔ ▶ [ 2. DETECT ] ➔ [ 3. STARE & FP ] ➔ [ 4. DoA VECTOR ] ➔ [ 5. THREAT EVAL ] ➔ [ 6. RESUME ]")
+                                self.hk_cycle_breadcrumbs.setText("CYCLE: [ 1. HUNT ] ➔ ▶ [ 2. DETECT ] ➔ [ 3. STARE && FP ] ➔ [ 4. DoA VECTOR ] ➔ [ 5. THREAT EVAL ] ➔ [ 6. RESUME ]")
                                 self.hk_cycle_breadcrumbs.setStyleSheet("color: #f59e0b; font-family: monospace; font-size: 10px; font-weight: bold;")
                             
                             self.log_event(f"AUTONOMOUS HUNTER-KILLER: Verified continuous carrier at {c_freq:.3f} MHz{matched_vtx_str} (SNR +{c_snr:.1f} dB). Snapping to Stare Mode.")
@@ -6863,7 +6863,7 @@ class CEMAApp(QMainWindow):
                                 self.hk_status_badge.setText(f"[ HUNTER-KILLER: HUNTING SWEEP {s_min:.0f} - {s_max:.0f} MHz ]")
                                 self.hk_status_badge.setStyleSheet("background-color: #060a14; color: #10b981; font-family: monospace; font-size: 12px; font-weight: bold; padding: 6px; border: 1px solid #10b981; border-radius: 4px;")
                             if hasattr(self, 'hk_cycle_breadcrumbs'):
-                                self.hk_cycle_breadcrumbs.setText("CYCLE: ▶ [ 1. HUNT ] ➔ [ 2. DETECT ] ➔ [ 3. STARE & FP ] ➔ [ 4. DoA VECTOR ] ➔ [ 5. THREAT EVAL ] ➔ [ 6. RESUME ]")
+                                self.hk_cycle_breadcrumbs.setText("CYCLE: ▶ [ 1. HUNT ] ➔ [ 2. DETECT ] ➔ [ 3. STARE && FP ] ➔ [ 4. DoA VECTOR ] ➔ [ 5. THREAT EVAL ] ➔ [ 6. RESUME ]")
                                 self.hk_cycle_breadcrumbs.setStyleSheet("color: #10b981; font-family: monospace; font-size: 10px; font-weight: bold;")
                             
                             self.sweep_start_input.setValue(s_min)
