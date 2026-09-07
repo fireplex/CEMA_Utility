@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#060a14">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="manifest" href="/manifest.json">
+  <link rel="icon" type="image/svg+xml" href="/static/icon.svg">
+  <link rel="stylesheet" href="/static/style.css">
+  <title>CEMA Tactical Suite // RPi-5</title>
+</head>
+<body>
+
+  <!-- Top Tactical Header -->
+  <header class="header-bar">
+    <div class="brand-section">
+      <img src="/static/icon.svg" alt="CEMA" class="brand-logo">
+      <div>
+        <div class="brand-title">CEMA TACTICAL SUITE</div>
+        <div class="brand-sub">RPI-5 AIRSPACE SENTRY // 915MHz</div>
+      </div>
+    </div>
+
+    <div class="status-badges">
+      <div id="wsBadge" class="badge"><span class="dot"></span> <span id="wsText">SYS: INIT</span></div>
+      <div id="loraBadge" class="badge"><span class="dot"></span> <span id="loraText">LORA: SEARCHING</span></div>
+      <div id="sdrBadge" class="badge"><span class="dot"></span> <span id="sdrText">SDR: SEARCHING</span></div>
+      <div id="krakenBadge" class="badge"><span class="dot"></span> <span id="krakenText">DF: STANDBY</span></div>
+      <div id="vtxBadge" class="badge"><span class="dot"></span> <span id="vtxText">VTX: STANDBY</span></div>
+      <div id="rateBadge" class="badge">RATE: <span id="rateText">AUTO</span></div>
+      <div id="armBadge" class="badge">ARM: <span id="armText">DISARMED</span></div>
+      <div id="pilotBadge" class="badge">TARGET: <span id="pilotText">AUTO</span></div>
+      <div id="sysBadge" class="badge">PI: <span id="sysText">--°C</span></div>
+    </div>
+
+    <div class="header-actions">
+      <button id="btnVoice" class="btn-header" style="color: var(--text-muted);">🔇 VOICE: OFF</button>
+      <button id="btnInstall" class="btn-header btn-install" style="display: none;">📲 INSTALL APP</button>
+    </div>
+  </header>
+
+  <!-- Navigation Bar -->
+  <nav class="nav-tabs">
+    <button class="tab-btn active" data-tab="tab-cockpit">01 // COCKPIT & TELEMETRY</button>
+    <button class="tab-btn" data-tab="tab-elrs">02 // ELRS CONTROLS & AIRSPACE</button>
+    <button class="tab-btn" data-tab="tab-sdr">03 // HACKRF SDR SPECTRUM</button>
+    <button class="tab-btn" data-tab="tab-kraken">04 // KRAKENSDR DF</button>
+    <button class="tab-btn" data-tab="tab-vtx">05 // VTX VIDEO DECODE</button>
+    <button class="tab-btn" data-tab="tab-sitrep">06 // SITREP & LOGS</button>
+  </nav>
+
+  <!-- Main View Container -->
+  <main class="main-content">
+
+    <!-- ============================================================ -->
+    <!-- TAB 1: COCKPIT & TELEMETRY -->
+    <!-- ============================================================ -->
+    <section id="tab-cockpit" class="tab-panel active">
+      <!-- Target Intercept & Pilot Lock Status HUD -->
+      <div id="targetLockHUD" class="card target-lock-hud">
+        <div style="display: flex; align-items: center; gap: 10px;">
+          <span id="targetLockIcon" style="font-size: 18px;">🎯</span>
+          <div>
+            <div style="font-family: var(--font-mono); font-size: 9.5px; color: var(--text-muted); letter-spacing: 1px; font-weight: 700;">AIRSPACE INTERCEPT TARGET</div>
+            <div id="targetLockTitle" style="font-family: var(--font-mono); font-size: 13px; font-weight: 800; color: var(--cyan-bright);">AUTO-ACQUIRE (MONITORING ALL PILOTS)</div>
+          </div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 12px; font-family: var(--font-mono); font-size: 11px;">
+          <div><span style="color: var(--text-muted);">RATE:</span> <span id="hudTargetRate" style="color: var(--text-main); font-weight: bold;">--</span></div>
+          <div><span style="color: var(--text-muted);">RSSI:</span> <span id="hudTargetRssi" style="color: var(--cyan-bright); font-weight: bold;">-- dBm</span></div>
+          <div><span style="color: var(--text-muted);">BEACONS:</span> <span id="hudTargetBeacons" style="color: var(--green-bright); font-weight: bold;">0</span></div>
+          <div id="targetLockBadge" class="badge" style="padding: 2px 6px;">STANDBY</div>
+          <button id="btnQuickUnlock" class="btn-tactical secondary" style="display: none; padding: 3px 8px; font-size: 10.5px;">RELEASE LOCK</button>
+        </div>
+      </div>
+
+      <!-- Flight Dynamics / Maneuver Banner -->
+      <div class="maneuver-banner">
+        <div id="maneuverTitle" class="maneuver-title">DISARMED / MOTOR SHUTDOWN</div>
+        <div id="maneuverDetail" class="maneuver-subtitle">Motors Idle | Throttle: 0% | Cyclic Rate: 0 us/s</div>
+      </div>
+
+      <!-- Live Canvas HUDs Grid -->
+      <div class="card-grid-2">
+        <!-- Gimbal HUD -->
+        <div class="card">
+          <div class="card-title">
+            <span>MODE 2 PILOT GIMBALS</span>
+            <span id="gimbalReadout" style="color: var(--text-dim);">THR: 0% | YAW: 1500us</span>
+          </div>
+          <div class="hud-canvas-container">
+            <canvas id="gimbalCanvas" class="hud-canvas" width="580" height="220"></canvas>
+          </div>
+        </div>
+
+        <!-- Attitude HUD -->
+        <div class="card">
+          <div class="card-title">
+            <span>ARTIFICIAL HORIZON & ATTITUDE</span>
+            <span id="attitudeReadout" style="color: var(--text-dim);">P: +0.0° | R: +0.0°</span>
+          </div>
+          <div class="hud-canvas-container">
+            <canvas id="attitudeCanvas" class="hud-canvas" width="580" height="220"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <!-- Telemetry Overview Metrics -->
+      <div class="card-grid-4">
+        <div class="metric-box">
+          <div class="metric-label">Sniffer RSSI / SNR</div>
+          <div class="metric-value cyan"><span id="mRssi">-115</span> <span style="font-size: 11px;">dBm</span> / <span id="mSnr">+0.0</span> <span style="font-size: 11px;">dB</span></div>
+        </div>
+        <div class="metric-box">
+          <div class="metric-label">Drone Battery</div>
+          <div class="metric-value green"><span id="mVolt">0.0</span><span style="font-size: 11px;">V</span> (<span id="mBatPct">0</span>%)</div>
+        </div>
+        <div class="metric-box">
+          <div class="metric-label">Link Margin / Pwr</div>
+          <div class="metric-value amber"><span id="mLq">0</span>% / <span id="mPwr">0</span> <span style="font-size: 11px;">mW</span></div>
+        </div>
+        <div class="metric-box">
+          <div class="metric-label">Flight Mode / GPS</div>
+          <div class="metric-value"><span id="mMode" style="color: var(--cyan-bright);">STANDBY</span> / <span id="mSats" style="font-size: 12px; color: var(--text-dim);">0 Sats</span></div>
+        </div>
+      </div>
+
+      <!-- 16-Channel Diagnostic Matrix -->
+      <div class="card">
+        <div class="card-title">
+          <span>16-CHANNEL LIVE DIAGNOSTIC MATRIX (ELRS / CRSF)</span>
+          <span style="color: var(--text-muted); font-size: 10.5px;">MIN: 988us | CTR: 1500us | MAX: 2012us</span>
+        </div>
+        <div id="channelGrid" class="channel-grid">
+          <!-- Populated by JavaScript -->
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================ -->
+    <!-- TAB 2: ELRS CONTROLS & AIRSPACE -->
+    <!-- ============================================================ -->
+    <section id="tab-elrs" class="tab-panel">
+      <!-- Hardware Serial Port Selector -->
+      <div class="card">
+        <div class="card-title">
+          <span>LORA HARDWARE SERIAL PORT (HELTEC V3 / CP2102)</span>
+          <span id="activePortBadge" class="badge">ACTIVE: SEARCHING...</span>
+        </div>
+        <div class="form-row">
+          <select id="portSelect" class="form-select">
+            <option value="">Auto-Detect USB Serial</option>
+          </select>
+          <button id="btnApplyPort" class="btn-tactical">SWITCH PORT</button>
+        </div>
+      </div>
+
+      <!-- Packet Rate Control -->
+      <div class="card">
+        <div class="card-title">EXPRESSLRS PACKET RATE & DEMODULATION CONTROL</div>
+        <div class="form-row">
+          <select id="rateSelect" class="form-select">
+            <option value="AUTO">Auto-Detect (Dynamic Rate Scanning)</option>
+            <option value="50HZ">50 Hz (Standard 915MHz - SF8 / 20ms)</option>
+            <option value="25HZ">25 Hz (Long Range - SF9 / 40ms)</option>
+            <option value="100HZ">100 Hz (Standard 8ch - SF7 / 10ms)</option>
+            <option value="100HZ FULL">100 Hz Full (16ch Full Res - SF7 / 10ms)</option>
+            <option value="D50">D50 (Déjà Vu 50Hz - SF7 / 10ms)</option>
+            <option value="150HZ">150 Hz (SF7 / 6.6ms)</option>
+            <option value="200HZ">200 Hz (SF6 / 5ms)</option>
+            <option value="200HZ FULL">200 Hz Full (16ch Full Res - SF6 / 5ms)</option>
+            <option value="250HZ">250 Hz (SF6 / 4ms)</option>
+            <option value="333HZ FULL">333 Hz Full (16ch Full Res - SF5 / 3ms)</option>
+          </select>
+          <button id="btnApplyRate" class="btn-tactical">LOCK RATE</button>
+        </div>
+        <div style="font-family: var(--font-mono); font-size: 11px; color: var(--cyan-bright); margin-top: 4px;">
+          Active Radio Config: <span id="rateDetailText">50Hz | SF8 | BW: 500kHz | Interval: 20000us</span>
+        </div>
+      </div>
+
+      <!-- Airspace Recon & Beacon Scanner Control -->
+      <div class="card" style="border-left: 4px solid var(--amber-bright);">
+        <div class="card-title">
+          <span>AIRSPACE RECON & BEACON SURVEY</span>
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span id="scanStatusBadge" class="badge">SCAN: STANDBY</span>
+            <button id="btnClearPilots" class="btn-tactical secondary" style="padding: 3px 8px; font-size: 10.5px;">CLEAR INVENTORY</button>
+          </div>
+        </div>
+        <div style="font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); margin-bottom: 6px;">
+          Survey mode stays parked on sync frequencies to discover all active pilots in range before locking onto a target.
+        </div>
+        <div class="form-row" style="flex-wrap: wrap; gap: 8px;">
+          <div style="display: flex; align-items: center; gap: 6px; flex: 1; min-width: 170px;">
+            <label style="font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); white-space: nowrap;">SCAN RATE:</label>
+            <select id="scanRateSelect" class="form-select" style="flex: 1;">
+              <option value="50HZ" selected>50 Hz (Standard 915MHz)</option>
+              <option value="AUTO">Auto-Cycle All Rates</option>
+              <option value="100HZ">100 Hz</option>
+              <option value="150HZ">150 Hz</option>
+              <option value="200HZ">200 Hz</option>
+              <option value="250HZ">250 Hz</option>
+              <option value="25HZ">25 Hz (Long Range)</option>
+              <option value="100HZ FULL">100 Hz Full Res</option>
+              <option value="200HZ FULL">200 Hz Full Res</option>
+              <option value="333HZ FULL">333 Hz Full Res</option>
+            </select>
+          </div>
+          <div style="display: flex; align-items: center; gap: 6px; flex: 1; min-width: 170px;">
+            <label style="font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); white-space: nowrap;">BAND:</label>
+            <select id="scanBandSelect" class="form-select" style="flex: 1;">
+              <option value="AUTO" selected>Auto (Dual 915.5 & 916.1 MHz)</option>
+              <option value="V4">ELRS v4 (915.5 MHz / Ch 20)</option>
+              <option value="V3">ELRS v3 (916.1 MHz / Ch 21)</option>
+            </select>
+          </div>
+          <button id="btnToggleScan" class="btn-tactical" style="padding: 7px 16px; font-weight: 800; min-width: 130px;">🔍 START SCAN</button>
+        </div>
+      </div>
+
+      <!-- Airspace Pilot Target Registry -->
+      <div class="card">
+        <div class="card-title">
+          <span>AIRSPACE PILOT TARGET TRACKER</span>
+          <button id="btnAutoPilot" class="btn-tactical secondary" style="padding: 3px 8px; font-size: 11px;">AUTO / ANY PILOT</button>
+        </div>
+        <div style="overflow-x: auto;">
+          <table class="pilot-table">
+            <thead>
+              <tr>
+                <th>TARGET UID</th>
+                <th>PROTOCOL</th>
+                <th>RATE</th>
+                <th>RSSI</th>
+                <th>BEACONS</th>
+                <th>LAST SEEN</th>
+                <th>ACTION</th>
+              </tr>
+            </thead>
+            <tbody id="pilotTableBody">
+              <tr>
+                <td colspan="7" style="text-align: center; color: var(--text-muted); padding: 14px;">Awaiting LoRa sync beacons...</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Raw Serial Console -->
+      <div class="card">
+        <div class="card-title">
+          <span>RAW LORA SERIAL DIAGNOSTICS</span>
+          <span id="rxCountText" style="color: var(--text-muted); font-size: 10px;">RX: 0 frames</span>
+        </div>
+        <div id="serialConsole" class="log-stream" style="height: 160px;">
+          <!-- Serial logs appended here -->
+        </div>
+        <div class="form-row" style="margin-top: 6px;">
+          <input id="inputSerialCmd" type="text" class="form-input" placeholder="Type serial command (e.g. SET_RATE:50HZ)...">
+          <button id="btnSendSerial" class="btn-tactical">SEND</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================ -->
+    <!-- TAB 3: HACKRF SDR SPECTRUM -->
+    <!-- ============================================================ -->
+    <section id="tab-sdr" class="tab-panel">
+      <!-- Hardware SDR Device Selector Card -->
+      <div class="card">
+        <div class="card-title">
+          <span>HACKRF HARDWARE SDR INTERFACE</span>
+          <span id="sdrHardwareBadge" class="badge">HARDWARE: SEARCHING...</span>
+        </div>
+        <div class="form-row">
+          <select id="sdrDeviceSelect" class="form-select">
+            <option value="">Auto-Detect HackRF SDR</option>
+          </select>
+          <button id="btnApplySdrDevice" class="btn-tactical">SELECT SDR</button>
+          <button id="btnScanSdr" class="btn-tactical secondary">SCAN SDR</button>
+        </div>
+        <div style="font-family: var(--font-mono); font-size: 11px; color: var(--cyan-bright); margin-top: 4px;">
+          Model: <span id="sdrBoardText">--</span> | Rev: <span id="sdrRevisionText">--</span> | Firmware: <span id="sdrFirmwareText">--</span> | Serial: <span id="sdrSerialText">--</span>
+        </div>
+      </div>
+
+      <!-- SDR Controls Card -->
+      <div class="card">
+        <div class="card-title">
+          <span>TUNING & RF DSP PARAMETERS</span>
+          <span id="sdrStreamingBadge" class="badge">STANDBY</span>
+        </div>
+        <div class="form-row">
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <label style="font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);">FREQ (MHz):</label>
+            <input id="sdrFreq" type="number" step="0.1" class="form-input" value="915.0" style="width: 90px; min-width: 90px;">
+          </div>
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <label style="font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);">LNA (dB):</label>
+            <input id="sdrLna" type="number" step="8" min="0" max="40" class="form-input" value="32" style="width: 70px; min-width: 70px;">
+          </div>
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <label style="font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);">VGA (dB):</label>
+            <input id="sdrVga" type="number" step="2" min="0" max="62" class="form-input" value="30" style="width: 70px; min-width: 70px;">
+          </div>
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <label style="font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);">PALETTE:</label>
+            <select id="sdrPalette" class="form-select" style="min-width: 110px;">
+              <option value="inferno">Inferno</option>
+              <option value="green">NVG Green</option>
+              <option value="amber">Amber CRT</option>
+              <option value="ice">Ice Blue</option>
+            </select>
+          </div>
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <label style="font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);">CONTRAST:</label>
+            <input id="sdrSens" type="range" min="15" max="65" value="35" style="width: 85px; accent-color: var(--accent-cyan); cursor: pointer;">
+            <span id="sdrSensVal" style="font-family: var(--font-mono); font-size: 11px; color: var(--accent-cyan); width: 34px;">35dB</span>
+          </div>
+          <button id="btnToggleSdr" class="btn-tactical">START SPECTRUM</button>
+        </div>
+      </div>
+
+      <!-- Real-Time Spectrum Canvas -->
+      <div class="card">
+        <div class="card-title">REAL-TIME RF SPECTRUM (FFT 20MHz SPAN)</div>
+        <canvas id="spectrumCanvas" class="spectrum-canvas" width="800" height="150"></canvas>
+      </div>
+
+      <!-- Waterfall Canvas -->
+      <div class="card">
+        <div class="card-title">WATERFALL SPECTROGRAM</div>
+        <canvas id="waterfallCanvas" class="waterfall-canvas" width="800" height="220"></canvas>
+      </div>
+    </section>
+
+    <!-- ============================================================ -->
+    <!-- TAB 4: KRAKENSDR DIRECTION FINDING -->
+    <!-- ============================================================ -->
+    <section id="tab-kraken" class="tab-panel">
+      <!-- Hardware / Health Card -->
+      <div class="card">
+        <div class="card-title">
+          <span>KRAKENSDR COHERENT DF INTERFACE</span>
+          <span id="krakenHealthBadge" class="badge">HARDWARE: SEARCHING...</span>
+        </div>
+        <div class="form-row" style="flex-wrap: wrap; gap: 10px;">
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <label style="font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);">SOURCE:</label>
+            <select id="krakenMode" class="form-select" style="min-width: 150px;">
+              <option value="KRAKEN_POLL">Live DoA Stream</option>
+              <option value="SIMULATOR">Simulator (Demo)</option>
+            </select>
+          </div>
+          <div id="krakenHostRow" style="display: flex; align-items: center; gap: 6px;">
+            <label style="font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);">HOST:</label>
+            <input id="krakenHost" type="text" class="form-input" value="127.0.0.1" style="width: 130px; min-width: 110px;">
+            <label style="font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);">PORT:</label>
+            <input id="krakenPort" type="number" class="form-input" value="8081" style="width: 80px; min-width: 70px;">
+          </div>
+        </div>
+        <div style="font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); margin-top: 6px;">
+          Coherent Tuners: <span id="krakenTuners" style="color: var(--cyan-bright);">0</span>/5 |
+          Stream: <span id="krakenStreamState" style="color: var(--text-dim);">--</span>
+        </div>
+      </div>
+
+      <!-- Retune / Array Controls -->
+      <div class="card">
+        <div class="card-title">
+          <span>DF TUNING & ARRAY GEOMETRY</span>
+          <span id="krakenStreamingBadge" class="badge">STANDBY</span>
+        </div>
+        <div class="form-row" style="flex-wrap: wrap; gap: 10px;">
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <label style="font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);">FREQ (MHz):</label>
+            <input id="krakenFreq" type="number" step="0.1" class="form-input" value="915.0" style="width: 90px; min-width: 90px;">
+          </div>
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <label style="font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);">GAIN (dB):</label>
+            <input id="krakenGain" type="number" step="0.5" min="0" max="49.6" class="form-input" value="30" style="width: 80px; min-width: 70px;">
+          </div>
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <label style="font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);">ARRAY:</label>
+            <select id="krakenArray" class="form-select" style="min-width: 130px;">
+              <option value="UCA">Circular (UCA)</option>
+              <option value="ULA">Linear (ULA)</option>
+            </select>
+          </div>
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <label style="font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);">SPACING (m):</label>
+            <input id="krakenSpacing" type="number" step="0.005" min="0.01" max="1.0" class="form-input" value="0.135" style="width: 80px; min-width: 70px;">
+          </div>
+          <button id="btnKrakenApply" class="btn-tactical secondary">APPLY / RETUNE</button>
+          <button id="btnToggleKraken" class="btn-tactical">▶ START DIRECTION FINDING</button>
+        </div>
+        <div style="font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); margin-top: 6px;">
+          Physics: <span id="krakenPhysicsHint" style="color: var(--text-dim);">UCA — unambiguous 360° coverage</span>
+        </div>
+      </div>
+
+      <!-- DoA Compass + MUSIC spectrum -->
+      <div class="card">
+        <div class="card-title">DIRECTION OF ARRIVAL — MUSIC PSEUDO-SPECTRUM</div>
+        <div id="krakenReadout" style="font-family: var(--font-mono); font-size: 13px; font-weight: 800; color: var(--amber-bright, #f59e0b); padding: 6px 0;">
+          [ KRAKENSDR DoA: STANDBY / DISCONNECTED ]
+        </div>
+        <div class="hud-canvas-container" style="display: flex; justify-content: center;">
+          <canvas id="doaCanvas" class="hud-canvas" width="420" height="420"></canvas>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================ -->
+    <!-- TAB 5: VTX ANALOG VIDEO DECODE -->
+    <!-- ============================================================ -->
+    <section id="tab-vtx" class="tab-panel">
+      <div class="card">
+        <div class="card-title">
+          <span>ANALOG FPV VTX DECODER (HackRF)</span>
+          <span id="vtxStreamBadge" class="badge">STANDBY</span>
+        </div>
+        <div class="form-row" style="flex-wrap: wrap; gap: 10px;">
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <label style="font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);">CHANNEL:</label>
+            <select id="vtxChannel" class="form-select" style="min-width: 150px;">
+              <optgroup label="RaceBand (R)">
+                <option value="R1">R1 · 5658</option><option value="R2">R2 · 5695</option>
+                <option value="R3">R3 · 5732</option><option value="R4">R4 · 5769</option>
+                <option value="R5">R5 · 5806</option><option value="R6">R6 · 5843</option>
+                <option value="R7">R7 · 5880</option><option value="R8">R8 · 5917</option>
+              </optgroup>
+              <optgroup label="FatShark (F)">
+                <option value="F1">F1 · 5740</option><option value="F2">F2 · 5760</option>
+                <option value="F3">F3 · 5780</option><option value="F4" selected>F4 · 5800</option>
+                <option value="F5">F5 · 5820</option><option value="F6">F6 · 5840</option>
+                <option value="F7">F7 · 5860</option><option value="F8">F8 · 5880</option>
+              </optgroup>
+              <optgroup label="Band A">
+                <option value="A1">A1 · 5865</option><option value="A2">A2 · 5845</option>
+                <option value="A3">A3 · 5825</option><option value="A4">A4 · 5805</option>
+                <option value="A5">A5 · 5785</option><option value="A6">A6 · 5765</option>
+                <option value="A7">A7 · 5745</option><option value="A8">A8 · 5725</option>
+              </optgroup>
+              <optgroup label="Band B">
+                <option value="B1">B1 · 5733</option><option value="B2">B2 · 5752</option>
+                <option value="B3">B3 · 5771</option><option value="B4">B4 · 5790</option>
+                <option value="B5">B5 · 5809</option><option value="B6">B6 · 5828</option>
+                <option value="B7">B7 · 5847</option><option value="B8">B8 · 5866</option>
+              </optgroup>
+              <optgroup label="Band E">
+                <option value="E1">E1 · 5705</option><option value="E2">E2 · 5685</option>
+                <option value="E3">E3 · 5665</option><option value="E4">E4 · 5645</option>
+                <option value="E5">E5 · 5885</option><option value="E6">E6 · 5905</option>
+                <option value="E7">E7 · 5925</option><option value="E8">E8 · 5945</option>
+              </optgroup>
+              <optgroup label="1.2 GHz (L)">
+                <option value="L1">L1 · 1080</option><option value="L2">L2 · 1120</option>
+                <option value="L3">L3 · 1160</option><option value="L4">L4 · 1200</option>
+                <option value="L5">L5 · 1240</option><option value="L6">L6 · 1280</option>
+                <option value="L7">L7 · 1320</option><option value="L8">L8 · 1360</option>
+              </optgroup>
+            </select>
+          </div>
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <label style="font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);">STANDARD:</label>
+            <select id="vtxStandard" class="form-select" style="min-width: 90px;">
+              <option value="PAL">PAL</option>
+              <option value="NTSC">NTSC</option>
+            </select>
+          </div>
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <label style="font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);">LNA:</label>
+            <input id="vtxLna" type="number" step="8" min="0" max="40" class="form-input" value="32" style="width: 66px; min-width: 60px;">
+            <label style="font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);">VGA:</label>
+            <input id="vtxVga" type="number" step="2" min="0" max="62" class="form-input" value="30" style="width: 66px; min-width: 60px;">
+          </div>
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <label style="font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);">INVERT:</label>
+            <input id="vtxInvert" type="checkbox" style="width: 16px; height: 16px; accent-color: var(--accent-cyan); cursor: pointer;">
+          </div>
+          <button id="btnToggleVtx" class="btn-tactical">▶ START VIDEO</button>
+        </div>
+        <div style="font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); margin-top: 6px;">
+          SYNC: <span id="vtxSync" style="color: var(--text-dim);">--</span> |
+          FPS: <span id="vtxFps" style="color: var(--cyan-bright);">0.0</span> |
+          <span id="vtxError" style="color: var(--red-bright);"></span>
+        </div>
+      </div>
+
+      <!-- Sync / Centering / Picture -->
+      <div class="card">
+        <div class="card-title">SYNC & PICTURE TUNING</div>
+        <div style="display: flex; flex-wrap: wrap; gap: 8px 18px; align-items: center;">
+          <label style="display: flex; align-items: center; gap: 6px; font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);">
+            <input id="vtxAutoHsync" type="checkbox" checked style="width: 16px; height: 16px; accent-color: var(--accent-cyan); cursor: pointer;">
+            Auto H-Sync Lock (PLL)
+          </label>
+        </div>
+        <div style="display: grid; grid-template-columns: 120px 1fr 90px; gap: 6px 10px; align-items: center; margin-top: 8px; max-width: 560px;">
+          <span style="font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);">H-Sync (line):</span>
+          <input id="vtxLineLen" type="range" min="620" max="660" value="640" style="width: 100%; accent-color: var(--accent-cyan); cursor: pointer;">
+          <span id="vtxLineLenVal" style="font-family: var(--font-mono); font-size: 11px; color: var(--cyan-bright);">640 px</span>
+
+          <span style="font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);">V-Hold:</span>
+          <input id="vtxVHold" type="range" min="0" max="625" value="0" style="width: 100%; accent-color: var(--accent-cyan); cursor: pointer;">
+          <span id="vtxVHoldVal" style="font-family: var(--font-mono); font-size: 11px; color: var(--cyan-bright);">0 lines</span>
+
+          <span style="font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);">H-Hold:</span>
+          <input id="vtxHHold" type="range" min="-320" max="320" value="0" style="width: 100%; accent-color: var(--accent-cyan); cursor: pointer;">
+          <span id="vtxHHoldVal" style="font-family: var(--font-mono); font-size: 11px; color: var(--cyan-bright);">0 px</span>
+
+          <span style="font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);">Contrast AGC:</span>
+          <input id="vtxContrast" type="range" min="50" max="300" value="100" style="width: 100%; accent-color: var(--accent-cyan); cursor: pointer;">
+          <span id="vtxContrastVal" style="font-family: var(--font-mono); font-size: 11px; color: var(--cyan-bright);">1.00x</span>
+
+          <span style="font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);">Brightness:</span>
+          <input id="vtxBrightness" type="range" min="-50" max="50" value="0" style="width: 100%; accent-color: var(--accent-cyan); cursor: pointer;">
+          <span id="vtxBrightnessVal" style="font-family: var(--font-mono); font-size: 11px; color: var(--cyan-bright);">0</span>
+        </div>
+        <div style="margin-top: 8px;">
+          <button id="btnVtxRecenter" class="btn-tactical secondary" style="padding: 4px 10px; font-size: 11px;">RE-CENTER (RESET HOLD)</button>
+        </div>
+      </div>
+
+      <!-- Decoded video -->
+      <div class="card">
+        <div class="card-title">DECODED VIDEO FEED (640x480)</div>
+        <div class="hud-canvas-container" style="aspect-ratio: 4 / 3; max-width: 640px; margin: 0 auto; width: 100%;">
+          <img id="vtxVideo" alt="VTX video" style="width: 100%; height: 100%; object-fit: contain; display: block; background: #000;">
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================ -->
+    <!-- TAB 6: SITREP & LOGS -->
+    <!-- ============================================================ -->
+    <section id="tab-sitrep" class="tab-panel">
+      <div class="card">
+        <div class="card-title">
+          <span>TACTICAL SITUATION REPORT (SITREP)</span>
+          <button id="btnClearSitrep" class="btn-tactical secondary" style="padding: 3px 8px; font-size: 11px;">CLEAR SITREP</button>
+        </div>
+        <div id="sitrepList" class="log-stream" style="height: 480px;">
+          <!-- SITREP events streamed here -->
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

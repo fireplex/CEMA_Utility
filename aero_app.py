@@ -219,11 +219,13 @@ class AeroTrackApp(QMainWindow):
         self.ref_lat_input.setRange(-90.0, 90.0)
         self.ref_lat_input.setValue(self.ref_lat)
         self.ref_lat_input.setDecimals(4)
+        self.ref_lat_input.editingFinished.connect(self.apply_station_coordinates)
 
         self.ref_lon_input = QDoubleSpinBox()
         self.ref_lon_input.setRange(-180.0, 180.0)
         self.ref_lon_input.setValue(self.ref_lon)
         self.ref_lon_input.setDecimals(4)
+        self.ref_lon_input.editingFinished.connect(self.apply_station_coordinates)
 
         self.restart_sdr_btn = QPushButton("RESTART FEED RECEIVER")
         self.restart_sdr_btn.clicked.connect(self.start_adsb_receiver)
@@ -255,8 +257,11 @@ class AeroTrackApp(QMainWindow):
             <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
             <style>
                 body, html, #map {{ height: 100%; margin: 0; padding: 0; background: #060a14; }}
+                .leaflet-tile-pane {{
+                    filter: invert(100%) hue-rotate(180deg) brightness(85%) contrast(120%);
+                }}
                 .ac-label {{
-                    background: rgba(15, 23, 42, 0.85);
+                    background: rgba(15, 23, 42, 0.90);
                     border: 1px solid #38bdf8;
                     color: #f8fafc;
                     font-family: monospace;
@@ -278,30 +283,48 @@ class AeroTrackApp(QMainWindow):
             <div id="map"></div>
             <script>
                 var map = L.map('map', {{ zoomControl: true }}).setView([{self.ref_lat}, {self.ref_lon}], 10);
-                L.tileLayer('https://{{s}}.basemaps.cartocdn.com/dark_all/{{z}}/{{x}}/{{y}}{{r}}.png', {{
-                    attribution: '&copy; CartoDB &copy; OpenStreetMap',
-                    maxZoom: 18
+                L.tileLayer('https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+                    attribution: '&copy; OpenStreetMap contributors',
+                    maxZoom: 19
                 }}).addTo(map);
 
-                // Range Rings (10nm, 25nm, 50nm)
-                var rings = [18520, 46300, 92600];
-                for (var r of rings) {{
-                    L.circle([{self.ref_lat}, {self.ref_lon}], {{
-                        radius: r,
-                        color: '#334155',
-                        weight: 1,
-                        fill: false,
-                        dashArray: '4, 4'
-                    }}).addTo(map);
+                var stationMarker = null;
+                var ringCircles = [];
+
+                function updateStationLocation(lat, lon) {{
+                    if (stationMarker) {{
+                        map.removeLayer(stationMarker);
+                    }}
+                    for (var i = 0; i < ringCircles.length; i++) {{
+                        map.removeLayer(ringCircles[i]);
+                    }}
+                    ringCircles = [];
+
+                    var rings = [18520, 46300, 92600]; // 10nm, 25nm, 50nm
+                    for (var r of rings) {{
+                        var circle = L.circle([lat, lon], {{
+                            radius: r,
+                            color: '#334155',
+                            weight: 1,
+                            fill: false,
+                            dashArray: '4, 4'
+                        }}).addTo(map);
+                        ringCircles.push(circle);
+                    }}
+
+                    stationMarker = L.circleMarker([lat, lon], {{
+                        radius: 8,
+                        color: '#38bdf8',
+                        fillColor: '#0284c7',
+                        fillOpacity: 1,
+                        weight: 2
+                    }}).bindTooltip("CEMA BASE STATION", {{ permanent: true, direction: 'top', className: 'ac-label' }}).addTo(map);
+
+                    map.setView([lat, lon], map.getZoom() || 10);
                 }}
 
-                // Ground Station Marker
-                L.circleMarker([{self.ref_lat}, {self.ref_lon}], {{
-                    radius: 7,
-                    color: '#38bdf8',
-                    fillColor: '#0284c7',
-                    fillOpacity: 1
-                }}).bindTooltip("CEMA BASE STATION", {{ permanent: true, direction: 'top', className: 'ac-label' }}).addTo(map);
+                // Initialize station & rings
+                updateStationLocation({self.ref_lat}, {self.ref_lon});
 
                 var markers = {{}};
                 var trails = {{}};
@@ -388,12 +411,23 @@ class AeroTrackApp(QMainWindow):
         """
         self.map_view.setHtml(map_html)
 
+    def apply_station_coordinates(self):
+        self.ref_lat = self.ref_lat_input.value()
+        self.ref_lon = self.ref_lon_input.value()
+        js = f"if (typeof updateStationLocation === 'function') {{ updateStationLocation({self.ref_lat}, {self.ref_lon}); }}"
+        self.map_view.page().runJavaScript(js)
+        self.start_adsb_receiver()
+
     def start_adsb_receiver(self):
         if self.adsb_thread and self.adsb_thread.isRunning():
             self.adsb_thread.stop()
         
         self.ref_lat = self.ref_lat_input.value()
         self.ref_lon = self.ref_lon_input.value()
+
+        # Instantly update Leaflet station location and range rings
+        js = f"if (typeof updateStationLocation === 'function') {{ updateStationLocation({self.ref_lat}, {self.ref_lon}); }}"
+        self.map_view.page().runJavaScript(js)
 
         mode_idx = self.source_combo.currentIndex() if hasattr(self, 'source_combo') else 0
         modes = ["live_opensky", "hackrf_sdr", "tcp_beast", "simulation"]

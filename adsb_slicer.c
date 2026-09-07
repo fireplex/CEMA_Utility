@@ -27,19 +27,25 @@ __declspec(dllexport) int process_iq_samples(
     int num_samples,
     AdsbFrameCallback callback
 ) {
-    if (num_samples < 250) return 0;
+    if (num_samples < 300) return 0;
 
     uint32_t *mag = (uint32_t*)malloc(num_samples * sizeof(uint32_t));
     if (!mag) return 0;
 
+    uint64_t total_energy = 0;
     for (int i = 0; i < num_samples; i++) {
         int32_t iv = iq_data[i * 2];
         int32_t qv = iq_data[i * 2 + 1];
-        mag[i] = (uint32_t)(iv * iv + qv * qv);
+        uint32_t m = (uint32_t)(iv * iv + qv * qv);
+        mag[i] = m;
+        total_energy += m;
     }
 
+    uint32_t noise_floor = (uint32_t)(total_energy / num_samples);
+    uint32_t min_pulse_energy = (noise_floor > 10) ? (noise_floor * 2 + 30) : 60;
+
     int frames_found = 0;
-    int max_idx = num_samples - 240;
+    int max_idx = num_samples - 250;
 
     for (int i = 0; i < max_idx; i++) {
         uint32_t p0 = mag[i];
@@ -54,17 +60,22 @@ __declspec(dllexport) int process_iq_samples(
         uint32_t p6 = mag[i + 6];
         uint32_t p8 = mag[i + 8];
 
+        // Preamble pulse vs valley check
         if (p0 <= p1 || p2 <= p3 || p7 <= p6 || p9 <= p8) {
+            continue;
+        }
+        if (p0 <= p4 || p2 <= p4 || p7 <= p5 || p9 <= p5) {
             continue;
         }
 
         uint32_t high_sum = p0 + p2 + p7 + p9;
         uint32_t low_sum = p1 + p3 + p4 + p5 + p6 + p8;
 
-        if (high_sum < 250 || high_sum <= (low_sum * 2)) {
+        if (high_sum < min_pulse_energy * 4 || high_sum <= (uint32_t)(low_sum * 1.6)) {
             continue;
         }
 
+        // Demodulate 112 bits starting at sample 16
         uint8_t msg[14] = {0};
         int bit_offset = i + 16;
 
@@ -92,17 +103,6 @@ __declspec(dllexport) int process_iq_samples(
                 frames_found++;
                 i += 240;
             }
-        } else if (df == 0 || df == 4 || df == 5 || df == 11) {
-            char hex_str[32];
-            for (int h = 0; h < 7; h++) {
-                sprintf(&hex_str[h * 2], "%02X", msg[h]);
-            }
-            hex_str[14] = '\0';
-            if (callback) {
-                callback(hex_str, (int)(high_sum / 4));
-            }
-            frames_found++;
-            i += 120;
         }
     }
 

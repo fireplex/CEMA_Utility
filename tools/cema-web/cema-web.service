@@ -1,0 +1,20 @@
+[Unit]
+Description=CEMA Tactical Suite Web Server & LoRa Engine
+After=network.target NetworkManager.service
+
+[Service]
+Type=simple
+User=feeka
+WorkingDirectory=/home/feeka/cema-web
+ExecStart=/usr/bin/python3 -m uvicorn backend:app --host 0.0.0.0 --port 80
+Restart=always
+RestartSec=2
+TimeoutStopSec=2
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

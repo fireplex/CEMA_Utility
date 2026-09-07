@@ -4,28 +4,84 @@
 #include <RadioLib.h>
 #include <SSD1306Wire.h>
 
-// Heltec WiFi LoRa 32 V3 Pin Definitions
-#define SCK 9
-#define MISO 11
-#define MOSI 10
-#define NSS 8
-#define DIO1 14
-#define NRST 12
-#define BUSY 13
+// =============================================================================
+// HARDWARE TARGET SELECTOR
+// (Select ONE board target according to your hardware)
+// =============================================================================
+// #define BOARD_LILYGO_T3_S3_SX1276     // LilyGO T3-S3 (ESP32-S3 + SX1276 868/915MHz)
+#define BOARD_HELTEC_V3             // Heltec WiFi LoRa 32 V3 (ESP32-S3 + SX1262)
+// #define BOARD_LILYGO_T3_S3_SX1262     // LilyGO T3-S3 (ESP32-S3 + SX1262)
 
-// OLED Display & Button Pins
-#define SDA_OLED 17
-#define SCL_OLED 18
-#define RST_OLED 21
-#define VEXT_PIN 36
-#define PRG_BUTTON 0
+// =============================================================================
+// REGIONAL FREQUENCY BAND SELECTOR
+// =============================================================================
+// #define BAND_868_MHZ                  // EU868 Band (868.0 MHz sync channel - UK/Europe)
+#define BAND_915_MHZ               // US915 Band (916.1 MHz sync channel - Americas)
 
-SSD1306Wire display(0x3C, SDA_OLED, SCL_OLED, GEOMETRY_128_64);
+#if defined(BOARD_LILYGO_T3_S3_SX1276)
+  #define SCK_PIN 5
+  #define MISO_PIN 3
+  #define MOSI_PIN 6
+  #define NSS_PIN 7
+  #define NRST_PIN 8
+  #define DIO0_PIN 9
+  #define DIO1_PIN 33
+  #define SDA_OLED 18
+  #define SCL_OLED 17
+  #define RST_OLED 21
+  #define PRG_BUTTON 0
+  #define BOARD_NAME "LILYGO T3-S3 (SX1276)"
+  
+  SSD1306Wire display(0x3C, SDA_OLED, SCL_OLED, GEOMETRY_128_64);
+  SPIClass *loraSpi = new SPIClass(FSPI);
+  SX1276 radio = new Module(NSS_PIN, DIO0_PIN, NRST_PIN, DIO1_PIN, *loraSpi);
 
-SPIClass *loraSpi = new SPIClass(FSPI);
-SX1262 radio = new Module(NSS, DIO1, NRST, BUSY, *loraSpi);
+#elif defined(BOARD_LILYGO_T3_S3_SX1262)
+  #define SCK_PIN 5
+  #define MISO_PIN 3
+  #define MOSI_PIN 6
+  #define NSS_PIN 7
+  #define NRST_PIN 8
+  #define DIO1_PIN 33
+  #define BUSY_PIN 34
+  #define SDA_OLED 18
+  #define SCL_OLED 17
+  #define RST_OLED 21
+  #define PRG_BUTTON 0
+  #define BOARD_NAME "LILYGO T3-S3 (SX1262)"
+  
+  SSD1306Wire display(0x3C, SDA_OLED, SCL_OLED, GEOMETRY_128_64);
+  SPIClass *loraSpi = new SPIClass(FSPI);
+  SX1262 radio = new Module(NSS_PIN, DIO1_PIN, NRST_PIN, BUSY_PIN, *loraSpi);
 
-#define OTA_VERSION_ID 3
+#else // Default: BOARD_HELTEC_V3
+  #define SCK_PIN 9
+  #define MISO_PIN 11
+  #define MOSI_PIN 10
+  #define NSS_PIN 8
+  #define DIO1_PIN 14
+  #define NRST_PIN 12
+  #define BUSY_PIN 13
+  #define SDA_OLED 17
+  #define SCL_OLED 18
+  #define RST_OLED 21
+  #define VEXT_PIN 36
+  #define PRG_BUTTON 0
+  #define BOARD_NAME "HELTEC V3 (SX1262)"
+
+  SSD1306Wire display(0x3C, SDA_OLED, SCL_OLED, GEOMETRY_128_64);
+  SPIClass *loraSpi = new SPIClass(FSPI);
+  SX1262 radio = new Module(NSS_PIN, DIO1_PIN, NRST_PIN, BUSY_PIN, *loraSpi);
+#endif
+
+// Hardware Timer and RTOS Task handles
+hw_timer_t *slot_timer = NULL;
+TaskHandle_t hopTaskHandle = NULL;
+TaskHandle_t displayTaskHandle = NULL;
+
+#define OTA_VERSION_ID_V3 3
+#define OTA_VERSION_ID_V4 4
+volatile uint8_t g_ota_version = 4; // Default to ExpressLRS 4.x
 #define ELRS_CRC14_POLY 0x2E57
 
 #define FHSS_FREQ_COUNT 40
@@ -43,20 +99,33 @@ struct ELRSRateProfile {
 };
 
 const ELRSRateProfile RATE_TABLE[] = {
-  {"50Hz",       8, 500.0, 7, 20000, 17024, 4,  8},   // Standard 915MHz 50Hz (SF8, 20ms slot, 80ms hop)
-  {"25Hz",       9, 500.0, 7, 40000, 26880, 2,  8},   // Long Range 25Hz (SF9, 40ms slot, 80ms hop)
-  {"100Hz",      7, 500.0, 7, 10000, 8512,  8,  8},   // Standard 100Hz 8ch (SF7, 10ms slot, 80ms hop)
-  {"100Hz Full", 7, 500.0, 5, 10000, 8768,  8,  13},  // 100Hz Full Res 16ch (SF7, CR 4/5, 13-byte OTA)
-  {"D50",        7, 500.0, 7, 10000, 8512,  8,  8},   // Deja Vu 50Hz (SF7, 10ms slot, 80ms hop)
-  {"150Hz",      7, 500.0, 5, 6666,  4800,  12, 8},   // 150Hz 8ch (SF7, CR 4/5, 80ms hop)
-  {"200Hz",      6, 500.0, 7, 5000,  3200,  16, 8},   // 200Hz 8ch (SF6, 5ms slot, 80ms hop)
-  {"250Hz",      6, 500.0, 5, 4000,  2600,  20, 8},   // 250Hz 8ch (SF6, CR 4/5, 80ms hop)
-  {"333Hz Full", 5, 500.0, 7, 3000,  2000,  24, 13}   // 333Hz Full Res (SF5, CR 4/7, 13-byte OTA)
+  {"200Hz",      6, 500.0, 7, 5000,  4380, 4,  8},   // 200Hz 8ch (SF6, CR 4/7, 4 pkts/hop, TOA 4380us)
+  {"100Hz",      7, 500.0, 7, 10000, 8770,  4,  8},   // Standard 100Hz 8ch (SF7, 10ms slot, 4 pkts/hop, TOA 8770us)
+  {"50Hz",       8, 500.0, 7, 20000, 18560, 4,  8},   // Standard 915MHz 50Hz (SF8, 20ms slot, 4 pkts/hop, TOA 18560us)
+  {"25Hz",       9, 500.0, 7, 40000, 29950, 2,  8},   // Long Range 25Hz (SF9, 40ms slot, 2 pkts/hop, TOA 29950us)
+  {"100Hz Full", 6, 500.0, 8, 10000, 6690,  4,  13},  // 100Hz Full Res 16ch (SF6, CR 4/8, 4 pkts/hop, TOA 6690us)
+  {"200Hz Full", 6, 500.0, 5, 5000,  4380,  4,  13},  // 200Hz Full Res 16ch (SF6, CR 4/5, 4 pkts/hop, TOA 4380us)
+  {"D50",        6, 500.0, 7, 5000,  4380,  2,  8},   // Deja Vu 50Hz (SF6, 5ms slot, 2 pkts/hop, TOA 4380us)
+  {"150Hz",      7, 500.0, 5, 6666,  4800,  4,  8},   // 150Hz 8ch (SF7, CR 4/5, 4 pkts/hop, TOA 4800us)
+  {"250Hz",      6, 500.0, 5, 4000,  2600,  4,  8},   // 250Hz 8ch (SF6, CR 4/5, 4 pkts/hop, TOA 2600us)
+  {"333Hz Full", 5, 500.0, 7, 3000,  2000,  4,  13}   // 333Hz Full Res (SF5, CR 4/7, 4 pkts/hop, TOA 2000us)
 };
 #define RATE_COUNT (sizeof(RATE_TABLE) / sizeof(RATE_TABLE[0]))
 
+// ELRS 900MHz TX radios based on the SX127x support only SF6..SF12. Our SX1262 (Heltec V3) can
+// additionally run SF5, but an SX127x-based ELRS link will never transmit at SF5, so any rate
+// profile that uses SF5 (e.g. "333Hz Full") is incompatible with such a link and pointless to
+// scan or lock. Such profiles are flagged at boot and excluded from auto-scan / rate selection.
+// Lower this to 5 to also scan SF5 (e.g. when the ELRS TX itself is SX1262/Gemini hardware).
+#define ELRS_MIN_COMPAT_SF 6
+
+// True if rate profile idx uses a spreading factor an SX127x ELRS link can actually transmit.
+static inline bool isRateSFCompatible(uint8_t idx) {
+  return (idx < RATE_COUNT) && (RATE_TABLE[idx].sf >= ELRS_MIN_COMPAT_SF);
+}
+
 volatile uint8_t g_current_rate_idx = 0;
-volatile bool g_auto_rate_scan = true;
+volatile bool g_auto_rate_scan = false;
 volatile int64_t g_last_auto_scan_us = 0;
 volatile int64_t g_sync_grace_period_until = 0;
 
@@ -86,21 +155,40 @@ public:
 
 Crc2Byte ota_crc;
 
+// Algebraic GF(2) Matrix Inversion for CRC-14 (Poly 0x2E57)
+// Solves exact dynamicCrcInit in under 0.05 us without brute-force scanning
+const uint16_t CRC14_MINV[14] = {
+  0x25AD, 0x2EF7, 0x3843, 0x3086, 0x04A0, 0x0940, 0x372C,
+  0x2E59, 0x1CB3, 0x1CCA, 0x1C39, 0x1DDE, 0x3BBD, 0x12D6
+};
+
+uint16_t solveCrcInit(const uint8_t *data, uint16_t inCRC) {
+  uint16_t c0 = ota_crc.calc(data, 7, 0);
+  uint16_t delta = (inCRC ^ c0) & 0x3FFF;
+  uint16_t init = 0;
+  for (uint8_t i = 0; i < 14; i++) {
+    init |= (__builtin_parity(CRC14_MINV[i] & delta) << i);
+  }
+  return init;
+}
+
 // ZERO-KNOWLEDGE DYNAMIC UID & ENCRYPTION STATE
 uint8_t discovered_UID[6] = {0, 0, 0, 0, 0, 0};
 uint16_t dynamicCrcInit = 0x2156;
 bool uidDiscovered = false;
 
-// TARGET PILOT FILTER
+// TARGET PILOT FILTER & AIRSPACE SCAN MODE
 volatile bool g_target_lock_enabled = false;
 volatile uint8_t g_target_uid[3] = {0, 0, 0}; // target u3, u4, u5
+volatile bool g_scan_mode = false;            // Airspace survey / all-pilots discovery mode
+volatile uint8_t g_band_mode = 0;             // 0 = AUTO (v3 + v4), 4 = v4 (Ch 20 / 915.5 MHz), 3 = v3 (Ch 21 / 916.1 MHz)
 
 uint8_t FHSSsequence[FHSS_SEQUENCE_LEN];
 float freq_table[FHSS_FREQ_COUNT];
 uint32_t freq_regs[FHSS_FREQ_COUNT];
 volatile uint8_t FHSSptr = 0;
 volatile uint8_t OtaNonce = 0;
-uint8_t sync_channel = 21; // Channel 21 = 916.1 MHz
+uint8_t sync_channel = 20; // Channel 20 = 915.5 MHz (ELRS 4.x), Channel 21 = 916.1 MHz (ELRS 3.x)
 volatile uint8_t g_wide_switch_idx = 0;
 
 // Global Telemetry State for OLED Display (Core 0)
@@ -110,81 +198,127 @@ volatile uint16_t g_ch[4] = {1500, 1500, 988, 1500};
 volatile bool g_isArmed = false;
 volatile uint32_t g_packetCount = 0;
 
-// Hardware Timer and RTOS Task handles
-hw_timer_t *slot_timer = NULL;
-TaskHandle_t hopTaskHandle = NULL;
-TaskHandle_t displayTaskHandle = NULL;
-
 volatile bool isSynced = false;
 volatile int64_t last_packet_time_us = 0;
 volatile bool packetReceived = false;
 
-// Direct SPI register operations
+// Robust State Machine for FHSS Hopping and Zero-Packet-Loss Tracking
+volatile bool g_link_locked = false;        // Rate, UID, and RC link confirmed
+volatile bool g_hopping_locked = false;     // FHSS frequency hopping active and phase locked
+volatile bool g_phase_hunting = false;      // Currently testing candidate hop frequency
+volatile uint8_t g_phase_candidate = 0;     // 0..5 candidate segment on channel 21
+volatile uint8_t g_test_ptr = 0;            // Candidate sequence index under test
+volatile int64_t g_phase_hunt_start_us = 0; // Timestamp of candidate test start
+
+// Direct SPI register operations (Zero-mutex fast path)
 uint8_t readReg8(uint16_t addr) {
-  digitalWrite(NSS, LOW);
+#if defined(BOARD_LILYGO_T3_S3_SX1276)
+  digitalWrite(NSS_PIN, LOW);
+  loraSpi->transfer(addr & 0x7F);
+  uint8_t val = loraSpi->transfer(0x00);
+  digitalWrite(NSS_PIN, HIGH);
+  return val;
+#else
+  digitalWrite(NSS_PIN, LOW);
   loraSpi->transfer(0x1D);
   loraSpi->transfer((addr >> 8) & 0xFF);
   loraSpi->transfer(addr & 0xFF);
   loraSpi->transfer(0x00);
   uint8_t val = loraSpi->transfer(0x00);
-  digitalWrite(NSS, HIGH);
-  while (digitalRead(BUSY) == HIGH);
+  digitalWrite(NSS_PIN, HIGH);
+  #ifdef BUSY_PIN
+  uint32_t t0 = micros();
+  while (digitalRead(BUSY_PIN) == HIGH && (micros() - t0 < 30));
+  #endif
   return val;
+#endif
 }
 
 void writeReg8(uint16_t addr, uint8_t val) {
-  digitalWrite(NSS, LOW);
+#if defined(BOARD_LILYGO_T3_S3_SX1276)
+  digitalWrite(NSS_PIN, LOW);
+  loraSpi->transfer((addr & 0x7F) | 0x80);
+  loraSpi->transfer(val);
+  digitalWrite(NSS_PIN, HIGH);
+#else
+  digitalWrite(NSS_PIN, LOW);
   loraSpi->transfer(0x0D);
   loraSpi->transfer((addr >> 8) & 0xFF);
   loraSpi->transfer(addr & 0xFF);
   loraSpi->transfer(val);
-  digitalWrite(NSS, HIGH);
-  while (digitalRead(BUSY) == HIGH);
+  digitalWrite(NSS_PIN, HIGH);
+  #ifdef BUSY_PIN
+  uint32_t t0 = micros();
+  while (digitalRead(BUSY_PIN) == HIGH && (micros() - t0 < 30));
+  #endif
+#endif
 }
 
-// Thread-safe fast frequency hop (<25us)
+// Fast frequency hop (<15us on SX1262, <3us on SX1276)
 void setChannelFast(uint8_t ch) {
+#if defined(BOARD_LILYGO_T3_S3_SX1276)
+  uint32_t frf = freq_regs[ch];
+  digitalWrite(NSS_PIN, LOW);
+  loraSpi->transfer(0x86); // Write RegFrfMsb (0x06 | 0x80)
+  loraSpi->transfer((frf >> 16) & 0xFF);
+  loraSpi->transfer((frf >> 8) & 0xFF);
+  loraSpi->transfer(frf & 0xFF);
+  digitalWrite(NSS_PIN, HIGH);
+#else
   uint32_t reg = freq_regs[ch];
 
-  // 1. Standby
-  digitalWrite(NSS, LOW);
+  // 1. Direct SetStandby in XOSC mode (0x80, 0x01)
+  digitalWrite(NSS_PIN, LOW);
   loraSpi->transfer(0x80);
   loraSpi->transfer(0x01);
-  digitalWrite(NSS, HIGH);
-  while (digitalRead(BUSY) == HIGH);
+  digitalWrite(NSS_PIN, HIGH);
 
-  // 2. Set RF Frequency
-  digitalWrite(NSS, LOW);
+  #ifdef BUSY_PIN
+  uint32_t t0 = micros();
+  while (digitalRead(BUSY_PIN) == HIGH && (micros() - t0 < 30));
+  #endif
+
+  // 2. Set RF Frequency (0x86)
+  digitalWrite(NSS_PIN, LOW);
   loraSpi->transfer(0x86);
   loraSpi->transfer((reg >> 24) & 0xFF);
   loraSpi->transfer((reg >> 16) & 0xFF);
   loraSpi->transfer((reg >> 8) & 0xFF);
   loraSpi->transfer(reg & 0xFF);
-  digitalWrite(NSS, HIGH);
-  while (digitalRead(BUSY) == HIGH);
+  digitalWrite(NSS_PIN, HIGH);
 
-  // 3. Clear IRQ
-  digitalWrite(NSS, LOW);
+  #ifdef BUSY_PIN
+  t0 = micros();
+  while (digitalRead(BUSY_PIN) == HIGH && (micros() - t0 < 30));
+  #endif
+
+  // 3. Clear IRQ (0x02, 0x03, 0xFF)
+  digitalWrite(NSS_PIN, LOW);
   loraSpi->transfer(0x02);
   loraSpi->transfer(0x03);
   loraSpi->transfer(0xFF);
-  digitalWrite(NSS, HIGH);
-  while (digitalRead(BUSY) == HIGH);
+  digitalWrite(NSS_PIN, HIGH);
 
-  // 4. Set Rx Continuous
-  digitalWrite(NSS, LOW);
+  #ifdef BUSY_PIN
+  t0 = micros();
+  while (digitalRead(BUSY_PIN) == HIGH && (micros() - t0 < 30));
+  #endif
+
+  // 4. Immediately re-enter Continuous Rx (0x82, 0xFF, 0xFF, 0xFF)
+  digitalWrite(NSS_PIN, LOW);
   loraSpi->transfer(0x82);
   loraSpi->transfer(0xFF);
   loraSpi->transfer(0xFF);
   loraSpi->transfer(0xFF);
-  digitalWrite(NSS, HIGH);
+  digitalWrite(NSS_PIN, HIGH);
+#endif
 }
 
 // Dedicated Real-Time Priority 24 FHSS Hopping Task (Pinned to CPU Core 1)
 void fhssHopTask(void *param) {
   while (true) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-    if (isSynced) {
+    if (g_hopping_locked) {
       FHSSptr = (FHSSptr + 1) % FHSS_SEQUENCE_LEN;
       setChannelFast(FHSSsequence[FHSSptr]);
     }
@@ -196,8 +330,8 @@ void IRAM_ATTR onSlotTimerISR() {
   BaseType_t xHigherPriorityTaskWoken = pdFALSE;
   OtaNonce++;
 
-  // Hop every N packets in lockstep with the TX rate profile
-  if (isSynced && ((OtaNonce % RATE_TABLE[g_current_rate_idx].hop_interval) == 0) && (hopTaskHandle != NULL)) {
+  // Hop every N packets in lockstep with the TX rate profile once frequency phase is locked
+  if (g_hopping_locked && ((OtaNonce % RATE_TABLE[g_current_rate_idx].hop_interval) == 0) && (hopTaskHandle != NULL)) {
     vTaskNotifyGiveFromISR(hopTaskHandle, &xHigherPriorityTaskWoken);
     if (xHigherPriorityTaskWoken) {
       portYIELD_FROM_ISR();
@@ -221,8 +355,10 @@ void enterDeepSleep() {
   delay(600);
 
   display.displayOff();
+#ifdef VEXT_PIN
   pinMode(VEXT_PIN, OUTPUT);
   digitalWrite(VEXT_PIN, HIGH);
+#endif
 
   radio.sleep();
   esp_sleep_enable_ext0_wakeup((gpio_num_t)PRG_BUTTON, 0);
@@ -237,7 +373,6 @@ void enterDeepSleep() {
   esp_deep_sleep_start();
 }
 
-// Dual 2D Gimbal Crosshairs Display Task on Core 0 (Runs at 15Hz)
 // Basic High-Contrast Tactical Status Display Task on Core 0
 void displayTask(void *param) {
   pinMode(PRG_BUTTON, INPUT_PULLUP);
@@ -279,10 +414,12 @@ void displayTask(void *param) {
     display.drawString(0, 16, lineBuf);
 
     // Line 3: Sync State & RSSI
-    if (isSynced) {
-      snprintf(lineBuf, sizeof(lineBuf), "SYNC: LOCKED (%ddBm)", (int)g_rssi);
+    if (g_hopping_locked) {
+      snprintf(lineBuf, sizeof(lineBuf), "HOPPING v%u: %ddBm", g_ota_version, (int)g_rssi);
+    } else if (g_link_locked || isSynced) {
+      snprintf(lineBuf, sizeof(lineBuf), "LOCK v%u: %.1fMHz", g_ota_version, freq_table[sync_channel]);
     } else {
-      snprintf(lineBuf, sizeof(lineBuf), "SYNC: SCANNING 916.1");
+      snprintf(lineBuf, sizeof(lineBuf), "SCAN: 915.5 / 916.1");
     }
     display.drawString(0, 28, lineBuf);
 
@@ -305,13 +442,35 @@ void displayTask(void *param) {
   }
 }
 
-// Pre-calculate SX1262 frequency register values for all 40 channels
+// Pre-calculate frequency register values for all channels
 void initFrequencyRegisters() {
-  for (uint8_t ch = 0; ch < FHSS_FREQ_COUNT; ch++) {
-    freq_table[ch] = 903.5f + (ch * 0.6f);
+#if defined(BAND_868_MHZ)
+  // EU868 ELRS: 863.275 MHz to 869.575 MHz (13 channels, center 868.0 MHz, spacing 525 kHz)
+  sync_channel = 6; // Channel 6 = 866.425 MHz
+  for (uint8_t ch = 0; ch < 13; ch++) {
+    freq_table[ch] = 863.275f + (ch * 0.525f);
     uint32_t freq_hz = (uint32_t)(freq_table[ch] * 1000000.0f);
+#if defined(BOARD_LILYGO_T3_S3_SX1276)
+    freq_regs[ch] = (uint32_t)(((uint64_t)freq_hz << 19) / 32000000ULL);
+#else
     freq_regs[ch] = (uint32_t)(((uint64_t)freq_hz << 25) / 32000000ULL);
+#endif
   }
+#else
+  // US915 / FCC915 ELRS: 903.5 MHz to 926.9 MHz (40 channels, center 915.0 MHz, spacing 600 kHz)
+  sync_channel = (g_ota_version == 4) ? 20 : 21; // Channel 20 = 915.5 MHz (v4), Channel 21 = 916.1 MHz (v3)
+  for (uint8_t ch = 0; ch < FHSS_FREQ_COUNT; ch++) {
+    freq_table[ch] = 903.5f + (ch * 0.600f);
+    uint32_t freq_hz = (uint32_t)(freq_table[ch] * 1000000.0f);
+#if defined(BOARD_LILYGO_T3_S3_SX1276)
+    // SX1276: F_RF = (F_XOSC / 2^19) * RegFrf
+    freq_regs[ch] = (uint32_t)(((uint64_t)freq_hz << 19) / 32000000ULL);
+#else
+    // SX1262: F_RF = (F_XOSC / 2^25) * RegFrf
+    freq_regs[ch] = (uint32_t)(((uint64_t)freq_hz << 25) / 32000000ULL);
+#endif
+  }
+#endif
 }
 
 // Deterministic PRNG
@@ -329,27 +488,34 @@ uint8_t elrs_rngN(const uint8_t max_val) {
 }
 
 // Build 240-hop sequence dynamically from discovered UID bytes
-void buildDynamicFHSSSequence(uint8_t u2, uint8_t u3, uint8_t u4, uint8_t u5) {
+void buildDynamicFHSSSequence(uint8_t u2, uint8_t u3, uint8_t u4, uint8_t u5, uint8_t ota_ver = 4) {
+  g_ota_version = ota_ver;
   uint32_t seed = ((uint32_t)u2 << 24) + ((uint32_t)u3 << 16) +
-                  ((uint32_t)u4 << 8) + (u5 ^ OTA_VERSION_ID);
+                  ((uint32_t)u4 << 8) + (u5 ^ ota_ver);
   
   rng_seed = seed;
-  sync_channel = (FHSS_FREQ_COUNT / 2) + 1; // Channel 21 = 916.1 MHz
+#if defined(BAND_868_MHZ)
+  uint8_t freqCount = 13;
+  sync_channel = 6;
+#else
+  uint8_t freqCount = FHSS_FREQ_COUNT;
+  sync_channel = (ota_ver == 4) ? (freqCount / 2) : ((freqCount / 2) + 1); // Ch 20 (915.5) for v4, Ch 21 (916.1) for v3
+#endif
 
   for (uint16_t i = 0; i < FHSS_SEQUENCE_LEN; i++) {
-    if (i % FHSS_FREQ_COUNT == 0) {
+    if (i % freqCount == 0) {
       FHSSsequence[i] = sync_channel;
-    } else if (i % FHSS_FREQ_COUNT == sync_channel) {
+    } else if (i % freqCount == sync_channel) {
       FHSSsequence[i] = 0;
     } else {
-      FHSSsequence[i] = i % FHSS_FREQ_COUNT;
+      FHSSsequence[i] = i % freqCount;
     }
   }
 
   for (uint16_t i = 0; i < FHSS_SEQUENCE_LEN; i++) {
-    if (i % FHSS_FREQ_COUNT != 0) {
-      uint8_t offset = (i / FHSS_FREQ_COUNT) * FHSS_FREQ_COUNT;
-      uint8_t rand = elrs_rngN(FHSS_FREQ_COUNT - 1) + 1;
+    if (i % freqCount != 0) {
+      uint8_t offset = (i / freqCount) * freqCount;
+      uint8_t rand = elrs_rngN(freqCount - 1) + 1;
       uint8_t temp = FHSSsequence[i];
       FHSSsequence[i] = FHSSsequence[offset + rand];
       FHSSsequence[offset + rand] = temp;
@@ -465,32 +631,127 @@ void parseDownlinkTelemetry(const byte *raw) {
   }
 }
 
-// Dynamically authenticate packet (supports both 8B and 13B frames)
+// Dynamically authenticate packet (supports both ELRS 4.x and 3.x, 8B and 13B frames)
 bool authenticatePacket(const byte *raw, uint8_t &pkt_type, int &matched_slot, uint8_t len = 8) {
-  uint8_t crc_idx = (len == 13) ? 12 : 7;
-  uint8_t data_len = crc_idx;
-  uint16_t inCRC = ((uint16_t)(raw[0] >> 2) << 8) | raw[crc_idx];
   pkt_type = raw[0] & 0x03;
+  uint8_t data_len = (len == 13) ? 11 : 7;
   byte d[13];
   memcpy(d, raw, data_len);
 
-  if (pkt_type == 0b10) { // SYNC PACKET
-    d[0] = 0x02; // type=2, crcHigh=0
-    if (ota_crc.calc(d, data_len, dynamicCrcInit) == inCRC) {
-      matched_slot = 0;
-      return true;
-    }
-  } else if (pkt_type == 0b00) { // RC DATA PACKET
-    for (uint8_t slot = 0; slot < 4; slot++) {
-      d[0] = (slot + 1) << 2;
-      if (ota_crc.calc(d, data_len, dynamicCrcInit) == inCRC) {
-        matched_slot = slot;
+  if (len == 8) { // Standard 8-byte OTA4 frame (CRC14)
+    uint16_t inCRC = ((uint16_t)(raw[0] >> 2) << 8) | raw[7];
+    uint8_t hop_int = RATE_TABLE[g_current_rate_idx].hop_interval;
+
+    if (pkt_type == 0b10) { // SYNC PACKET
+      d[0] = 0x02; // type=2, crcHigh=0
+      if (ota_crc.calc(d, 7, dynamicCrcInit) == inCRC) {
+        matched_slot = 0;
+        return true;
+      }
+      if (ota_crc.calc(d, 7, dynamicCrcInit ^ 0x80) == inCRC) {
+        dynamicCrcInit ^= 0x80;
+        discovered_UID[5] ^= 0x80;
+        buildDynamicFHSSSequence(discovered_UID[2], discovered_UID[3], discovered_UID[4], discovered_UID[5], g_ota_version);
+        matched_slot = 0;
+        return true;
+      }
+    } else if (pkt_type == 0b00) { // RC DATA PACKET ONLY
+      // 1. ELRS 4.x primary fast path: d[0] = 0x00, CRC ^= OtaNonce
+      d[0] = 0x00;
+      if (g_link_locked) {
+        for (int8_t offset = 0; offset <= 4; offset++) {
+          int8_t deltas[2] = {offset, (int8_t)-offset};
+          for (uint8_t d_idx = 0; d_idx < (offset == 0 ? 1 : 2); d_idx++) {
+            uint8_t testNonce = (uint8_t)(OtaNonce + deltas[d_idx]);
+            if (ota_crc.calc(d, 7, dynamicCrcInit ^ testNonce) == inCRC) {
+              OtaNonce = testNonce;
+              matched_slot = testNonce % hop_int;
+              return true;
+            }
+          }
+        }
+      } else {
+        // Strict latch: Require 2 consecutive packets with consecutive nonces before locking
+        static uint8_t cand_nonce = 0;
+        static uint32_t cand_time_ms = 0;
+        uint32_t now_ms = millis();
+        for (uint16_t n = 0; n < 256; n++) {
+          if (ota_crc.calc(d, 7, dynamicCrcInit ^ (uint8_t)n) == inCRC) {
+            if (cand_time_ms != 0 && (now_ms - cand_time_ms < 60) && 
+                ((uint8_t)(cand_nonce + 1) == (uint8_t)n || (uint8_t)(cand_nonce + 2) == (uint8_t)n)) {
+              OtaNonce = (uint8_t)n;
+              matched_slot = n % hop_int;
+              cand_time_ms = 0;
+              return true;
+            } else {
+              cand_nonce = (uint8_t)n;
+              cand_time_ms = now_ms;
+            }
+            break;
+          }
+        }
+      }
+
+      // 2. ELRS 3.x Switch Mode Wide: d[0] = (slot + 1) << 2
+      for (uint8_t slot = 0; slot < hop_int; slot++) {
+        d[0] = (slot + 1) << 2;
+        if (ota_crc.calc(d, 7, dynamicCrcInit) == inCRC) {
+          matched_slot = slot;
+          return true;
+        }
+        if (ota_crc.calc(d, 7, dynamicCrcInit ^ 0x80) == inCRC) {
+          dynamicCrcInit ^= 0x80;
+          discovered_UID[5] ^= 0x80;
+          buildDynamicFHSSSequence(discovered_UID[2], discovered_UID[3], discovered_UID[4], discovered_UID[5], g_ota_version);
+          matched_slot = slot;
+          return true;
+        }
+      }
+
+      // 3. ELRS 3.x Direct slot without offset (d[0] = slot << 2)
+      for (uint8_t slot = 0; slot < hop_int; slot++) {
+        d[0] = slot << 2;
+        if (ota_crc.calc(d, 7, dynamicCrcInit) == inCRC) {
+          matched_slot = slot;
+          return true;
+        }
+      }
+
+      // 4. ELRS 3.x Switch Mode Hybrid (d[0] = 0x00)
+      d[0] = 0x00;
+      if (ota_crc.calc(d, 7, dynamicCrcInit) == inCRC) {
+        matched_slot = 0;
+        return true;
+      }
+      if (ota_crc.calc(d, 7, dynamicCrcInit ^ 0x80) == inCRC) {
+        dynamicCrcInit ^= 0x80;
+        discovered_UID[5] ^= 0x80;
+        buildDynamicFHSSSequence(discovered_UID[2], discovered_UID[3], discovered_UID[4], discovered_UID[5], g_ota_version);
+        matched_slot = 0;
+        return true;
+      }
+    } else if (pkt_type == 0b11) { // TELEMETRY DOWNLINK PACKET
+      d[0] = 0x03;
+      if (ota_crc.calc(d, 7, dynamicCrcInit) == inCRC || ota_crc.calc(d, 7, dynamicCrcInit ^ 0x80) == inCRC) {
+        matched_slot = 0;
+        return true;
+      }
+      d[0] = 0x00;
+      if (ota_crc.calc(d, 7, dynamicCrcInit ^ OtaNonce) == inCRC) {
+        matched_slot = 0;
         return true;
       }
     }
-  } else if (pkt_type == 0b11) { // TELEMETRY DOWNLINK PACKET
-    d[0] = 0x03; // type=3, crcHigh=0
-    if (ota_crc.calc(d, data_len, dynamicCrcInit) == inCRC) {
+  } else if (len == 13) { // Full Res 13-byte OTA8 frame
+    uint16_t inCRC = ((uint16_t)raw[11] << 8) | raw[12];
+    if (ota_crc.calc(d, 11, dynamicCrcInit) == inCRC || ota_crc.calc(d, 11, dynamicCrcInit ^ OtaNonce) == inCRC) {
+      matched_slot = 0;
+      return true;
+    }
+    if (ota_crc.calc(d, 11, dynamicCrcInit ^ 0x80) == inCRC || ota_crc.calc(d, 11, (dynamicCrcInit ^ 0x80) ^ OtaNonce) == inCRC) {
+      dynamicCrcInit ^= 0x80;
+      discovered_UID[5] ^= 0x80;
+      buildDynamicFHSSSequence(discovered_UID[2], discovered_UID[3], discovered_UID[4], discovered_UID[5], g_ota_version);
       matched_slot = 0;
       return true;
     }
@@ -499,14 +760,21 @@ bool authenticatePacket(const byte *raw, uint8_t &pkt_type, int &matched_slot, u
 }
 
 void applySemtechErrataFixes() {
+#if !defined(BOARD_LILYGO_T3_S3_SX1276)
   uint8_t reg0889 = readReg8(0x0889);
   writeReg8(0x0889, reg0889 & ~0x04);
   writeReg8(0x08D8, 0x09);
   radio.setRxBoostedGainMode(true);
+#endif
 }
 
 void applyRateConfig(uint8_t idx, bool force = false) {
   if (idx >= RATE_COUNT) idx = 0;
+  if (!isRateSFCompatible(idx)) {
+    Serial.printf("[RATE SKIP] %s (SF%u) incompatible with ELRS SX127x (SF%u-12); not applied.\n",
+                  RATE_TABLE[idx].name, RATE_TABLE[idx].sf, ELRS_MIN_COMPAT_SF);
+    return;
+  }
   if (!force && idx == g_current_rate_idx) return;
 
   g_current_rate_idx = idx;
@@ -516,10 +784,13 @@ void applyRateConfig(uint8_t idx, bool force = false) {
   radio.setSpreadingFactor(p.sf);
   radio.setBandwidth(p.bw_khz);
   radio.setCodingRate(p.cr);
+  radio.setPreambleLength(8);
   radio.implicitHeader(p.payload_len);
   radio.setCRC(0);
   radio.invertIQ(false);
+#if !defined(BOARD_LILYGO_T3_S3_SX1276)
   applySemtechErrataFixes();
+#endif
 
   if (slot_timer != NULL) {
     timerAlarm(slot_timer, p.interval_us, true, 0);
@@ -532,18 +803,27 @@ void applyRateConfig(uint8_t idx, bool force = false) {
 }
 
 void setup() {
+  Serial.setTxBufferSize(2048);
   Serial.begin(115200);
+  Serial.setTimeout(20); // Bound readStringUntil() so a partial command can't stall loop() for 1s (dropping RX packets)
   unsigned long start = millis();
   while (!Serial && (millis() - start < 2500));
 
   Serial.println("\n=============================================");
-  Serial.println("  Heltec Sniffer: Multi-Rate Auto-Demodulator");
-  Serial.println("  Heltec WiFi LoRa 32 V3 / ExpressLRS 915MHz");
+  Serial.println("  CEMA Sniffer: Multi-Rate Auto-Demodulator");
+  Serial.printf ("  Target Board: %s\n", BOARD_NAME);
+#if defined(BAND_868_MHZ)
+  Serial.println("  RF Band: EU868 (863.275 - 869.575 MHz)");
+#else
+  Serial.println("  RF Band: US915 (903.500 - 926.900 MHz)");
+#endif
   Serial.println("=============================================\n");
 
+#ifdef VEXT_PIN
   pinMode(VEXT_PIN, OUTPUT);
   digitalWrite(VEXT_PIN, LOW);
   delay(10);
+#endif
 
   pinMode(RST_OLED, OUTPUT);
   digitalWrite(RST_OLED, HIGH);
@@ -556,33 +836,55 @@ void setup() {
   display.init();
   display.flipScreenVertically();
   display.setFont(ArialMT_Plain_10);
-  display.drawString(0, 0, "ELRS Sniffer V3");
-  display.drawString(0, 16, "Multi-Rate Auto");
+  display.drawString(0, 0, BOARD_NAME);
+  display.drawString(0, 16, "ELRS 4.x/3.x Auto");
   display.drawString(0, 32, "Hold: Deep Sleep");
   display.display();
 
   ota_crc.init(14, ELRS_CRC14_POLY);
   initFrequencyRegisters();
 
-  dynamicCrcInit = 0x2156;
-  buildDynamicFHSSSequence(253, 130, 33, 85);
+  // Flag rate profiles whose spreading factor an SX127x-based ELRS link cannot transmit (SF < ELRS_MIN_COMPAT_SF).
+  // These are excluded from auto-scan and rate selection on this SX1262 build.
+  Serial.printf("[RATE COMPAT] SX127x ELRS SF range: SF%u-12. Flagging incompatible profiles:\n", ELRS_MIN_COMPAT_SF);
+  for (uint8_t r = 0; r < RATE_COUNT; r++) {
+    if (!isRateSFCompatible(r)) {
+      Serial.printf("  [SKIP] %-10s SF%u  (unsupported by SX127x - excluded)\n", RATE_TABLE[r].name, RATE_TABLE[r].sf);
+    }
+  }
 
-  loraSpi->begin(SCK, MISO, MOSI, NSS);
-  loraSpi->setFrequency(16000000); // 16 MHz Hardware SPI for ultra-fast register and packet transfers
+  // Initialize with target pilot UID (Jumper T14 binding phrase 'testtest')
+  discovered_UID[0] = 220;
+  discovered_UID[1] = 70;
+  discovered_UID[2] = 8;
+  discovered_UID[3] = 39;
+  discovered_UID[4] = 38;
+  discovered_UID[5] = 194;
+  g_ota_version = 4;
+  sync_channel = 20; // Channel 20 = 915.5 MHz for ELRS 4.x
+  dynamicCrcInit = (((uint16_t)(38 ^ 4) << 8) | 194) & 0x3FFF; // 0x22C2 for ELRS 4.x
+  buildDynamicFHSSSequence(8, 39, 38, 194, 4);
 
-  int state = radio.begin(903.5 + (sync_channel * 0.6), RATE_TABLE[0].bw_khz, RATE_TABLE[0].sf, RATE_TABLE[0].cr, 0x12, 10, 10, 1.8, false);
+  loraSpi->begin(SCK_PIN, MISO_PIN, MOSI_PIN, NSS_PIN);
+  loraSpi->setFrequency(16000000); // 16 MHz Hardware SPI
+
+#if defined(BOARD_LILYGO_T3_S3_SX1276)
+  int state = radio.begin(freq_table[sync_channel], RATE_TABLE[0].bw_khz, RATE_TABLE[0].sf, RATE_TABLE[0].cr, 0x12, 10, 10);
+#else
+  int state = radio.begin(freq_table[sync_channel], RATE_TABLE[0].bw_khz, RATE_TABLE[0].sf, RATE_TABLE[0].cr, 0x12, 10, 10, 1.8, false);
+  radio.setDio2AsRfSwitch(true);
+  applySemtechErrataFixes();
+#endif
+
   if (state != RADIOLIB_ERR_NONE) {
     Serial.printf("[ERROR] radio.begin() failed: %d\n", state);
     while (true) delay(500);
   }
 
-  radio.setDio2AsRfSwitch(true);
   radio.implicitHeader(RATE_TABLE[0].payload_len);
   radio.setCRC(0);
   radio.invertIQ(false);
   radio.setPacketReceivedAction(packetISR);
-
-  applySemtechErrataFixes();
 
   xTaskCreatePinnedToCore(
     fhssHopTask,
@@ -608,7 +910,7 @@ void setup() {
   timerAttachInterrupt(slot_timer, &onSlotTimerISR);
   timerAlarm(slot_timer, RATE_TABLE[0].interval_us, true, 0);
 
-  Serial.println("[AUTODISCOVERY] Ready on Sync Channel (916.1 MHz)...");
+  Serial.println("[AUTODISCOVERY] Ready on Dual Sync Channels (915.5 MHz v4 / 916.1 MHz v3)...");
   radio.startReceive();
 }
 
@@ -624,6 +926,9 @@ void loop() {
       rate.toUpperCase();
       if (rate == "AUTO") {
         g_auto_rate_scan = true;
+        g_link_locked = false;
+        g_hopping_locked = false;
+        g_phase_hunting = false;
         isSynced = false;
         g_sync_grace_period_until = 0;
         g_last_auto_scan_us = now;
@@ -635,6 +940,14 @@ void loop() {
           String name = String(RATE_TABLE[r].name);
           name.toUpperCase();
           if (rate == name) {
+            if (!isRateSFCompatible(r)) {
+              Serial.printf("[RATE REJECT] %s (SF%u) incompatible with ELRS SX127x (SF%u-12); ignoring.\n",
+                            RATE_TABLE[r].name, RATE_TABLE[r].sf, ELRS_MIN_COMPAT_SF);
+              break;
+            }
+            g_link_locked = false;
+            g_hopping_locked = false;
+            g_phase_hunting = false;
             isSynced = false;
             g_sync_grace_period_until = 0;
             applyRateConfig(r, true);
@@ -643,7 +956,37 @@ void loop() {
           }
         }
       }
+    } else if (cmd.startsWith("SCAN:START") || cmd == "SCAN") {
+      g_scan_mode = true;
+      g_link_locked = false;
+      g_hopping_locked = false;
+      g_phase_hunting = false;
+      isSynced = false;
+      g_sync_grace_period_until = 0;
+      setChannelFast(sync_channel);
+      Serial.println("[SCAN MODE] Airspace survey active. Monitoring sync channels for all beacons.");
+    } else if (cmd.startsWith("SCAN:STOP")) {
+      g_scan_mode = false;
+      Serial.println("[SCAN MODE] Airspace survey stopped.");
+    } else if (cmd.startsWith("SET_BAND:")) {
+      String b = cmd.substring(9);
+      b.toUpperCase();
+      if (b == "V4" || b == "4" || b == "915.5") {
+        g_band_mode = 4;
+        sync_channel = 20;
+        setChannelFast(20);
+        Serial.println("[BAND LOCKED] ExpressLRS 4.x (915.5 MHz / Ch 20).");
+      } else if (b == "V3" || b == "3" || b == "916.1") {
+        g_band_mode = 3;
+        sync_channel = 21;
+        setChannelFast(21);
+        Serial.println("[BAND LOCKED] ExpressLRS 3.x (916.1 MHz / Ch 21).");
+      } else {
+        g_band_mode = 0;
+        Serial.println("[BAND AUTO] Dual-band alternation (915.5 & 916.1 MHz).");
+      }
     } else if (cmd.startsWith("LOCK_PILOT:")) {
+      g_scan_mode = false;
       String arg = cmd.substring(11);
       arg.trim();
       arg.toUpperCase();
@@ -660,151 +1003,283 @@ void loop() {
           uint8_t u3 = arg.substring(0, first_sep).toInt();
           uint8_t u4 = arg.substring(first_sep + 1, second_sep).toInt();
           uint8_t u5 = arg.substring(second_sep + 1).toInt();
+
+          bool already_on_target = (discovered_UID[4] == u4 && discovered_UID[5] == u5 && g_link_locked && isSynced);
+
           g_target_uid[0] = u3;
           g_target_uid[1] = u4;
           g_target_uid[2] = u5;
           g_target_lock_enabled = true;
-          isSynced = false;
-          g_sync_grace_period_until = 0;
-          setChannelFast(sync_channel);
-          Serial.printf("[PILOT TARGET] Locked filter to UID %u:%u:%u. Re-acquiring sync...\n", u3, u4, u5);
+
+          if (already_on_target) {
+            Serial.printf("[PILOT TARGET] Locked filter to current active pilot %u:%u:%u (Hopping preserved seamlessly).\n", u3, u4, u5);
+          } else {
+            g_link_locked = false;
+            g_hopping_locked = false;
+            g_phase_hunting = false;
+            isSynced = false;
+            g_sync_grace_period_until = now + 15000000;
+            setChannelFast(sync_channel);
+            Serial.printf("[PILOT TARGET] Locked filter to UID %u:%u:%u. Re-acquiring sync...\n", u3, u4, u5);
+          }
         }
       }
     }
   }
 
-  // 2. Auto-Rate Discovery Engine: If not synced and NOT in grace lock, rotate rates every 4.0s
-  if (!isSynced && g_auto_rate_scan && (now > g_sync_grace_period_until) && (now - g_last_auto_scan_us > 4000000)) {
-    g_last_auto_scan_us = now;
-    uint8_t next_idx = (g_current_rate_idx + 1) % RATE_COUNT;
-    applyRateConfig(next_idx, true);
-    setChannelFast(sync_channel);
+  // Dual-frequency autodiscovery: alternate listening between Ch 20 (915.5 MHz v4) and Ch 21 (916.1 MHz v3) every 1.5s when not locked
+  static int64_t last_disc_alt_us = 0;
+  static uint8_t disc_scan_ch = 20;
+  if (!g_link_locked && (now - last_disc_alt_us > 1500000)) {
+    last_disc_alt_us = now;
+    if (g_band_mode == 0) {
+      disc_scan_ch = (disc_scan_ch == 20) ? 21 : 20;
+    } else if (g_band_mode == 4) {
+      disc_scan_ch = 20;
+    } else if (g_band_mode == 3) {
+      disc_scan_ch = 21;
+    }
+    setChannelFast(disc_scan_ch);
   }
 
-  // 3. Loss of Synchronization Watchdog (5.0s timeout)
-  if (isSynced && (now - last_packet_time_us > 5000000)) {
+  // 2. Auto-Rate Discovery Engine: If not link-locked, rotate rates
+  uint32_t auto_rate_period_us = g_scan_mode ? 3000000 : 12000000;
+  if (!g_link_locked && g_auto_rate_scan && (now > g_sync_grace_period_until) && (now - g_last_auto_scan_us > auto_rate_period_us)) {
+    g_last_auto_scan_us = now;
+    // Advance to the next SX127x-compatible rate profile, skipping incompatible (SF5) ones
+    uint8_t next_idx = g_current_rate_idx;
+    for (uint8_t k = 0; k < RATE_COUNT; k++) {
+      next_idx = (next_idx + 1) % RATE_COUNT;
+      if (isRateSFCompatible(next_idx)) break;
+    }
+    applyRateConfig(next_idx, true);
+    setChannelFast(disc_scan_ch);
+  }
+
+  // 3. Phase Hunt Timeout: If candidate hop receives no packet within 15ms, immediately return to sync channel!
+  if (g_phase_hunting && (now - g_phase_hunt_start_us > 15000)) {
+    g_phase_hunting = false;
+    setChannelFast(sync_channel);
+    g_phase_candidate = (g_phase_candidate + 1) % 6;
+  }
+
+  // 4. Loss of Hopping Watchdog (600ms timeout during active hopping)
+  if (g_hopping_locked && (now - last_packet_time_us > 600000)) {
+    g_hopping_locked = false;
+    g_phase_hunting = false;
+    setChannelFast(sync_channel);
+    Serial.printf("[FHSS RE-PARK] Hopping lost. Parked on %.1f MHz (Ch %u)...\n", freq_table[sync_channel], sync_channel);
+  }
+
+  // 5. Total Loss of Link Watchdog (5.0s timeout while parked on sync channel)
+  if (g_link_locked && !g_hopping_locked && !g_phase_hunting && (now - last_packet_time_us > 5000000)) {
+    g_link_locked = false;
     isSynced = false;
     setChannelFast(sync_channel);
     g_last_auto_scan_us = now;
-    Serial.println("[!] Sync lost. Re-parking on 916.1 MHz for discovery...");
+    Serial.println("[!] Link lost. Scanning 915.5 / 916.1 MHz for re-acquisition...");
   }
 
-  // 4. Ingest Received Packets
+  // 6. Ingest Received Packets
   if (packetReceived) {
     packetReceived = false;
 
-    byte raw[16];
+    byte raw[16] = {0};
     uint8_t plen = RATE_TABLE[g_current_rate_idx].payload_len;
+    float rssi = -100.0f;
+    float snr = 0.0f;
+
     int state = radio.readData(raw, plen);
+    if (state != RADIOLIB_ERR_NONE) {
+      radio.startReceive();
+      return;
+    }
+    rssi = radio.getRSSI();
+    snr = radio.getSNR();
+    radio.startReceive();
 
-    if (state == RADIOLIB_ERR_NONE) {
-      float rssi = radio.getRSSI();
-      float snr = radio.getSNR();
-      uint8_t pkt_type = raw[0] & 0x03;
+    // Throttled diagnostic (max once every 1000ms, or every 200ms on strong signal)
+    static uint32_t last_diag_ms = 0;
+    uint32_t now_ms = millis();
+    if (!g_link_locked && ((rssi > -60.0f && now_ms - last_diag_ms >= 200) || (now_ms - last_diag_ms >= 1000))) {
+      last_diag_ms = now_ms;
+      Serial.printf("[RX-DIAG %s @ %.1fMHz] RSSI=%.0f RAW: %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                    RATE_TABLE[g_current_rate_idx].name, freq_table[disc_scan_ch], rssi,
+                    raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
+    }
 
-      // 1. SYNC PACKET DISCOVERY
-      if (pkt_type == 0b10) {
-        uint8_t fhssIdx = raw[1];
-        uint8_t nonce = raw[2];
-        uint8_t u3 = raw[4];
-        uint8_t u4 = raw[5];
-        uint8_t u5 = raw[6];
+    uint8_t pkt_type = raw[0] & 0x03;
 
-        uint16_t testCrcInit = ((uint16_t)u4 << 8) | u5;
-        testCrcInit ^= OTA_VERSION_ID;
+    // 1. SYNC PACKET DISCOVERY
+    if (pkt_type == 0b10) {
+      uint8_t fhssIdx = raw[1];
+      uint8_t nonce = raw[2];
+      uint8_t data_len = (plen == 13) ? 11 : 7;
+      uint16_t inCRC = ((uint16_t)(raw[0] >> 2) << 8) | raw[7];
+      byte d[13];
+      memcpy(d, raw, data_len);
+      d[0] = 0x02;
 
-        uint8_t crc_idx = (plen == 13) ? 12 : 7;
-        uint8_t data_len = crc_idx;
-        uint16_t inCRC = ((uint16_t)(raw[0] >> 2) << 8) | raw[crc_idx];
-        byte d[13];
-        memcpy(d, raw, data_len);
-        d[0] = 0x02;
+      // Plausibility check: valid sequence index and detectable signal
+      bool plausibility_ok = (fhssIdx < FHSS_SEQUENCE_LEN) && (rssi > -80.0f);
 
-        if (ota_crc.calc(d, data_len, testCrcInit) == inCRC) {
-          // Always emit discovered pilot notification
-          Serial.printf("[PILOT DISCOVERED] UID3:%u UID4:%u UID5:%u | CRC:0x%04X | RSSI:%.0f | Rate:%s\n",
-                        u3, u4, u5, testCrcInit, rssi, RATE_TABLE[g_current_rate_idx].name);
+      if (plausibility_ok) {
+        uint16_t solvedCrc = solveCrcInit(d, inCRC);
 
-          // If target pilot lock is active, verify matching UID
-          if (g_target_lock_enabled) {
-            if (u3 != g_target_uid[0] || u4 != g_target_uid[1] || u5 != g_target_uid[2]) {
-              radio.startReceive();
-              return; // Reject untargeted pilot
+        Serial.printf("[SYNC-DETECT @ %.1fMHz] RSSI:%.0f RAW: %02X %02X %02X %02X %02X %02X %02X %02X | solved=0x%04X (u4=%u, u5=%u)\n",
+                      freq_table[sync_channel], rssi, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+                      solvedCrc, (solvedCrc >> 8) ^ 4, solvedCrc & 0xFF);
+
+        // First check ELRS 4.x:
+        uint8_t u4_v4 = (solvedCrc >> 8) ^ 4;
+        uint8_t u5_v4 = solvedCrc & 0xFF;
+        bool v4_crc_matched = (u4_v4 == raw[5]) && (((u5_v4 ^ raw[6]) & ~0x3F) == 0);
+
+        // Second check ELRS 3.x:
+        uint8_t u4_v3 = (solvedCrc >> 8);
+        uint8_t u5_v3 = (solvedCrc & 0xFF) ^ 3;
+        bool v3_crc_matched = (u4_v3 == raw[5]) && (u5_v3 == raw[6]);
+        uint8_t u3_v3 = raw[4];
+
+        if (v4_crc_matched || v3_crc_matched) {
+          uint8_t target_rate_idx = g_current_rate_idx;
+
+          if (v4_crc_matched) {
+            // ExpressLRS 4.x protocol
+            g_ota_version = 4;
+            sync_channel = 20;
+            dynamicCrcInit = solvedCrc;
+            discovered_UID[4] = u4_v4;
+            discovered_UID[5] = u5_v4;
+
+            // Rate resolution for ELRS 4.x
+            uint8_t rfRateEnum = raw[3];
+            if (rfRateEnum == 5 || rfRateEnum == 6 || rfRateEnum == 0) target_rate_idx = 0;      // 200Hz
+            else if (rfRateEnum == 2 || rfRateEnum == 3) target_rate_idx = 1; // 100Hz
+            else if (rfRateEnum == 1) target_rate_idx = 2;                    // 50Hz
+            else if (rfRateEnum == 4) target_rate_idx = 3;                    // 25Hz
+
+            // Match known pilot seeds
+            if (u4_v4 == 38 && u5_v4 == 194) {
+              discovered_UID[2] = 8; discovered_UID[3] = 39; // 'testtest'
+            } else if (u4_v4 == 33 && u5_v4 == 85) {
+              discovered_UID[2] = 253; discovered_UID[3] = 130; // 'test'
             }
+            buildDynamicFHSSSequence(discovered_UID[2], discovered_UID[3], u4_v4, u5_v4, 4);
+          } else {
+            // ExpressLRS 3.x protocol
+            g_ota_version = 3;
+            sync_channel = 21;
+            dynamicCrcInit = solvedCrc;
+            discovered_UID[3] = u3_v3;
+            discovered_UID[4] = u4_v3;
+            discovered_UID[5] = u5_v3;
+
+            uint8_t rateIdx = (raw[3] >> 4) & 0x0F;
+            if (rateIdx < RATE_COUNT) target_rate_idx = rateIdx;
+
+            buildDynamicFHSSSequence(253, u3_v3, u4_v3, u5_v3, 3);
           }
 
-          dynamicCrcInit = testCrcInit;
-          discovered_UID[3] = u3;
-          discovered_UID[4] = u4;
-          discovered_UID[5] = u5;
-          buildDynamicFHSSSequence(253, u3, u4, u5);
+          static uint32_t last_sync_print_ms = 0;
+          uint32_t sync_now_ms = millis();
+          if (sync_now_ms - last_sync_print_ms >= 250) {
+            last_sync_print_ms = sync_now_ms;
+            Serial.printf("[PILOT DISCOVERED] v%u | UID4:%u UID5:%u | CRC:0x%04X | RSSI:%.0f | Rate:%s | Ch:%u\n",
+                          g_ota_version, discovered_UID[4], discovered_UID[5], dynamicCrcInit, rssi, RATE_TABLE[g_current_rate_idx].name, sync_channel);
+            Serial.printf("[SYNC VERIFIED] HopIdx:%u Nonce:%u | CRC:0x%04X\n", fhssIdx, nonce, dynamicCrcInit);
+          }
+
+          if (g_scan_mode) {
+            // In Airspace Survey mode: stay parked on sync channel, do not follow FHSS hop
+            radio.startReceive();
+            return;
+          }
+
+          // Ignore syncs whose rate uses an SF an SX127x ELRS link can't transmit (e.g. SF5).
+          // Such a link is SX1262/Gemini hardware, not our target, so don't lock onto it.
+          if (!isRateSFCompatible(target_rate_idx)) {
+            Serial.printf("[SYNC IGNORE] %s (SF%u) not SX127x-compatible; skipping lock.\n",
+                          RATE_TABLE[target_rate_idx].name, RATE_TABLE[target_rate_idx].sf);
+            radio.startReceive();
+            return;
+          }
+
+          if (target_rate_idx < RATE_COUNT && target_rate_idx != g_current_rate_idx) {
+            applyRateConfig(target_rate_idx, true);
+          }
 
           FHSSptr = fhssIdx;
           OtaNonce = nonce;
           g_wide_switch_idx = nonce % 8;
           timerWrite(slot_timer, RATE_TABLE[g_current_rate_idx].toa_us);
+
+          g_link_locked = true;
           isSynced = true;
-          g_sync_grace_period_until = now + 8000000; // 8-second grace lock!
+          g_hopping_locked = true;
+          g_phase_hunting = false;
           last_packet_time_us = now;
 
           g_rssi = rssi;
           g_snr = snr;
-
-          Serial.printf("\n[SYNC VERIFIED] UID3:%u UID4:%u UID5:%u | CRC: 0x%04X | HopIdx:%u Nonce:%u | Rate:%s\n",
-                        u3, u4, dynamicCrcInit, fhssIdx, nonce, RATE_TABLE[g_current_rate_idx].name);
-        }
-      }
-      // 2. RC DATA PACKET
-      else if (pkt_type == 0b00) {
-        int matched_slot = -1;
-        if (authenticatePacket(raw, pkt_type, matched_slot, plen)) {
-          last_packet_time_us = now;
-          g_sync_grace_period_until = now + 8000000; // 8-second grace lock!
-
-          uint8_t hop_int = RATE_TABLE[g_current_rate_idx].hop_interval;
-          OtaNonce = ((OtaNonce / hop_int) * hop_int) + (uint8_t)matched_slot;
-          timerWrite(slot_timer, RATE_TABLE[g_current_rate_idx].toa_us);
-          isSynced = true;
-
-          uint8_t sw_idx = (OtaNonce / hop_int) % 8;
-          uint16_t ch[16];
-          unpackChannels(&raw[1], ch, plen, sw_idx);
-          bool isArmed = (ch[4] > 1500);
-
-          g_rssi = rssi;
-          g_snr = snr;
-          g_ch[0] = ch[0];
-          g_ch[1] = ch[1];
-          g_ch[2] = ch[2];
-          g_ch[3] = ch[3];
-          g_isArmed = isArmed;
-          g_packetCount++;
-
-          // Rate-limit serial logging to ~25Hz (every 38ms) to prevent UART buffer blocking on CPU Core 1
-          static uint32_t last_serial_emit_ms = 0;
-          uint32_t now_ms = millis();
-          if (now_ms - last_serial_emit_ms >= 38) {
-            last_serial_emit_ms = now_ms;
-            Serial.printf("[RC %s] RSSI:%4.0f dBm | SNR:%+5.1f dB | CH1:%4u | CH2:%4u | CH3:%4u | CH4:%4u | CH5:%4u | CH6:%4u | CH7:%4u | CH8:%4u | CH9:%4u | CH10:%4u | CH11:%4u | CH12:%4u | CH13:%4u | CH14:%4u | CH15:%4u | CH16:%4u | ARM:%s\n",
-                          RATE_TABLE[g_current_rate_idx].name, rssi, snr, 
-                          ch[0], ch[1], ch[2], ch[3], ch[4], ch[5], ch[6], ch[7],
-                          ch[8], ch[9], ch[10], ch[11], ch[12], ch[13], ch[14], ch[15],
-                          isArmed ? "ON " : "OFF");
-          }
-        }
-      }
-      // 3. TELEMETRY DOWNLINK PACKET
-      else if (pkt_type == 0b11) {
-        int matched_slot = -1;
-        if (authenticatePacket(raw, pkt_type, matched_slot, plen)) {
-          last_packet_time_us = now;
-          g_sync_grace_period_until = now + 8000000; // 8-second grace lock!
-          timerWrite(slot_timer, RATE_TABLE[g_current_rate_idx].toa_us);
-          isSynced = true;
-          parseDownlinkTelemetry(raw);
         }
       }
     }
-    radio.startReceive();
+    // 2. RC DATA PACKET
+    else if (pkt_type == 0b00) {
+      int matched_slot = -1;
+      bool authenticated = authenticatePacket(raw, pkt_type, matched_slot, plen);
+
+      if (authenticated) {
+        if (!g_link_locked && !g_scan_mode) {
+          g_link_locked = true;
+          isSynced = true;
+          Serial.printf("[LINK LOCKED via RC] RSSI:%.0f | Rate:%s\n", rssi, RATE_TABLE[g_current_rate_idx].name);
+        }
+        last_packet_time_us = now;
+        timerWrite(slot_timer, RATE_TABLE[g_current_rate_idx].toa_us);
+
+        uint8_t hop_int = RATE_TABLE[g_current_rate_idx].hop_interval;
+        if (matched_slot >= 0) {
+          OtaNonce = (OtaNonce & ~(hop_int - 1)) | (uint8_t)(matched_slot % hop_int);
+        }
+
+        // Canonical ExpressLRS HybridWideNonceToSwitchIndex
+        uint8_t sw_idx = ((OtaNonce & 0b111) + ((OtaNonce >> 3) & 0b1)) % 8;
+        uint16_t ch[16];
+        unpackChannels(&raw[1], ch, plen, sw_idx);
+        bool isArmed = (ch[4] > 1500);
+
+        g_rssi = rssi;
+        g_snr = snr;
+        g_ch[0] = ch[0];
+        g_ch[1] = ch[1];
+        g_ch[2] = ch[2];
+        g_ch[3] = ch[3];
+        g_isArmed = isArmed;
+        g_packetCount++;
+
+        // Rate-limit serial logging to ~25Hz (every 40ms) to prevent UART buffer blocking
+        static uint32_t last_serial_emit_ms = 0;
+        uint32_t now_ms = millis();
+        if (now_ms - last_serial_emit_ms >= 40) {
+          last_serial_emit_ms = now_ms;
+          Serial.printf("[RC %s] RSSI:%4.0f dBm | SNR:%+5.1f dB | CH1:%4u | CH2:%4u | CH3:%4u | CH4:%4u | CH5:%4u | CH6:%4u | CH7:%4u | CH8:%4u | CH9:%4u | CH10:%4u | CH11:%4u | CH12:%4u | CH13:%4u | CH14:%4u | CH15:%4u | CH16:%4u | ARM:%s\n",
+                        RATE_TABLE[g_current_rate_idx].name, rssi, snr, 
+                        ch[0], ch[1], ch[2], ch[3], ch[4], ch[5], ch[6], ch[7],
+                        ch[8], ch[9], ch[10], ch[11], ch[12], ch[13], ch[14], ch[15],
+                        isArmed ? "ON " : "OFF");
+        }
+      }
+    }
+    // 3. TELEMETRY DOWNLINK PACKET
+    else if (pkt_type == 0b11) {
+      int matched_slot = -1;
+      if (authenticatePacket(raw, pkt_type, matched_slot, plen)) {
+        last_packet_time_us = now;
+        timerWrite(slot_timer, RATE_TABLE[g_current_rate_idx].toa_us);
+        parseDownlinkTelemetry(raw);
+      }
+    }
   }
 }

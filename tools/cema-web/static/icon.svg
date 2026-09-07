@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <radialGradient id="bgGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#0e1726"/>
+      <stop offset="100%" stop-color="#060a14"/>
+    </radialGradient>
+    <linearGradient id="cyberBlue" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#0284c7"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="110" fill="url(#bgGlow)" stroke="#1e293b" stroke-width="8"/>
+  
+  <!-- Outer Tactical Radar Rings -->
+  <circle cx="256" cy="256" r="200" fill="none" stroke="#1e293b" stroke-width="4" stroke-dasharray="10 8"/>
+  <circle cx="256" cy="256" r="140" fill="none" stroke="#334155" stroke-width="3"/>
+  <circle cx="256" cy="256" r="80" fill="none" stroke="#0284c7" stroke-width="2" opacity="0.6"/>
+
+  <!-- Crosshairs -->
+  <line x1="46" y1="256" x2="466" y2="256" stroke="#334155" stroke-width="2"/>
+  <line x1="256" y1="46" x2="256" y2="466" stroke="#334155" stroke-width="2"/>
+
+  <!-- Radar Sweep Cone -->
+  <path d="M256 256 L397 115 A200 200 0 0 1 456 256 Z" fill="url(#cyberBlue)" opacity="0.18"/>
+
+  <!-- Stylized LoRa / Drone Wing Center -->
+  <polygon points="256,120 330,340 256,295 182,340" fill="url(#cyberBlue)" stroke="#38bdf8" stroke-width="6"/>
+  <circle cx="256" cy="256" r="14" fill="#38bdf8"/>
+
+  <!-- Corner Brackets -->
+  <path d="M 60 110 L 60 60 L 110 60" fill="none" stroke="#38bdf8" stroke-width="8"/>
+  <path d="M 452 110 L 452 60 L 402 60" fill="none" stroke="#38bdf8" stroke-width="8"/>
+  <path d="M 60 402 L 60 452 L 110 452" fill="none" stroke="#38bdf8" stroke-width="8"/>
+  <path d="M 452 402 L 452 452 L 402 452" fill="none" stroke="#38bdf8" stroke-width="8"/>
+
+  <!-- Tactical Text -->
+  <text x="256" y="420" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace" font-size="34" font-weight="900" fill="#38bdf8" letter-spacing="6" text-anchor="middle">CEMA</text>
+</svg>

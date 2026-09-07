@@ -1581,7 +1581,12 @@ DEFAULT_SETTINGS = {
     "heltec_baud": 115200,
     "heltec_rate_idx": 0,
     "heltec_auto_reconnect": True,
-    "map_provider": "CartoDB Dark Matter (Tactical)",
+    "lora_node_a_port": "COM6",
+    "lora_node_a_baud": 115200,
+    "lora_node_b_port": "COM7",
+    "lora_node_b_baud": 115200,
+    "dual_lora_enabled": True,
+    "map_provider": "OpenStreetMap Standard (Tactical Dark)",
     "map_home_lat": 51.5074,
     "map_home_lon": -0.1278,
     "map_breadcrumbs_max": 100,
@@ -1844,27 +1849,32 @@ class TacticalSettingsDialog(QDialog):
         k_layout.addStretch()
         tabs.addTab(kraken_tab, "Kraken SDR")
 
-        # --- TAB 2: HELTEC LORA ---
+        # --- TAB 2: LORA SNIFFERS (LILYGO & HELTEC) ---
         heltec_tab = QWidget()
         h_layout = QVBoxLayout(heltec_tab)
-        h_grp = QGroupBox("Heltec WiFi LoRa 32 V3 Sniffer Interface")
+        h_grp = QGroupBox("Multi-Node LoRa Hardware (LilyGO T3-S3 && Heltec V3)")
         h_grid = QGridLayout(h_grp)
 
         self.h_port_combo = QComboBox()
+        self.node_b_port_combo = QComboBox()
         self.refresh_com_ports()
         
         self.h_refresh_btn = QPushButton("Refresh Ports")
         self.h_refresh_btn.clicked.connect(self.refresh_com_ports)
 
-        port_row_widget = QWidget()
-        port_row_layout = QHBoxLayout(port_row_widget)
-        port_row_layout.setContentsMargins(0, 0, 0, 0)
-        port_row_layout.addWidget(self.h_port_combo, 1)
-        port_row_layout.addWidget(self.h_refresh_btn)
+        port_a_widget = QWidget()
+        port_a_layout = QHBoxLayout(port_a_widget)
+        port_a_layout.setContentsMargins(0, 0, 0, 0)
+        port_a_layout.addWidget(self.h_port_combo, 1)
+        port_a_layout.addWidget(self.h_refresh_btn)
 
         self.h_baud = QComboBox()
-        self.h_baud.addItems(["115200", "921600", "57600", "38400", "9600"])
-        self.h_baud.setCurrentText(str(self.settings.get("heltec_baud", 115200)))
+        self.h_baud.addItems(["115200", "921600", "2000000", "57600", "38400", "9600"])
+        self.h_baud.setCurrentText(str(self.settings.get("lora_node_a_baud", 115200)))
+
+        self.node_b_baud = QComboBox()
+        self.node_b_baud.addItems(["115200", "921600", "2000000", "57600", "38400", "9600"])
+        self.node_b_baud.setCurrentText(str(self.settings.get("lora_node_b_baud", 115200)))
 
         self.h_rate = QComboBox()
         self.h_rate.addItems([
@@ -1884,17 +1894,27 @@ class TacticalSettingsDialog(QDialog):
         self.h_auto_reconnect = QCheckBox("Auto-reconnect on USB disconnect")
         self.h_auto_reconnect.setChecked(bool(self.settings.get("heltec_auto_reconnect", True)))
 
-        h_grid.addWidget(QLabel("Serial COM Port:"), 0, 0)
-        h_grid.addWidget(port_row_widget, 0, 1)
-        h_grid.addWidget(QLabel("Serial Baud Rate:"), 1, 0)
+        self.dual_lora_cb = QCheckBox("Enable Dual-Node 2-Station Differential RSSI Geolocation")
+        self.dual_lora_cb.setChecked(bool(self.settings.get("dual_lora_enabled", True)))
+
+        h_grid.addWidget(QLabel("Node 1 (LilyGO T3-S3 SX1276) Port:"), 0, 0)
+        h_grid.addWidget(port_a_widget, 0, 1)
+        h_grid.addWidget(QLabel("Node 1 Baud Rate:"), 1, 0)
         h_grid.addWidget(self.h_baud, 1, 1)
-        h_grid.addWidget(QLabel("Startup Packet Rate:"), 2, 0)
-        h_grid.addWidget(self.h_rate, 2, 1)
-        h_grid.addWidget(self.h_auto_reconnect, 3, 0, 1, 2)
+
+        h_grid.addWidget(QLabel("Node 2 (Heltec V3 SX1262) Port:"), 2, 0)
+        h_grid.addWidget(self.node_b_port_combo, 2, 1)
+        h_grid.addWidget(QLabel("Node 2 Baud Rate:"), 3, 0)
+        h_grid.addWidget(self.node_b_baud, 3, 1)
+
+        h_grid.addWidget(QLabel("Default Packet Rate:"), 4, 0)
+        h_grid.addWidget(self.h_rate, 4, 1)
+        h_grid.addWidget(self.h_auto_reconnect, 5, 0, 1, 2)
+        h_grid.addWidget(self.dual_lora_cb, 6, 0, 1, 2)
 
         h_layout.addWidget(h_grp)
         h_layout.addStretch()
-        tabs.addTab(heltec_tab, "Heltec Sniffer")
+        tabs.addTab(heltec_tab, "LoRa Sniffers")
 
         # --- TAB 3: TACTICAL MAP ---
         map_tab = QWidget()
@@ -2000,10 +2020,18 @@ class TacticalSettingsDialog(QDialog):
         ports = get_available_com_ports()
         self.h_port_combo.clear()
         self.h_port_combo.addItems(ports)
-        saved_port = self.settings.get("heltec_port", "COM6")
-        idx = self.h_port_combo.findText(saved_port)
-        if idx >= 0:
-            self.h_port_combo.setCurrentIndex(idx)
+        saved_port_a = self.settings.get("lora_node_a_port", self.settings.get("heltec_port", "COM6"))
+        idx_a = self.h_port_combo.findText(saved_port_a)
+        if idx_a >= 0:
+            self.h_port_combo.setCurrentIndex(idx_a)
+
+        if hasattr(self, 'node_b_port_combo'):
+            self.node_b_port_combo.clear()
+            self.node_b_port_combo.addItems(ports)
+            saved_port_b = self.settings.get("lora_node_b_port", "COM7")
+            idx_b = self.node_b_port_combo.findText(saved_port_b)
+            if idx_b >= 0:
+                self.node_b_port_combo.setCurrentIndex(idx_b)
 
     def reset_defaults(self):
         self.settings = DEFAULT_SETTINGS.copy()
@@ -2014,9 +2042,13 @@ class TacticalSettingsDialog(QDialog):
         self.k_arr_combo.setCurrentText(self.settings["kraken_default_arr"])
         self.k_radius.setValue(self.settings["kraken_default_radius"])
         self.k_gain.setValue(self.settings["kraken_default_gain"])
-        self.h_baud.setCurrentText(str(self.settings["heltec_baud"]))
+        self.h_baud.setCurrentText(str(self.settings["lora_node_a_baud"]))
+        if hasattr(self, 'node_b_baud'):
+            self.node_b_baud.setCurrentText(str(self.settings["lora_node_b_baud"]))
         self.h_rate.setCurrentIndex(self.settings["heltec_rate_idx"])
         self.h_auto_reconnect.setChecked(self.settings["heltec_auto_reconnect"])
+        if hasattr(self, 'dual_lora_cb'):
+            self.dual_lora_cb.setChecked(self.settings["dual_lora_enabled"])
         self.m_provider.setCurrentText(self.settings["map_provider"])
         self.m_lat.setValue(self.settings["map_home_lat"])
         self.m_lon.setValue(self.settings["map_home_lon"])
@@ -2038,6 +2070,11 @@ class TacticalSettingsDialog(QDialog):
             "kraken_default_gain": self.k_gain.value(),
             "heltec_port": self.h_port_combo.currentText(),
             "heltec_baud": int(self.h_baud.currentText()),
+            "lora_node_a_port": self.h_port_combo.currentText(),
+            "lora_node_a_baud": int(self.h_baud.currentText()),
+            "lora_node_b_port": self.node_b_port_combo.currentText() if hasattr(self, 'node_b_port_combo') else "COM7",
+            "lora_node_b_baud": int(self.node_b_baud.currentText()) if hasattr(self, 'node_b_baud') else 115200,
+            "dual_lora_enabled": self.dual_lora_cb.isChecked() if hasattr(self, 'dual_lora_cb') else True,
             "heltec_rate_idx": self.h_rate.currentIndex(),
             "heltec_auto_reconnect": self.h_auto_reconnect.isChecked(),
             "map_provider": self.m_provider.currentText(),
@@ -2424,14 +2461,6 @@ class CEMAApp(QMainWindow):
         self.freeze_btn.toggled.connect(self.toggle_freeze)
         self.freeze_btn.setToolTip("Freeze display updates to analyze waterfall/spectrum without motion (Shortcut: Space).")
 
-        self.heltec_port_combo = QComboBox()
-        self.heltec_port_combo.addItems(get_available_com_ports())
-        self.heltec_port_combo.setToolTip("Select COM Port for Heltec WiFi LoRa 32 V3 sniffer.")
-        self.heltec_connect_btn = QPushButton("HELTEC V3")
-        self.heltec_connect_btn.setStyleSheet("background-color: #1e293b; color: #38bdf8; border: 1px solid #38bdf8; border-radius: 4px; padding: 5px 10px;")
-        self.heltec_connect_btn.clicked.connect(self.restart_heltec)
-        self.heltec_connect_btn.setToolTip("Connect or Reconnect to Heltec WiFi LoRa 32 V3 sniffer hardware.")
-
         self.settings_btn = QPushButton("SETTINGS")
         self.settings_btn.setStyleSheet("background-color: #1e293b; color: #38bdf8; border: 1px solid #0284c7; font-weight: bold; border-radius: 4px; padding: 5px 10px;")
         self.settings_btn.clicked.connect(self.open_settings_dialog)
@@ -2480,10 +2509,6 @@ class CEMAApp(QMainWindow):
         r1.addWidget(QLabel("Palette:"))
         r1.addWidget(self.palette_combo)
         r1.addSpacing(10)
-        r1.addWidget(QLabel("Heltec Port:"))
-        r1.addWidget(self.heltec_port_combo)
-        r1.addWidget(self.heltec_connect_btn)
-        r1.addSpacing(6)
         r1.addWidget(self.settings_btn)
         r1.addStretch()
         control_layout.addLayout(r1, 1, 0)
@@ -2502,8 +2527,11 @@ class CEMAApp(QMainWindow):
         self.badge_sdr = QLabel("[ SDR: HACKRF ONE (20 MS/s) ]")
         self.badge_sdr.setStyleSheet("color: #10b981; background: #060e1a; font-family: 'Consolas', monospace; font-size: 9.5pt; font-weight: bold; padding: 2px 8px; border: 1px solid #10b981; border-radius: 3px;")
 
+        self.badge_lilygo = QLabel("[ LILYGO T3-S3: STANDBY ]")
+        self.badge_lilygo.setStyleSheet("color: #64748b; background: #060e1a; font-family: 'Consolas', monospace; font-size: 9.5pt; font-weight: bold; padding: 2px 8px; border: 1px solid #334155; border-radius: 3px;")
+
         self.badge_heltec = QLabel("[ HELTEC V3: STANDBY ]")
-        self.badge_heltec.setStyleSheet("color: #38bdf8; background: #060e1a; font-family: 'Consolas', monospace; font-size: 9.5pt; font-weight: bold; padding: 2px 8px; border: 1px solid #0284c7; border-radius: 3px;")
+        self.badge_heltec.setStyleSheet("color: #64748b; background: #060e1a; font-family: 'Consolas', monospace; font-size: 9.5pt; font-weight: bold; padding: 2px 8px; border: 1px solid #334155; border-radius: 3px;")
 
         self.badge_kraken = QLabel("[ KRAKENSDR: STANDBY ]")
         self.badge_kraken.setStyleSheet("color: #f59e0b; background: #060e1a; font-family: 'Consolas', monospace; font-size: 9.5pt; font-weight: bold; padding: 2px 8px; border: 1px solid #f59e0b; border-radius: 3px;")
@@ -2512,6 +2540,7 @@ class CEMAApp(QMainWindow):
         self.badge_copilot.setStyleSheet("color: #a78bfa; background: #060e1a; font-family: 'Consolas', monospace; font-size: 9.5pt; font-weight: bold; padding: 2px 8px; border: 1px solid #7c3aed; border-radius: 3px;")
 
         status_bar_layout.addWidget(self.badge_sdr)
+        status_bar_layout.addWidget(self.badge_lilygo)
         status_bar_layout.addWidget(self.badge_heltec)
         status_bar_layout.addWidget(self.badge_kraken)
         status_bar_layout.addWidget(self.badge_copilot)
@@ -2910,17 +2939,25 @@ class CEMAApp(QMainWindow):
                 body { margin: 0; padding: 0; background-color: #0b0f19; }
                 #map { height: 100vh; width: 100vw; }
                 .leaflet-container { background-color: #0b0f19 !important; }
+                .leaflet-tile-pane {
+                    filter: invert(100%) hue-rotate(180deg) brightness(85%) contrast(120%);
+                }
             </style>
         </head>
         <body>
             <div id="map"></div>
             <script>
-                var map = L.map('map', {zoomControl: false}).setView([0, 0], 2);
+                var map = L.map('map', {zoomControl: false}).setView([51.5074, -0.1278], 11);
                 
-                L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-                    attribution: '&copy; OpenStreetMap &copy; CartoDB',
+                L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                    attribution: '&copy; OpenStreetMap contributors',
                     maxZoom: 19
                 }).addTo(map);
+
+                function setObserverLocation(lat, lon) {
+                    map.setView([lat, lon], Math.max(map.getZoom(), 11));
+                    updateRfRangeRing(lat, lon, 500, '#38bdf8');
+                }
 
                 var markers = {};
                 var droneTrail = L.polyline([], {
@@ -3107,8 +3144,10 @@ class CEMAApp(QMainWindow):
         self.geo_lon_input = QLineEdit()
         self.geo_lat_input.setPlaceholderText("Latitude")
         self.geo_lon_input.setPlaceholderText("Longitude")
-        self.geo_lat_input.setText("51.5074")
-        self.geo_lon_input.setText("-0.1278")
+        self.geo_lat_input.setText(str(self.settings.get("map_home_lat", "51.5074")))
+        self.geo_lon_input.setText(str(self.settings.get("map_home_lon", "-0.1278")))
+        self.geo_lat_input.editingFinished.connect(self.manual_plot_target)
+        self.geo_lon_input.editingFinished.connect(self.manual_plot_target)
         
         self.geo_plot_btn = QPushButton("PLOT MANUALLY")
         self.geo_plot_btn.setStyleSheet("background-color: #0f172a; color: #38bdf8; font-weight: bold; border: 1px solid #1e293b; padding: 4px 8px; border-radius: 4px;")
@@ -3193,18 +3232,39 @@ class CEMAApp(QMainWindow):
         layout.setSpacing(6)
         self.drone_parent_layout = layout
 
-        # Header Status & Detach Bar
-        header_row = QHBoxLayout()
-        self.drone_status_label = QLabel("[ HELTEC V3: SEARCHING FOR 915MHz PACKETS ]")
-        self.drone_status_label.setStyleSheet("background-color: #090d16; color: #f59e0b; font-weight: bold; font-size: 13px; padding: 6px; border: 1px solid #1e293b; border-radius: 4px;")
-        
+        # Multi-Node LoRa Transceiver Header Box
+        header_box = QGroupBox("Multi-Node LoRa Transceivers (LilyGO T3-S3 SX1276 && Heltec V3 SX1262)")
+        header_box.setStyleSheet("QGroupBox { color: #38bdf8; font-weight: bold; border: 1px solid #1e293b; border-radius: 6px; margin-top: 4px; padding-top: 6px; background-color: #0b0f19; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }")
+        header_layout = QGridLayout(header_box)
+        header_layout.setContentsMargins(6, 6, 6, 6)
+        header_layout.setSpacing(6)
+
+        self.node_a_status_label = QLabel("[ NODE 1 (LILYGO T3-S3 SX1276): STANDBY ]")
+        self.node_a_status_label.setStyleSheet("background-color: #090d16; color: #94a3b8; font-weight: bold; font-size: 11px; padding: 4px 8px; border: 1px solid #1e293b; border-radius: 4px; font-family: monospace;")
+
+        self.node_b_status_label = QLabel("[ NODE 2 (HELTEC V3 SX1262): STANDBY ]")
+        self.node_b_status_label.setStyleSheet("background-color: #090d16; color: #94a3b8; font-weight: bold; font-size: 11px; padding: 4px 8px; border: 1px solid #1e293b; border-radius: 4px; font-family: monospace;")
+
+        self.drone_status_label = self.node_a_status_label
+
+        self.connect_nodes_btn = QPushButton("CONNECT LORA NODES")
+        self.connect_nodes_btn.setStyleSheet("background-color: #0284c7; color: white; font-weight: bold; padding: 4px 8px; border: 1px solid #38bdf8; border-radius: 4px;")
+        self.connect_nodes_btn.clicked.connect(self.start_dual_lora_nodes)
+
         self.drone_detach_btn = QPushButton("DETACH COCKPIT")
         self.drone_detach_btn.setStyleSheet("background-color: #1e293b; color: #38bdf8; font-weight: bold; padding: 4px 8px; border: 1px solid #0284c7; border-radius: 4px;")
         self.drone_detach_btn.clicked.connect(self.detach_drone_window)
-        
-        header_row.addWidget(self.drone_status_label, 1)
-        header_row.addWidget(self.drone_detach_btn)
-        layout.addLayout(header_row)
+
+        self.diff_rssi_badge = QLabel("[ 2-STATION CEP GEOLOCATION: WAITING DUAL SYNC ]")
+        self.diff_rssi_badge.setStyleSheet("background-color: #060a14; color: #38bdf8; font-family: monospace; font-size: 11px; font-weight: bold; padding: 4px 8px; border: 1px solid #1e293b; border-radius: 4px;")
+
+        header_layout.addWidget(self.node_a_status_label, 0, 0)
+        header_layout.addWidget(self.node_b_status_label, 0, 1)
+        header_layout.addWidget(self.connect_nodes_btn, 0, 2)
+        header_layout.addWidget(self.drone_detach_btn, 0, 3)
+        header_layout.addWidget(self.diff_rssi_badge, 1, 0, 1, 4)
+
+        layout.addWidget(header_box)
 
         self.drone_cockpit_container = QWidget()
         cockpit_layout = QVBoxLayout(self.drone_cockpit_container)
@@ -3227,6 +3287,7 @@ class CEMAApp(QMainWindow):
             "D50 (Déjà Vu 50Hz - SF7 / 10ms)",
             "150 Hz (SF7 / 6.6ms)",
             "200 Hz (SF6 / 5ms)",
+            "200 Hz Full (16ch Full Res - SF6 / 5ms)",
             "250 Hz (SF6 / 4ms)",
             "333 Hz Full (16ch Full Res - SF5 / 3ms)"
         ])
@@ -5433,22 +5494,75 @@ class CEMAApp(QMainWindow):
         win.closed.connect(lambda: self.popout_windows.pop("drone", None))
         win.show()
 
+    def start_dual_lora_nodes(self):
+        port_a = self.settings.get("lora_node_a_port", "COM6")
+        port_b = self.settings.get("lora_node_b_port", "COM7")
+
+        if not hasattr(self, 'dual_lora_mgr') or self.dual_lora_mgr is None:
+            from heltec_bridge import DualLoRaManager
+            self.dual_lora_mgr = DualLoRaManager(port_node_a=port_a, port_node_b=port_b)
+            self.dual_lora_mgr.node_a.rc_data_received.connect(self.on_heltec_rc)
+            self.dual_lora_mgr.node_a.telemetry_link_received.connect(self.on_heltec_tlm_link)
+            self.dual_lora_mgr.node_a.battery_received.connect(self.on_heltec_battery)
+            self.dual_lora_mgr.node_a.attitude_received.connect(self.on_heltec_attitude)
+            self.dual_lora_mgr.node_a.flight_mode_received.connect(self.on_heltec_flight_mode)
+            self.dual_lora_mgr.node_a.gps_received.connect(self.on_heltec_gps)
+            self.dual_lora_mgr.node_a.sync_discovered.connect(self.on_heltec_sync)
+            self.dual_lora_mgr.node_a.rate_detected.connect(self.on_heltec_rate)
+            self.dual_lora_mgr.node_a.pilot_discovered.connect(self.on_heltec_pilot_discovered)
+
+            self.dual_lora_mgr.node_b.rc_data_received.connect(self.on_heltec_rc)
+            self.dual_lora_mgr.node_b.telemetry_link_received.connect(self.on_heltec_tlm_link)
+            self.dual_lora_mgr.node_b.battery_received.connect(self.on_heltec_battery)
+            self.dual_lora_mgr.node_b.attitude_received.connect(self.on_heltec_attitude)
+            self.dual_lora_mgr.node_b.flight_mode_received.connect(self.on_heltec_flight_mode)
+            self.dual_lora_mgr.node_b.gps_received.connect(self.on_heltec_gps)
+            self.dual_lora_mgr.node_b.sync_discovered.connect(self.on_heltec_sync)
+            self.dual_lora_mgr.node_b.rate_detected.connect(self.on_heltec_rate)
+            self.dual_lora_mgr.node_b.pilot_discovered.connect(self.on_heltec_pilot_discovered)
+
+            self.dual_lora_mgr.node_status_signal.connect(self.on_lora_node_status)
+            self.dual_lora_mgr.differential_rssi_fix.connect(self.on_differential_rssi_fix)
+
+        self.dual_lora_mgr.start_nodes()
+        self.log_event(f"DUAL LORA MANAGER: Started Node 1 ({port_a}) and Node 2 ({port_b}).")
+
+    def on_lora_node_status(self, node_id, status_text, connected):
+        color = "#10b981" if connected else "#94a3b8"
+        bg = "#064e3b" if connected else "#090d16"
+        border = "#10b981" if connected else "#1e293b"
+        style = f"background-color: {bg}; color: {color}; font-weight: bold; font-size: 11px; padding: 4px 8px; border: 1px solid {border}; border-radius: 4px; font-family: monospace;"
+
+        badge_color = "#38bdf8" if connected else "#64748b"
+        badge_border = "#0284c7" if connected else "#334155"
+        badge_style = f"color: {badge_color}; background: #060e1a; font-family: 'Consolas', monospace; font-size: 9.5pt; font-weight: bold; padding: 2px 8px; border: 1px solid {badge_border}; border-radius: 3px;"
+
+        if node_id == "NODE_A":
+            if hasattr(self, 'node_a_status_label'):
+                self.node_a_status_label.setText(f"[ {status_text} ]")
+                self.node_a_status_label.setStyleSheet(style)
+            if hasattr(self, 'badge_lilygo'):
+                txt = "LILYGO T3-S3: ONLINE" if connected else "LILYGO T3-S3: STANDBY"
+                self.badge_lilygo.setText(f"[ {txt} ]")
+                self.badge_lilygo.setStyleSheet(badge_style)
+        elif node_id == "NODE_B":
+            if hasattr(self, 'node_b_status_label'):
+                self.node_b_status_label.setText(f"[ {status_text} ]")
+                self.node_b_status_label.setStyleSheet(style)
+            if hasattr(self, 'badge_heltec'):
+                txt = "HELTEC V3: ONLINE" if connected else "HELTEC V3: STANDBY"
+                self.badge_heltec.setText(f"[ {txt} ]")
+                self.badge_heltec.setStyleSheet(badge_style)
+
+    def on_differential_rssi_fix(self, fix):
+        if hasattr(self, 'diff_rssi_badge'):
+            sign = "+" if fix["delta_rssi_db"] >= 0 else ""
+            self.diff_rssi_badge.setText(f"[ 2-STATION FIX: dRSSI {sign}{fix['delta_rssi_db']:.1f} dB | Closest: {fix['dominant_station']} | Dist Ratio: {fix['dist_ratio']:.2f}x | Pilot: {fix['uid']} ]")
+            self.diff_rssi_badge.setStyleSheet("background-color: #064e3b; color: #34d399; font-family: monospace; font-size: 11px; font-weight: bold; padding: 4px 8px; border: 1px solid #10b981; border-radius: 4px;")
+        self.log_event(f"DUAL-STATION FIX: Pilot {fix['uid']} | dRSSI {fix['delta_rssi_db']:.1f} dB | Closest: {fix['dominant_station']}")
+
     def start_heltec(self):
-        port = self.heltec_port_combo.currentText() if hasattr(self, 'heltec_port_combo') else "COM6"
-        if self.heltec_thread:
-            self.heltec_thread.stop()
-        self.heltec_thread = HeltecLoraThread(port=port)
-        self.heltec_thread.rc_data_received.connect(self.on_heltec_rc)
-        self.heltec_thread.telemetry_link_received.connect(self.on_heltec_tlm_link)
-        self.heltec_thread.battery_received.connect(self.on_heltec_battery)
-        self.heltec_thread.attitude_received.connect(self.on_heltec_attitude)
-        self.heltec_thread.flight_mode_received.connect(self.on_heltec_flight_mode)
-        self.heltec_thread.gps_received.connect(self.on_heltec_gps)
-        self.heltec_thread.sync_discovered.connect(self.on_heltec_sync)
-        self.heltec_thread.rate_detected.connect(self.on_heltec_rate)
-        self.heltec_thread.pilot_discovered.connect(self.on_heltec_pilot_discovered)
-        self.heltec_thread.status_changed.connect(self.on_heltec_status)
-        self.heltec_thread.start()
+        self.start_dual_lora_nodes()
 
     def on_heltec_pilot_discovered(self, data):
         uid_str = data.get("uid_str", "")
@@ -5505,87 +5619,107 @@ class CEMAApp(QMainWindow):
                     self.kraken_radius_spin.blockSignals(False)
                 self.push_kraken_hardware_settings()
 
-    def on_lock_pilot_clicked(self):
-        if not hasattr(self, 'pilot_selector_combo'):
-            return
-        idx = self.pilot_selector_combo.currentIndex()
-        if idx <= 0:
-            self.on_unlock_pilot_clicked()
-            return
-        uid_str = self.pilot_selector_combo.itemData(idx)
-        if not uid_str or uid_str not in getattr(self, 'discovered_pilots', {}):
-            return
-        p = self.discovered_pilots[uid_str]
-        cmd = f"LOCK_PILOT:{p['u3']},{p['u4']},{p['u5']}"
-        if self.heltec_thread:
-            self.heltec_thread.send_command(cmd)
-        if hasattr(self, 'pilot_target_badge'):
-            self.pilot_target_badge.setText(f"[ LOCKED TARGET: PILOT UID {p['u3']}:{p['u4']}:{p['u5']} | CRC 0x{p['crc_init']} ]")
-            self.pilot_target_badge.setStyleSheet("background-color: #060a14; color: #f59e0b; font-family: monospace; font-size: 11px; font-weight: bold; padding: 5px; border: 1px solid #f59e0b; border-radius: 4px;")
-        
-        # Update active FHSS 900M entry in Hunter-Killer queue immediately with the locked pilot
-        if hasattr(self, 'hk_priority_queue') and 'FHSS_900M' in self.hk_priority_queue:
-            self.hk_priority_queue['FHSS_900M']['mod'] = f"ELRS 900M [LOCKED UID {p['u3']}:{p['u4']}:{p['u5']}]"
-            self.hk_priority_queue['FHSS_900M']['fingerprint'] = f"0x{p['crc_init']}"
-            self.refresh_hk_queue_ui()
+    def send_lora_command(self, cmd):
+        sent = False
+        try:
+            if hasattr(self, 'dual_lora_mgr') and self.dual_lora_mgr:
+                sent = self.dual_lora_mgr.send_command(cmd)
+            elif hasattr(self, 'heltec_thread') and self.heltec_thread:
+                sent = self.heltec_thread.send_command(cmd)
+        except Exception as e:
+            print(f"Error dispatching LoRa command: {e}")
+        return sent
 
-        # Auto-Fusion Hand-Off: Sync Kraken DoA to 915.000 MHz
-        if hasattr(self, 'auto_fusion_heltec_kraken_cb') and self.auto_fusion_heltec_kraken_cb.isChecked():
-            if hasattr(self, 'kraken_freq_spin'):
-                self.kraken_freq_spin.blockSignals(True)
-                self.kraken_freq_spin.setValue(915.0)
-                self.kraken_freq_spin.blockSignals(False)
-            if hasattr(self, 'kraken_radius_spin') and hasattr(self, 'kraken_array_combo') and self.kraken_array_combo.currentIndex() == 0:
-                self.kraken_radius_spin.blockSignals(True)
-                self.kraken_radius_spin.setValue(0.135)
-                self.kraken_radius_spin.blockSignals(False)
-            self.push_kraken_hardware_settings()
-            self.log_event(f"SENSOR FUSION: Synced Kraken DoA Array to 915.000 MHz (Locked Target UID {p['u3']}:{p['u4']}:{p['u5']}).")
-                
-        self.log_event(f"Target pilot locked: UID {p['u3']}:{p['u4']}:{p['u5']}")
+    def on_lock_pilot_clicked(self):
+        try:
+            if not hasattr(self, 'pilot_selector_combo'):
+                return
+            idx = self.pilot_selector_combo.currentIndex()
+            if idx <= 0:
+                self.on_unlock_pilot_clicked()
+                return
+            uid_str = self.pilot_selector_combo.itemData(idx)
+            if not uid_str or uid_str not in getattr(self, 'discovered_pilots', {}):
+                return
+            p = self.discovered_pilots[uid_str]
+            cmd = f"LOCK_PILOT:{p.get('u3', 0)},{p.get('u4', 0)},{p.get('u5', 0)}"
+            self.send_lora_command(cmd)
+            if hasattr(self, 'pilot_target_badge'):
+                self.pilot_target_badge.setText(f"[ LOCKED TARGET: PILOT UID {p.get('u3', 0)}:{p.get('u4', 0)}:{p.get('u5', 0)} | CRC 0x{p.get('crc_init', '')} ]")
+                self.pilot_target_badge.setStyleSheet("background-color: #060a14; color: #f59e0b; font-family: monospace; font-size: 11px; font-weight: bold; padding: 5px; border: 1px solid #f59e0b; border-radius: 4px;")
+            
+            # Update active FHSS 900M entry in Hunter-Killer queue immediately with the locked pilot
+            if hasattr(self, 'hk_priority_queue') and 'FHSS_900M' in self.hk_priority_queue:
+                self.hk_priority_queue['FHSS_900M']['mod'] = f"ELRS 900M [LOCKED UID {p.get('u3', 0)}:{p.get('u4', 0)}:{p.get('u5', 0)}]"
+                self.hk_priority_queue['FHSS_900M']['fingerprint'] = f"0x{p.get('crc_init', '')}"
+                self.refresh_hk_queue_ui()
+
+            # Auto-Fusion Hand-Off: Sync Kraken DoA to 915.000 MHz
+            if hasattr(self, 'auto_fusion_heltec_kraken_cb') and self.auto_fusion_heltec_kraken_cb.isChecked():
+                if hasattr(self, 'kraken_freq_spin'):
+                    self.kraken_freq_spin.blockSignals(True)
+                    self.kraken_freq_spin.setValue(915.0)
+                    self.kraken_freq_spin.blockSignals(False)
+                if hasattr(self, 'kraken_radius_spin') and hasattr(self, 'kraken_array_combo') and self.kraken_array_combo.currentIndex() == 0:
+                    self.kraken_radius_spin.blockSignals(True)
+                    self.kraken_radius_spin.setValue(0.135)
+                    self.kraken_radius_spin.blockSignals(False)
+                self.push_kraken_hardware_settings()
+                self.log_event(f"SENSOR FUSION: Synced Kraken DoA Array to 915.000 MHz (Locked Target UID {p.get('u3', 0)}:{p.get('u4', 0)}:{p.get('u5', 0)}).")
+                    
+            self.log_event(f"Target pilot locked: UID {p.get('u3', 0)}:{p.get('u4', 0)}:{p.get('u5', 0)}")
+        except Exception as e:
+            self.log_event(f"Lock pilot error: {e}")
 
     def on_unlock_pilot_clicked(self):
-        if self.heltec_thread:
-            self.heltec_thread.send_command("LOCK_PILOT:AUTO")
-        if hasattr(self, 'pilot_selector_combo'):
-            self.pilot_selector_combo.setCurrentIndex(0)
-        if hasattr(self, 'pilot_target_badge'):
-            self.pilot_target_badge.setText("[ ACTIVE TARGET: AUTO / ANY PILOT ]")
-            self.pilot_target_badge.setStyleSheet("background-color: #060a14; color: #38bdf8; font-family: monospace; font-size: 11px; font-weight: bold; padding: 5px; border: 1px solid #1e293b; border-radius: 4px;")
-        self.log_event("Target pilot filter set to Auto / Any.")
+        try:
+            self.send_lora_command("LOCK_PILOT:AUTO")
+            if hasattr(self, 'pilot_selector_combo'):
+                self.pilot_selector_combo.setCurrentIndex(0)
+            if hasattr(self, 'pilot_target_badge'):
+                self.pilot_target_badge.setText("[ ACTIVE TARGET: AUTO / ANY PILOT ]")
+                self.pilot_target_badge.setStyleSheet("background-color: #060a14; color: #38bdf8; font-family: monospace; font-size: 11px; font-weight: bold; padding: 5px; border: 1px solid #1e293b; border-radius: 4px;")
+            self.log_event("Target pilot filter set to Auto / Any.")
+        except Exception as e:
+            self.log_event(f"Unlock pilot error: {e}")
 
     def on_elrs_rate_selected(self, index):
-        if not self.heltec_thread:
-            return
-        cmd_map = {
-            0: "SET_RATE:AUTO",
-            1: "SET_RATE:50HZ",
-            2: "SET_RATE:25HZ",
-            3: "SET_RATE:100HZ",
-            4: "SET_RATE:100HZ FULL",
-            5: "SET_RATE:D50",
-            6: "SET_RATE:150HZ",
-            7: "SET_RATE:200HZ",
-            8: "SET_RATE:250HZ",
-            9: "SET_RATE:333HZ FULL"
-        }
-        cmd = cmd_map.get(index, "SET_RATE:AUTO")
-        self.heltec_thread.send_command(cmd)
-        self.log_event(f"Sent ExpressLRS rate command to Heltec: {cmd}")
+        try:
+            cmd_map = {
+                0: "SET_RATE:AUTO",
+                1: "SET_RATE:50HZ",
+                2: "SET_RATE:25HZ",
+                3: "SET_RATE:100HZ",
+                4: "SET_RATE:100HZ FULL",
+                5: "SET_RATE:D50",
+                6: "SET_RATE:150HZ",
+                7: "SET_RATE:200HZ",
+                8: "SET_RATE:200HZ FULL",
+                9: "SET_RATE:250HZ",
+                10: "SET_RATE:333HZ FULL"
+            }
+            cmd = cmd_map.get(index, "SET_RATE:AUTO")
+            self.send_lora_command(cmd)
+            self.log_event(f"Sent ExpressLRS rate command to LoRa Hardware: {cmd}")
+        except Exception as e:
+            self.log_event(f"Rate selection error: {e}")
 
     def on_heltec_rate(self, data):
-        rate_name = data.get('rate_name', '50Hz')
-        sf = data.get('sf', 8)
-        bw = data.get('bw_khz', 500.0)
-        interval = data.get('interval_us', 20000)
-        if hasattr(self, 'elrs_rate_badge'):
-            self.elrs_rate_badge.setText(f"[ ACTIVE DEMOD: {rate_name} | SF{sf} | BW: {bw:.0f}kHz | Interval: {interval} µs ]")
-            self.elrs_rate_badge.setStyleSheet("background-color: #060a14; color: #10b981; font-family: monospace; font-size: 11px; font-weight: bold; padding: 5px; border: 1px solid #10b981; border-radius: 4px;")
-        
-        # Suppress log event when Auto-Detect scanning is active to prevent event log flooding
-        is_auto = hasattr(self, 'elrs_rate_mode_combo') and self.elrs_rate_mode_combo.currentIndex() == 0
-        if not is_auto:
-            self.log_event(f"Heltec locked ELRS rate: {rate_name} (SF{sf}, BW {bw:.0f}kHz, {interval} µs)")
+        try:
+            rate_name = data.get('rate_name', '50Hz')
+            sf = data.get('sf', 8)
+            bw = data.get('bw_khz', 500.0)
+            interval = data.get('interval_us', 20000)
+            if hasattr(self, 'elrs_rate_badge'):
+                self.elrs_rate_badge.setText(f"[ ACTIVE DEMOD: {rate_name} | SF{sf} | BW: {bw:.0f}kHz | Interval: {interval} µs ]")
+                self.elrs_rate_badge.setStyleSheet("background-color: #060a14; color: #10b981; font-family: monospace; font-size: 11px; font-weight: bold; padding: 5px; border: 1px solid #10b981; border-radius: 4px;")
+            
+            # Suppress log event when Auto-Detect scanning is active to prevent event log flooding
+            is_auto = hasattr(self, 'elrs_rate_mode_combo') and self.elrs_rate_mode_combo.currentIndex() == 0
+            if not is_auto:
+                self.log_event(f"Heltec locked ELRS rate: {rate_name} (SF{sf}, BW {bw:.0f}kHz, {interval} µs)")
+        except Exception as e:
+            pass
 
     def restart_heltec(self):
         self.start_heltec()
@@ -5598,12 +5732,20 @@ class CEMAApp(QMainWindow):
         self.settings = settings
         self.log_event("TACTICAL SETTINGS: Hardware && System configuration updated.")
 
-        # Update Heltec Port if changed
+        # Update LoRa Ports if changed
         if hasattr(self, 'heltec_port_combo'):
             idx = self.heltec_port_combo.findText(settings.get('heltec_port', 'COM6'))
             if idx >= 0:
                 self.heltec_port_combo.setCurrentIndex(idx)
-        if self.heltec_thread and self.heltec_thread.port != settings.get('heltec_port', 'COM6'):
+        if hasattr(self, 'dual_lora_mgr') and self.dual_lora_mgr:
+            port_a = settings.get('lora_node_a_port', settings.get('heltec_port', 'COM6'))
+            port_b = settings.get('lora_node_b_port', 'COM7')
+            if self.dual_lora_mgr.node_a.port != port_a:
+                self.dual_lora_mgr.node_a.set_port(port_a)
+            if self.dual_lora_mgr.node_b.port != port_b:
+                self.dual_lora_mgr.node_b.set_port(port_b)
+            self.dual_lora_mgr.start_nodes()
+        elif self.heltec_thread and self.heltec_thread.port != settings.get('heltec_port', 'COM6'):
             self.heltec_thread.set_port(settings.get('heltec_port', 'COM6'))
             self.restart_heltec()
 
@@ -5629,283 +5771,318 @@ class CEMAApp(QMainWindow):
             self.drone_status_label.setText(f"[ {msg.upper()} ]")
 
     def on_heltec_rc(self, data):
-        ch1 = data['ch1']
-        ch2 = data['ch2']
-        ch3 = data['ch3']
-        ch4 = data['ch4']
-        rssi = data['rssi']
-        snr = data['snr']
-        armed = data['armed']
-        channels = data.get('channels', [ch1, ch2, ch3, ch4] + [1500] * 12)
+        try:
+            channels = data.get('channels', [1500] * 16)
+            ch1 = data.get('ch1', channels[0] if len(channels) > 0 else 1500)
+            ch2 = data.get('ch2', channels[1] if len(channels) > 1 else 1500)
+            ch3 = data.get('ch3', channels[2] if len(channels) > 2 else 988)
+            ch4 = data.get('ch4', channels[3] if len(channels) > 3 else 1500)
+            rssi = data.get('rssi', -100.0)
+            snr = data.get('snr', 0.0)
+            armed = data.get('armed', False)
 
-        # Synchronize live armed status & telemetry to discovered_pilots for AI Copilot & SITREP
-        if not hasattr(self, 'discovered_pilots'):
-            self.discovered_pilots = {}
-        
-        pilot_key = getattr(self, 'last_pilot_key', None) or "ACTIVE_PILOT"
-        if pilot_key not in self.discovered_pilots:
-            self.discovered_pilots[pilot_key] = {
-                "u3": 0, "u4": 0, "u5": 0,
-                "crc_init": "2156",
-                "rssi": rssi,
-                "rate_name": data.get('packet_rate', '50Hz'),
-                "armed": armed,
-                "channels": channels,
-                "last_seen": time.time()
-            }
-        else:
-            self.discovered_pilots[pilot_key]["armed"] = armed
-            self.discovered_pilots[pilot_key]["rssi"] = rssi
-            self.discovered_pilots[pilot_key]["rate_name"] = data.get('packet_rate', '50Hz')
-            self.discovered_pilots[pilot_key]["channels"] = channels
-            self.discovered_pilots[pilot_key]["last_seen"] = time.time()
-
-        for p in self.discovered_pilots.values():
-            p["armed"] = armed
-            p["rate_name"] = data.get('packet_rate', '50Hz')
-            p["rssi"] = rssi
-            p["last_seen"] = time.time()
-
-        if hasattr(self, 'heltec_connect_btn'):
-            self.heltec_connect_btn.setText(f"🚁 HELTEC: {rssi:.0f}dBm")
-
-        pkt_rate = data.get('packet_rate', '50Hz')
-        if hasattr(self, 'elrs_rate_badge'):
-            if not hasattr(self, 'current_locked_elrs_rate') or self.current_locked_elrs_rate != pkt_rate:
-                self.current_locked_elrs_rate = pkt_rate
-                self.elrs_rate_badge.setText(f"[ ACTIVE DEMOD: {pkt_rate} (Synchronized) ]")
-                self.elrs_rate_badge.setStyleSheet("background-color: #060a14; color: #10b981; font-family: monospace; font-size: 11px; font-weight: bold; padding: 5px; border: 1px solid #10b981; border-radius: 4px;")
-
-        # Feature 1: Update Mode 2 Gimbal HUD
-        if self.gimbal_hud:
-            self.gimbal_hud.update_sticks(ch1, ch2, ch3, ch4, armed)
-
-        thr_pct = max(0.0, min(100.0, (ch3 - 988.0) / 10.24))
-        if hasattr(self, 'drone_sticks_lbl'):
-            self.drone_sticks_lbl.setText(f"THR: {ch3} µs ({thr_pct:.0f}%) | YAW: {ch1} µs | PIT: {ch2} µs | ROL: {ch4} µs")
-
-        # Feature 3: Update 16-Channel Diagnostic Matrix
-        if hasattr(self, 'channel_bars') and len(self.channel_bars) == 16:
-            for idx in range(16):
-                val = channels[idx] if idx < len(channels) else 1500
-                self.channel_bars[idx].setValue(val)
-                self.channel_labels[idx].setText(f"{val}µs")
-                if idx == 4: # AUX1 Arm
-                    if val > 1500:
-                        self.channel_labels[idx].setStyleSheet("color: #ef4444; font-weight: bold; font-size: 8.5pt; font-family: 'Consolas', monospace;")
-                        self.channel_bars[idx].setStyleSheet("QProgressBar { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 3px; } QProgressBar::chunk { background-color: #ef4444; border-radius: 2px; }")
-                    else:
-                        self.channel_labels[idx].setStyleSheet("color: #10b981; font-weight: bold; font-size: 8.5pt; font-family: 'Consolas', monospace;")
-                        self.channel_bars[idx].setStyleSheet("QProgressBar { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 3px; } QProgressBar::chunk { background-color: #10b981; border-radius: 2px; }")
-                elif idx == 5: # AUX2 Flight Mode
-                    color = "#10b981" if val < 1300 else ("#f59e0b" if val < 1700 else "#ef4444")
-                    self.channel_labels[idx].setStyleSheet(f"color: {color}; font-weight: bold; font-size: 8.5pt; font-family: 'Consolas', monospace;")
-
-        if hasattr(self, 'drone_rssi_lbl'):
-            self.drone_rssi_lbl.setText(f"Sniffer RSSI: {rssi:.0f} dBm")
-            self.drone_snr_lbl.setText(f"Sniffer SNR: {snr:+.1f} dB")
-            if armed:
-                self.drone_arm_lbl.setText("Arm State: ⚠️ ARMED")
-                self.drone_arm_lbl.setStyleSheet("background-color: #7f1d1d; color: #fca5a5; font-weight: bold; padding: 6px; border-radius: 4px;")
+            # Synchronize live armed status & telemetry to discovered_pilots for AI Copilot & SITREP
+            if not hasattr(self, 'discovered_pilots'):
+                self.discovered_pilots = {}
+            
+            pilot_key = getattr(self, 'last_pilot_key', None) or "ACTIVE_PILOT"
+            pkt_rate = data.get('packet_rate', data.get('rate', '50Hz'))
+            if pilot_key not in self.discovered_pilots:
+                self.discovered_pilots[pilot_key] = {
+                    "u3": 0, "u4": 0, "u5": 0,
+                    "crc_init": "2156",
+                    "rssi": rssi,
+                    "rate_name": pkt_rate,
+                    "armed": armed,
+                    "channels": channels,
+                    "last_seen": time.time()
+                }
             else:
-                self.drone_arm_lbl.setText("Arm State: DISARMED")
-                self.drone_arm_lbl.setStyleSheet("background-color: #0f172a; color: #38bdf8; padding: 6px; border-radius: 4px;")
+                self.discovered_pilots[pilot_key]["armed"] = armed
+                self.discovered_pilots[pilot_key]["rssi"] = rssi
+                self.discovered_pilots[pilot_key]["rate_name"] = pkt_rate
+                self.discovered_pilots[pilot_key]["channels"] = channels
+                self.discovered_pilots[pilot_key]["last_seen"] = time.time()
 
-        # Feature 2: Flight Dynamics & Maneuver Classifier
-        if hasattr(self, 'flight_classifier') and hasattr(self, 'maneuver_badge'):
-            badge_text, badge_color, detail_text = self.flight_classifier.classify(ch1, ch2, ch3, ch4, armed)
-            self.maneuver_badge.setText(badge_text)
-            self.maneuver_badge.setStyleSheet(f"background-color: {badge_color}22; color: {badge_color}; font-weight: bold; font-size: 14px; padding: 8px; border-radius: 4px; border: 1px solid {badge_color};")
-            self.maneuver_detail_lbl.setText(detail_text)
+            for p in self.discovered_pilots.values():
+                p["armed"] = armed
+                p["rate_name"] = pkt_rate
+                p["rssi"] = rssi
+                p["last_seen"] = time.time()
 
-        # Feature 4: Dual-Link RF Proximity (Station to Pilot)
-        if hasattr(self, 'sniffer_rssi_bar') and hasattr(self, 'proximity_lbl'):
-            self.sniffer_rssi_bar.setValue(int(rssi))
-            if rssi > -55:
-                self.proximity_lbl.setText("🔴 IMMEDIATE VICINITY (< 50m)")
-                self.proximity_lbl.setStyleSheet("color: #ef4444; font-weight: bold;")
-                self.sniffer_rssi_bar.setStyleSheet("QProgressBar { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 4px; } QProgressBar::chunk { background-color: #ef4444; border-radius: 3px; }")
-            elif rssi > -70:
-                self.proximity_lbl.setText("🟠 CLOSE PROXIMITY (50m - 200m)")
-                self.proximity_lbl.setStyleSheet("color: #f97316; font-weight: bold;")
-                self.sniffer_rssi_bar.setStyleSheet("QProgressBar { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 4px; } QProgressBar::chunk { background-color: #f97316; border-radius: 3px; }")
-            elif rssi > -88:
-                self.proximity_lbl.setText("🟡 MEDIUM TACTICAL RANGE (200m - 800m)")
-                self.proximity_lbl.setStyleSheet("color: #eab308; font-weight: bold;")
-                self.sniffer_rssi_bar.setStyleSheet("QProgressBar { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 4px; } QProgressBar::chunk { background-color: #eab308; border-radius: 3px; }")
-            else:
-                self.proximity_lbl.setText("🔵 PERIMETER / LONG RANGE (> 800m)")
-                self.proximity_lbl.setStyleSheet("color: #38bdf8; font-weight: bold;")
-                self.sniffer_rssi_bar.setStyleSheet("QProgressBar { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 4px; } QProgressBar::chunk { background-color: #38bdf8; border-radius: 3px; }")
+            if hasattr(self, 'heltec_connect_btn'):
+                self.heltec_connect_btn.setText(f"🚁 HELTEC: {rssi:.0f}dBm")
 
-        # Feature 3: Intel DB Auto-Fingerprinting for Heltec Pilot
-        self.pilot_rssi_history.append((time.time(), rssi))
-        if len(self.pilot_rssi_history) > 20:
-            self.pilot_rssi_history.pop(0)
+            if hasattr(self, 'elrs_rate_badge'):
+                if not hasattr(self, 'current_locked_elrs_rate') or self.current_locked_elrs_rate != pkt_rate:
+                    self.current_locked_elrs_rate = pkt_rate
+                    self.elrs_rate_badge.setText(f"[ ACTIVE DEMOD: {pkt_rate} (Synchronized) ]")
+                    self.elrs_rate_badge.setStyleSheet("background-color: #060a14; color: #10b981; font-family: monospace; font-size: 11px; font-weight: bold; padding: 5px; border: 1px solid #10b981; border-radius: 4px;")
 
-        trend = "STATIONARY"
-        trend_diff = 0.0
-        if len(self.pilot_rssi_history) >= 6:
-            dt = self.pilot_rssi_history[-1][0] - self.pilot_rssi_history[0][0]
-            if dt > 1.0:
-                slope = (self.pilot_rssi_history[-1][1] - self.pilot_rssi_history[0][1]) / dt
-                trend_diff = self.pilot_rssi_history[-1][1] - self.pilot_rssi_history[0][1]
-                if slope > 1.5:
-                    trend = "CLOSING"
-                elif slope < -1.5:
-                    trend = "FADING"
+            # Feature 1: Update Mode 2 Gimbal HUD
+            if hasattr(self, 'gimbal_hud') and self.gimbal_hud:
+                self.gimbal_hud.update_sticks(ch1, ch2, ch3, ch4, armed)
 
-        pilot_key = self.last_pilot_key or "ELRS_0x2156"
-        if pilot_key in self.fingerprint_db:
-            entry = self.fingerprint_db[pilot_key]
-            entry["trend"] = trend
-            entry["trend_diff"] = trend_diff
-            entry["last_seen"] = datetime.datetime.now().strftime("%H:%M:%S")
-            entry["last_pulse"] = 20.0
-            entry["duty_cycle"] = 92.8
-            entry["packet_count"] = entry.get("packet_count", 0) + 1
-            if not hasattr(self, 'last_fp_save_time') or (time.time() - self.last_fp_save_time > 2.0):
-                self.last_fp_save_time = time.time()
-                self.save_fingerprints()
-                self.refresh_fingerprint_ui()
+            thr_pct = max(0.0, min(100.0, (ch3 - 988.0) / 10.24))
+            if hasattr(self, 'drone_sticks_lbl'):
+                self.drone_sticks_lbl.setText(f"THR: {ch3} µs ({thr_pct:.0f}%) | YAW: {ch1} µs | PIT: {ch2} µs | ROL: {ch4} µs")
 
-        if not hasattr(self, 'heltec_last_arm'):
-            self.heltec_last_arm = None
-        if self.heltec_last_arm != armed:
-            self.heltec_last_arm = armed
-            self.log_event(f"HELTEC PILOT STATE: {'ARMED' if armed else 'DISARMED'} (RSSI: {rssi:.0f} dBm)")
+            # Feature 3: Update 16-Channel Diagnostic Matrix
+            if hasattr(self, 'channel_bars') and len(self.channel_bars) == 16:
+                for idx in range(16):
+                    val = channels[idx] if idx < len(channels) else 1500
+                    self.channel_bars[idx].setValue(val)
+                    self.channel_labels[idx].setText(f"{val}µs")
+                    if idx == 4: # AUX1 Arm
+                        if val > 1500:
+                            self.channel_labels[idx].setStyleSheet("color: #ef4444; font-weight: bold; font-size: 8.5pt; font-family: 'Consolas', monospace;")
+                            self.channel_bars[idx].setStyleSheet("QProgressBar { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 3px; } QProgressBar::chunk { background-color: #ef4444; border-radius: 2px; }")
+                        else:
+                            self.channel_labels[idx].setStyleSheet("color: #10b981; font-weight: bold; font-size: 8.5pt; font-family: 'Consolas', monospace;")
+                            self.channel_bars[idx].setStyleSheet("QProgressBar { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 3px; } QProgressBar::chunk { background-color: #10b981; border-radius: 2px; }")
+                    elif idx == 5: # AUX2 Flight Mode
+                        color = "#10b981" if val < 1300 else ("#f59e0b" if val < 1700 else "#ef4444")
+                        self.channel_labels[idx].setStyleSheet(f"color: {color}; font-weight: bold; font-size: 8.5pt; font-family: 'Consolas', monospace;")
+
+            if hasattr(self, 'drone_rssi_lbl'):
+                self.drone_rssi_lbl.setText(f"Sniffer RSSI: {rssi:.0f} dBm")
+                self.drone_snr_lbl.setText(f"Sniffer SNR: {snr:+.1f} dB")
+                if armed:
+                    self.drone_arm_lbl.setText("Arm State: ⚠️ ARMED")
+                    self.drone_arm_lbl.setStyleSheet("background-color: #7f1d1d; color: #fca5a5; font-weight: bold; padding: 6px; border-radius: 4px;")
+                else:
+                    self.drone_arm_lbl.setText("Arm State: DISARMED")
+                    self.drone_arm_lbl.setStyleSheet("background-color: #0f172a; color: #38bdf8; padding: 6px; border-radius: 4px;")
+
+            # Feature 2: Flight Dynamics & Maneuver Classifier
+            if hasattr(self, 'flight_classifier') and hasattr(self, 'maneuver_badge') and hasattr(self, 'maneuver_detail_lbl'):
+                badge_text, badge_color, detail_text = self.flight_classifier.classify(ch1, ch2, ch3, ch4, armed)
+                self.maneuver_badge.setText(badge_text)
+                self.maneuver_badge.setStyleSheet(f"background-color: {badge_color}22; color: {badge_color}; font-weight: bold; font-size: 14px; padding: 8px; border-radius: 4px; border: 1px solid {badge_color};")
+                self.maneuver_detail_lbl.setText(detail_text)
+
+            # Feature 4: Dual-Link RF Proximity (Station to Pilot)
+            if hasattr(self, 'sniffer_rssi_bar') and hasattr(self, 'proximity_lbl'):
+                self.sniffer_rssi_bar.setValue(int(rssi))
+                if rssi > -55:
+                    self.proximity_lbl.setText("🔴 IMMEDIATE VICINITY (< 50m)")
+                    self.proximity_lbl.setStyleSheet("color: #ef4444; font-weight: bold;")
+                    self.sniffer_rssi_bar.setStyleSheet("QProgressBar { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 4px; } QProgressBar::chunk { background-color: #ef4444; border-radius: 3px; }")
+                elif rssi > -70:
+                    self.proximity_lbl.setText("🟠 CLOSE PROXIMITY (50m - 200m)")
+                    self.proximity_lbl.setStyleSheet("color: #f97316; font-weight: bold;")
+                    self.sniffer_rssi_bar.setStyleSheet("QProgressBar { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 4px; } QProgressBar::chunk { background-color: #f97316; border-radius: 3px; }")
+                elif rssi > -88:
+                    self.proximity_lbl.setText("🟡 MEDIUM TACTICAL RANGE (200m - 800m)")
+                    self.proximity_lbl.setStyleSheet("color: #eab308; font-weight: bold;")
+                    self.sniffer_rssi_bar.setStyleSheet("QProgressBar { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 4px; } QProgressBar::chunk { background-color: #eab308; border-radius: 3px; }")
+                else:
+                    self.proximity_lbl.setText("🔵 PERIMETER / LONG RANGE (> 800m)")
+                    self.proximity_lbl.setStyleSheet("color: #38bdf8; font-weight: bold;")
+                    self.sniffer_rssi_bar.setStyleSheet("QProgressBar { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 4px; } QProgressBar::chunk { background-color: #38bdf8; border-radius: 3px; }")
+
+            # Feature 3: Intel DB Auto-Fingerprinting for Heltec Pilot
+            if hasattr(self, 'pilot_rssi_history'):
+                self.pilot_rssi_history.append((time.time(), rssi))
+                if len(self.pilot_rssi_history) > 20:
+                    self.pilot_rssi_history.pop(0)
+
+                trend = "STATIONARY"
+                trend_diff = 0.0
+                if len(self.pilot_rssi_history) >= 6:
+                    dt = self.pilot_rssi_history[-1][0] - self.pilot_rssi_history[0][0]
+                    if dt > 1.0:
+                        slope = (self.pilot_rssi_history[-1][1] - self.pilot_rssi_history[0][1]) / dt
+                        trend_diff = self.pilot_rssi_history[-1][1] - self.pilot_rssi_history[0][1]
+                        if slope > 1.5:
+                            trend = "CLOSING"
+                        elif slope < -1.5:
+                            trend = "FADING"
+
+                pilot_key = getattr(self, 'last_pilot_key', None) or "ELRS_0x2156"
+                if hasattr(self, 'fingerprint_db') and pilot_key in self.fingerprint_db:
+                    entry = self.fingerprint_db[pilot_key]
+                    entry["trend"] = trend
+                    entry["trend_diff"] = trend_diff
+                    entry["last_seen"] = datetime.datetime.now().strftime("%H:%M:%S")
+                    entry["last_pulse"] = 20.0
+                    entry["duty_cycle"] = 92.8
+                    entry["packet_count"] = entry.get("packet_count", 0) + 1
+                    if not hasattr(self, 'last_fp_save_time') or (time.time() - self.last_fp_save_time > 2.0):
+                        self.last_fp_save_time = time.time()
+                        self.save_fingerprints()
+                        self.refresh_fingerprint_ui()
+
+            if not hasattr(self, 'heltec_last_arm'):
+                self.heltec_last_arm = None
+            if self.heltec_last_arm != armed:
+                self.heltec_last_arm = armed
+                self.log_event(f"HELTEC PILOT STATE: {'ARMED' if armed else 'DISARMED'} (RSSI: {rssi:.0f} dBm)")
+        except Exception as e:
+            pass
 
     def on_heltec_tlm_link(self, data):
-        lq = data['drone_lq']
-        drone_rssi = data['drone_rssi']
-        drone_snr = data['drone_snr']
-        self.last_drone_rssi = drone_rssi
-        self.last_drone_lq = lq
+        try:
+            lq = data.get('drone_lq', data.get('link_quality', 100))
+            drone_rssi = data.get('drone_rssi', data.get('rssi1', -100.0))
+            drone_snr = data.get('drone_snr', data.get('snr', 0.0))
+            self.last_drone_rssi = drone_rssi
+            self.last_drone_lq = lq
 
-        if hasattr(self, 'drone_lq_lbl'):
-            self.drone_lq_lbl.setText(f"Drone Link Quality: {lq}%")
-            self.drone_remote_rssi_lbl.setText(f"Drone RSSI: {drone_rssi} dBm")
+            if hasattr(self, 'drone_lq_lbl'):
+                self.drone_lq_lbl.setText(f"Drone Link Quality: {lq}%")
+                self.drone_remote_rssi_lbl.setText(f"Drone RSSI: {drone_rssi:.0f} dBm")
 
-        if hasattr(self, 'drone_lq_bar') and hasattr(self, 'link_margin_lbl'):
-            self.drone_lq_bar.setValue(int(lq))
-            if lq >= 85 and drone_rssi > -95:
-                self.link_margin_lbl.setText(f"NOMINAL LINK ({lq}% RC Integrity)")
-                self.link_margin_lbl.setStyleSheet("color: #22c55e; font-weight: bold;")
-                self.drone_lq_bar.setStyleSheet("QProgressBar { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 4px; } QProgressBar::chunk { background-color: #22c55e; border-radius: 3px; }")
-            elif lq >= 50 or drone_rssi > -105:
-                self.link_margin_lbl.setText(f"MARGIN DEGRADED ({lq}% LQ | {drone_rssi}dBm)")
-                self.link_margin_lbl.setStyleSheet("color: #eab308; font-weight: bold;")
-                self.drone_lq_bar.setStyleSheet("QProgressBar { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 4px; } QProgressBar::chunk { background-color: #eab308; border-radius: 3px; }")
-            else:
-                self.link_margin_lbl.setText(f"CRITICAL FAILSAFE IMMINENT ({lq}% LQ)")
-                self.link_margin_lbl.setStyleSheet("color: #ef4444; font-weight: bold;")
-                self.drone_lq_bar.setStyleSheet("QProgressBar { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 4px; } QProgressBar::chunk { background-color: #ef4444; border-radius: 3px; }")
+            if hasattr(self, 'drone_lq_bar') and hasattr(self, 'link_margin_lbl'):
+                self.drone_lq_bar.setValue(int(lq))
+                if lq >= 85 and drone_rssi > -95:
+                    self.link_margin_lbl.setText(f"NOMINAL LINK ({lq}% RC Integrity)")
+                    self.link_margin_lbl.setStyleSheet("color: #22c55e; font-weight: bold;")
+                    self.drone_lq_bar.setStyleSheet("QProgressBar { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 4px; } QProgressBar::chunk { background-color: #22c55e; border-radius: 3px; }")
+                elif lq >= 50 or drone_rssi > -105:
+                    self.link_margin_lbl.setText(f"MARGIN DEGRADED ({lq}% LQ | {drone_rssi:.0f}dBm)")
+                    self.link_margin_lbl.setStyleSheet("color: #eab308; font-weight: bold;")
+                    self.drone_lq_bar.setStyleSheet("QProgressBar { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 4px; } QProgressBar::chunk { background-color: #eab308; border-radius: 3px; }")
+                else:
+                    self.link_margin_lbl.setText(f"CRITICAL FAILSAFE IMMINENT ({lq}% LQ)")
+                    self.link_margin_lbl.setStyleSheet("color: #ef4444; font-weight: bold;")
+                    self.drone_lq_bar.setStyleSheet("QProgressBar { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 4px; } QProgressBar::chunk { background-color: #ef4444; border-radius: 3px; }")
 
-        self.geo_status_label.setText(f"[ TARGET TELEMETRY: PROTOCOL LOCKED | LQ: {lq}% | RSSI: {drone_rssi}dBm ]")
-        self.geo_status_label.setStyleSheet("color: #22c55e; font-weight: bold; font-size: 15px;")
-        if not hasattr(self, 'last_tlm_log_time') or (time.time() - self.last_tlm_log_time > 3.0):
-            self.last_tlm_log_time = time.time()
-            self.log_event(f"HELTEC DRONE TELEMETRY: LQ={lq}% | DroneRSSI={drone_rssi} dBm | SNR={drone_snr} dB")
+            if hasattr(self, 'geo_status_label'):
+                self.geo_status_label.setText(f"[ TARGET TELEMETRY: PROTOCOL LOCKED | LQ: {lq}% | RSSI: {drone_rssi:.0f}dBm ]")
+                self.geo_status_label.setStyleSheet("color: #22c55e; font-weight: bold; font-size: 15px;")
+            if not hasattr(self, 'last_tlm_log_time') or (time.time() - self.last_tlm_log_time > 3.0):
+                self.last_tlm_log_time = time.time()
+                self.log_event(f"HELTEC DRONE TELEMETRY: LQ={lq}% | DroneRSSI={drone_rssi:.0f} dBm | SNR={drone_snr:.1f} dB")
+        except Exception as e:
+            pass
 
     def on_heltec_battery(self, data):
-        if hasattr(self, 'drone_vbat_lbl'):
-            self.drone_vbat_lbl.setText(f"LiPo Voltage: {data['voltage']:.1f} V")
-            self.drone_curr_lbl.setText(f"Current Draw: {data['current']:.1f} A")
-        self.log_event(f"HELTEC DRONE BATTERY: {data['voltage']:.1f}V | {data['current']:.1f}A | {data['battery_pct']}%")
+        try:
+            v = data.get('voltage', 0.0)
+            curr = data.get('current', 0.0)
+            pct = data.get('battery_pct', 100.0)
+            if hasattr(self, 'drone_vbat_lbl'):
+                self.drone_vbat_lbl.setText(f"LiPo Voltage: {v:.1f} V")
+                self.drone_curr_lbl.setText(f"Current Draw: {curr:.1f} A")
+            self.log_event(f"HELTEC DRONE BATTERY: {v:.1f}V | {curr:.1f}A | {pct:.1f}%")
+        except Exception as e:
+            pass
 
     def on_heltec_attitude(self, data):
-        pitch = data.get("pitch", 0.0)
-        roll = data.get("roll", 0.0)
-        yaw = data.get("yaw", 0.0)
-        if hasattr(self, 'drone_att_lbl'):
-            self.drone_att_lbl.setText(f"Attitude: P:{pitch:+.0f}° | R:{roll:+.0f}° | Y:{yaw:.0f}°")
-        if not hasattr(self, 'last_att_log_time') or (time.time() - self.last_att_log_time > 5.0):
-            self.last_att_log_time = time.time()
-            self.log_event(f"HELTEC UAV ATTITUDE: Pitch={pitch:+.1f}° | Roll={roll:+.1f}° | Yaw={yaw:.1f}°")
+        try:
+            pitch = data.get("pitch", 0.0)
+            roll = data.get("roll", 0.0)
+            yaw = data.get("yaw", 0.0)
+            if hasattr(self, 'drone_att_lbl'):
+                self.drone_att_lbl.setText(f"Attitude: P:{pitch:+.0f}° | R:{roll:+.0f}° | Y:{yaw:.0f}°")
+            if not hasattr(self, 'last_att_log_time') or (time.time() - self.last_att_log_time > 5.0):
+                self.last_att_log_time = time.time()
+                self.log_event(f"HELTEC UAV ATTITUDE: Pitch={pitch:+.1f}° | Roll={roll:+.1f}° | Yaw={yaw:.1f}°")
+        except Exception as e:
+            pass
 
     def on_heltec_flight_mode(self, data):
-        mode = data.get("mode", "ANGLE")
-        if hasattr(self, 'drone_fmode_lbl'):
-            self.drone_fmode_lbl.setText(f"Flight Mode: {mode}")
-            color = "#10b981" if mode in ["ANGLE", "POSHOLD"] else ("#f59e0b" if mode == "HORIZON" else "#ef4444")
-            self.drone_fmode_lbl.setStyleSheet(f"background-color: #0f172a; color: {color}; border: 1px solid #1e293b; padding: 6px; border-radius: 4px; font-weight: bold; font-size: 11px;")
-        self.log_event(f"HELTEC UAV FLIGHT MODE: {mode}")
+        try:
+            mode = data.get("mode", "ANGLE")
+            if hasattr(self, 'drone_fmode_lbl'):
+                self.drone_fmode_lbl.setText(f"Flight Mode: {mode}")
+                color = "#10b981" if mode in ["ANGLE", "POSHOLD"] else ("#f59e0b" if mode == "HORIZON" else "#ef4444")
+                self.drone_fmode_lbl.setStyleSheet(f"background-color: #0f172a; color: {color}; border: 1px solid #1e293b; padding: 6px; border-radius: 4px; font-weight: bold; font-size: 11px;")
+            self.log_event(f"HELTEC UAV FLIGHT MODE: {mode}")
+        except Exception as e:
+            pass
 
     def on_heltec_gps(self, data):
-        lat = data.get("lat", 0.0)
-        lon = data.get("lon", 0.0)
-        alt = data.get("alt", 0.0)
-        spd = data.get("spd", 0.0)
-        sats = data.get("sats", 0)
+        try:
+            lat = data.get("lat", 0.0)
+            lon = data.get("lon", 0.0)
+            alt = data.get("alt", 0.0)
+            spd = data.get("spd", 0.0)
+            sats = data.get("sats", 0)
 
-        # Synchronize GPS and kinematic state to discovered_pilots for AI Copilot
-        if hasattr(self, 'discovered_pilots'):
-            for p in self.discovered_pilots.values():
-                if lat != 0 or lon != 0:
-                    p["lat"] = lat
-                    p["lon"] = lon
-                p["alt"] = alt
-                p["spd"] = spd
-                p["sats"] = sats
+            # Synchronize GPS and kinematic state to discovered_pilots for AI Copilot
+            if hasattr(self, 'discovered_pilots'):
+                for p in self.discovered_pilots.values():
+                    if lat != 0 or lon != 0:
+                        p["lat"] = lat
+                        p["lon"] = lon
+                    p["alt"] = alt
+                    p["spd"] = spd
+                    p["sats"] = sats
 
-        if lat != 0 or lon != 0:
-            self.gps_breadcrumbs_count += 1
-            if hasattr(self, 'geo_breadcrumbs_lbl'):
-                self.geo_breadcrumbs_lbl.setText(f"[ TRACK POINTS: {self.gps_breadcrumbs_count} ]")
+            if lat != 0 or lon != 0:
+                self.gps_breadcrumbs_count += 1
+                if hasattr(self, 'geo_breadcrumbs_lbl'):
+                    self.geo_breadcrumbs_lbl.setText(f"[ TRACK POINTS: {self.gps_breadcrumbs_count} ]")
 
-            self.update_theoretical_locations(lat - 0.001, lon - 0.001, lat, lon)
-            
-            # Feature 5: Append point to Leaflet droneTrail polyline
-            js_trail = f"addDroneTrailPoint({lat}, {lon});"
-            self.geo_map_view.page().runJavaScript(js_trail)
+                self.update_theoretical_locations(lat - 0.001, lon - 0.001, lat, lon)
+                
+                # Feature 5: Append point to Leaflet droneTrail polyline
+                js_trail = f"addDroneTrailPoint({lat}, {lon});"
+                self.geo_map_view.page().runJavaScript(js_trail)
 
-            # Draw estimated RF proximity ring around ground station / pilot
-            js_ring = f"updateRfRangeRing({lat - 0.001}, {lon - 0.001}, 250, '#38bdf8');"
-            self.geo_map_view.page().runJavaScript(js_ring)
+                # Draw estimated RF proximity ring around ground station / pilot
+                js_ring = f"updateRfRangeRing({lat - 0.001}, {lon - 0.001}, 250, '#38bdf8');"
+                self.geo_map_view.page().runJavaScript(js_ring)
 
-            self.log_event(f"HELTEC UAV GPS FIX: {lat:.5f}, {lon:.5f} | Alt: {alt}m | Spd: {spd}km/h | Sats: {sats}")
+                self.log_event(f"HELTEC UAV GPS FIX: {lat:.5f}, {lon:.5f} | Alt: {alt}m | Spd: {spd}km/h | Sats: {sats}")
+        except Exception as e:
+            pass
 
     def on_heltec_sync(self, data):
-        crc_hex = data['crc_init']
-        pilot_id = f"0x{crc_hex}"
-        uid_str = f"{data['uid4']}.{data['uid5']}"
-        pilot_key = f"ELRS_{pilot_id}"
-        self.last_pilot_key = pilot_key
+        try:
+            crc_hex = data.get('crc_init', '')
+            pilot_id = f"0x{crc_hex}"
+            u4 = data.get('uid4', data.get('u4', 0))
+            u5 = data.get('uid5', data.get('u5', 0))
+            uid_str = f"{u4}.{u5}"
+            pilot_key = f"ELRS_{pilot_id}"
+            self.last_pilot_key = pilot_key
 
-        if hasattr(self, 'drone_pilot_lbl'):
-            self.drone_pilot_lbl.setText(f"Pilot Hash: {pilot_id} (UID {uid_str})")
+            if hasattr(self, 'drone_pilot_lbl'):
+                self.drone_pilot_lbl.setText(f"Pilot Hash: {pilot_id} (UID {uid_str})")
 
-        # Feature 3: Auto-register into Intel DB
-        if pilot_key not in self.fingerprint_db:
-            self.fingerprint_db[pilot_key] = {
-                "name": f"ELRS Pilot ({pilot_id})",
-                "classification": "[ELRS 900MHz]",
-                "found_at": 915.00,
-                "protocol": "ExpressLRS 900MHz (50Hz SF8)",
-                "crc_init": pilot_id,
-                "uid": uid_str,
-                "first_seen": datetime.datetime.now().strftime("%H:%M:%S"),
-                "last_seen": datetime.datetime.now().strftime("%H:%M:%S"),
-                "trend": "STATIONARY",
-                "trend_diff": 0.0,
-                "last_pulse": 20.0,
-                "duty_cycle": 92.8,
-                "packet_count": 1
-            }
-            self.save_fingerprints()
-            self.refresh_fingerprint_ui()
-            self.log_event(f"INTEL DB: Auto-registered ELRS Pilot {pilot_id} (UID {uid_str})")
+            # Feature 3: Auto-register into Intel DB
+            if hasattr(self, 'fingerprint_db') and pilot_key not in self.fingerprint_db:
+                self.fingerprint_db[pilot_key] = {
+                    "name": f"ELRS Pilot ({pilot_id})",
+                    "classification": "[ELRS 900MHz]",
+                    "found_at": 915.00,
+                    "protocol": "ExpressLRS 900MHz (50Hz SF8)",
+                    "crc_init": pilot_id,
+                    "uid": uid_str,
+                    "first_seen": datetime.datetime.now().strftime("%H:%M:%S"),
+                    "last_seen": datetime.datetime.now().strftime("%H:%M:%S"),
+                    "trend": "STATIONARY",
+                    "trend_diff": 0.0,
+                    "last_pulse": 20.0,
+                    "duty_cycle": 92.8,
+                    "packet_count": 1
+                }
+                self.save_fingerprints()
+                self.refresh_fingerprint_ui()
+                self.log_event(f"INTEL DB: Auto-registered ELRS Pilot {pilot_id} (UID {uid_str})")
 
-        self.log_event(f"HELTEC DISCOVERED PILOT: Hash {pilot_id} | HopIdx: {data['hop_idx']} | Nonce: {data['nonce']}")
+            hop_idx = data.get('hop_idx', 0)
+            nonce = data.get('nonce', 0)
+            self.log_event(f"HELTEC DISCOVERED PILOT: Hash {pilot_id} | HopIdx: {hop_idx} | Nonce: {nonce}")
+        except Exception as e:
+            pass
 
     def manual_plot_target(self):
         """Allows the user to manually test the map via the UI text fields."""
         try:
             lat = float(self.geo_lat_input.text())
             lon = float(self.geo_lon_input.text())
+            self.settings["map_home_lat"] = lat
+            self.settings["map_home_lon"] = lon
+            save_app_settings(self.settings)
             self.update_theoretical_locations(lat, lon, lat + 0.002, lon + 0.002)
-            self.geo_map_view.page().runJavaScript(f"addDroneTrailPoint({lat + 0.002}, {lon + 0.002});")
-            self.geo_map_view.page().runJavaScript(f"updateRfRangeRing({lat}, {lon}, 300, '#38bdf8');")
+            self.geo_map_view.page().runJavaScript(f"if (typeof setObserverLocation === 'function') {{ setObserverLocation({lat}, {lon}); }}")
+            self.geo_map_view.page().runJavaScript(f"if (typeof addDroneTrailPoint === 'function') {{ addDroneTrailPoint({lat + 0.002}, {lon + 0.002}); }}")
+            self.geo_map_view.page().runJavaScript(f"if (typeof updateRfRangeRing === 'function') {{ updateRfRangeRing({lat}, {lon}, 300, '#38bdf8'); }}")
+            self.log_event(f"OBSERVER COORDINATES APPLIED: Relocated station to {lat:.5f}, {lon:.5f}")
         except ValueError:
             self.log_event("ERROR: Invalid manual coordinates.")
 
@@ -6511,8 +6688,14 @@ class CEMAApp(QMainWindow):
 
         # 2. Heltec V3 LoRa Sniffer Telemetry Badge
         if hasattr(self, 'badge_heltec'):
-            if self.heltec_thread and getattr(self.heltec_thread, 'running', False):
-                pilot_cnt = getattr(self, 'last_pilot_count', 0)
+            is_active = False
+            if hasattr(self, 'dual_lora_mgr') and self.dual_lora_mgr:
+                is_active = getattr(self.dual_lora_mgr.node_b, 'running', False) or getattr(self.dual_lora_mgr.node_a, 'running', False)
+            elif self.heltec_thread and getattr(self.heltec_thread, 'running', False):
+                is_active = True
+
+            if is_active:
+                pilot_cnt = len(getattr(self, 'discovered_pilots', {}))
                 if pilot_cnt > 0:
                     self.badge_heltec.setText(f"[ HELTEC V3: {pilot_cnt} PILOT(S) ACTIVE ]")
                     self.badge_heltec.setStyleSheet("color: #38bdf8; background: #060e1a; font-family: 'Consolas', monospace; font-size: 9.5pt; font-weight: bold; padding: 2px 8px; border: 1px solid #0284c7; border-radius: 3px;")
@@ -7158,6 +7341,8 @@ class CEMAApp(QMainWindow):
             self.native_video_thread.stop()
         if hasattr(self, 'external_video_thread') and self.external_video_thread:
             self.external_video_thread.stop()
+        if hasattr(self, 'dual_lora_mgr') and self.dual_lora_mgr:
+            self.dual_lora_mgr.stop_nodes()
         if self.heltec_thread:
             self.heltec_thread.stop()
         if self.hackrf_thread:

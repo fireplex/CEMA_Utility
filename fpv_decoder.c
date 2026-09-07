@@ -1,9 +1,46 @@
-#include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <math.h>
+
+/* ---- Cross-platform OS glue (Windows DLL / Linux-ARM .so) ---- */
+#ifdef _WIN32
+  #include <windows.h>
+  #define DLL_EXPORT __declspec(dllexport)
+  typedef HMODULE lib_handle_t;
+  #define LIB_OPEN(p)   LoadLibraryA(p)
+  #define LIB_SYM(h,s)  GetProcAddress((h),(s))
+  #define LIB_CLOSE(h)  FreeLibrary(h)
+  typedef volatile LONG atomic_lock_t;
+  #define ATOMIC_XCHG(ptr,val) InterlockedExchange((ptr),(val))
+#else
+  #include <dlfcn.h>
+  #define DLL_EXPORT __attribute__((visibility("default")))
+  typedef void* lib_handle_t;
+  #define LIB_OPEN(p)   dlopen((p), RTLD_NOW | RTLD_GLOBAL)
+  #define LIB_SYM(h,s)  dlsym((h),(s))
+  #define LIB_CLOSE(h)  dlclose(h)
+  typedef volatile long atomic_lock_t;
+  #define ATOMIC_XCHG(ptr,val) __atomic_exchange_n((ptr),(val),__ATOMIC_SEQ_CST)
+#endif
+
+/* Portable monotonic wall-clock in seconds (for FPS calculation) */
+#ifndef _WIN32
+  #include <time.h>
+#endif
+static double now_seconds(void) {
+#ifdef _WIN32
+    LARGE_INTEGER f, t;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t);
+    return (double)t.QuadPart / (double)f.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+#endif
+}
 
 #define PI 3.14159265358979323846
 #define SAMPLES_PER_FRAME 400000 // Exact 625 full-frame lines at 10 MSPS (40.0 ms = 25 FPS)
@@ -38,7 +75,7 @@ typedef int (*pfn_hackrf_set_lna_gain)(hackrf_device* device, uint32_t value);
 typedef int (*pfn_hackrf_set_vga_gain)(hackrf_device* device, uint32_t value);
 typedef int (*pfn_hackrf_set_baseband_filter_bandwidth)(hackrf_device* device, const uint32_t bandwidth_hz);
 
-static HMODULE hHackrfDll = NULL;
+static lib_handle_t hHackrfDll = NULL;
 static pfn_hackrf_init fn_hackrf_init = NULL;
 static pfn_hackrf_exit fn_hackrf_exit = NULL;
 static pfn_hackrf_open fn_hackrf_open = NULL;
@@ -96,8 +133,7 @@ static float g_lp_x1 = 0.0f, g_lp_x2 = 0.0f;
 static float g_lp_y1 = 0.0f, g_lp_y2 = 0.0f;
 
 static uint32_t g_frame_count = 0;
-static LARGE_INTEGER g_perf_freq;
-static LARGE_INTEGER g_last_fps_time;
+static double g_last_fps_time = 0.0;
 static float g_fps = 0.0f;
 
 // Local 2D field buffer
@@ -190,38 +226,45 @@ static bool load_hackrf_dll(void) {
     if (hHackrfDll) return true;
 
     const char* paths[] = {
+#ifdef _WIN32
         "hackrf.dll",
-        "C:\\Users\\toxic\\Downloads\\hackrf-tools-windows (1)\\hackrf.dll",
         "C:\\Program Files\\HackRF\\bin\\hackrf.dll",
         "C:\\Users\\toxic\\Desktop\\hackrf-utility\\hackrf.dll"
+#else
+        "libhackrf.so.0",
+        "libhackrf.so",
+        "/usr/lib/aarch64-linux-gnu/libhackrf.so.0",
+        "/usr/local/lib/libhackrf.so.0"
+#endif
     };
 
-    for (int i = 0; i < 4; i++) {
-        hHackrfDll = LoadLibraryA(paths[i]);
+    int npaths = (int)(sizeof(paths) / sizeof(paths[0]));
+    for (int i = 0; i < npaths; i++) {
+        hHackrfDll = LIB_OPEN(paths[i]);
         if (hHackrfDll) break;
     }
 
     if (!hHackrfDll) return false;
 
-    fn_hackrf_init = (pfn_hackrf_init)GetProcAddress(hHackrfDll, "hackrf_init");
-    fn_hackrf_exit = (pfn_hackrf_exit)GetProcAddress(hHackrfDll, "hackrf_exit");
-    fn_hackrf_open = (pfn_hackrf_open)GetProcAddress(hHackrfDll, "hackrf_open");
-    fn_hackrf_close = (pfn_hackrf_close)GetProcAddress(hHackrfDll, "hackrf_close");
-    fn_hackrf_start_rx = (pfn_hackrf_start_rx)GetProcAddress(hHackrfDll, "hackrf_start_rx");
-    fn_hackrf_stop_rx = (pfn_hackrf_stop_rx)GetProcAddress(hHackrfDll, "hackrf_stop_rx");
-    fn_hackrf_set_freq = (pfn_hackrf_set_freq)GetProcAddress(hHackrfDll, "hackrf_set_freq");
-    fn_hackrf_set_sample_rate = (pfn_hackrf_set_sample_rate)GetProcAddress(hHackrfDll, "hackrf_set_sample_rate");
-    fn_hackrf_set_amp_enable = (pfn_hackrf_set_amp_enable)GetProcAddress(hHackrfDll, "hackrf_set_amp_enable");
-    fn_hackrf_set_lna_gain = (pfn_hackrf_set_lna_gain)GetProcAddress(hHackrfDll, "hackrf_set_lna_gain");
-    fn_hackrf_set_vga_gain = (pfn_hackrf_set_vga_gain)GetProcAddress(hHackrfDll, "hackrf_set_vga_gain");
-    fn_hackrf_set_baseband_filter_bandwidth = (pfn_hackrf_set_baseband_filter_bandwidth)GetProcAddress(hHackrfDll, "hackrf_set_baseband_filter_bandwidth");
+    fn_hackrf_init = (pfn_hackrf_init)LIB_SYM(hHackrfDll, "hackrf_init");
+    fn_hackrf_exit = (pfn_hackrf_exit)LIB_SYM(hHackrfDll, "hackrf_exit");
+    fn_hackrf_open = (pfn_hackrf_open)LIB_SYM(hHackrfDll, "hackrf_open");
+    fn_hackrf_close = (pfn_hackrf_close)LIB_SYM(hHackrfDll, "hackrf_close");
+    fn_hackrf_start_rx = (pfn_hackrf_start_rx)LIB_SYM(hHackrfDll, "hackrf_start_rx");
+    fn_hackrf_stop_rx = (pfn_hackrf_stop_rx)LIB_SYM(hHackrfDll, "hackrf_stop_rx");
+    fn_hackrf_set_freq = (pfn_hackrf_set_freq)LIB_SYM(hHackrfDll, "hackrf_set_freq");
+    fn_hackrf_set_sample_rate = (pfn_hackrf_set_sample_rate)LIB_SYM(hHackrfDll, "hackrf_set_sample_rate");
+    fn_hackrf_set_amp_enable = (pfn_hackrf_set_amp_enable)LIB_SYM(hHackrfDll, "hackrf_set_amp_enable");
+    fn_hackrf_set_lna_gain = (pfn_hackrf_set_lna_gain)LIB_SYM(hHackrfDll, "hackrf_set_lna_gain");
+    fn_hackrf_set_vga_gain = (pfn_hackrf_set_vga_gain)LIB_SYM(hHackrfDll, "hackrf_set_vga_gain");
+    fn_hackrf_set_baseband_filter_bandwidth = (pfn_hackrf_set_baseband_filter_bandwidth)LIB_SYM(hHackrfDll, "hackrf_set_baseband_filter_bandwidth");
 
     return (fn_hackrf_init && fn_hackrf_open && fn_hackrf_start_rx);
 }
 
 // --- EXPORTED C API ---
 
-__declspec(dllexport) int fpv_decoder_start(uint64_t freq_hz, uint32_t sample_rate, uint32_t lna, uint32_t vga, uint32_t amp) {
+DLL_EXPORT int fpv_decoder_start(uint64_t freq_hz, uint32_t sample_rate, uint32_t lna, uint32_t vga, uint32_t amp) {
     if (!load_hackrf_dll()) {
         return -1;
     }
@@ -230,8 +273,7 @@ __declspec(dllexport) int fpv_decoder_start(uint64_t freq_hz, uint32_t sample_ra
         return 0;
     }
 
-    QueryPerformanceFrequency(&g_perf_freq);
-    QueryPerformanceCounter(&g_last_fps_time);
+    g_last_fps_time = now_seconds();
     g_frame_count = 0;
     g_fps = 0.0f;
 
@@ -280,7 +322,7 @@ __declspec(dllexport) int fpv_decoder_start(uint64_t freq_hz, uint32_t sample_ra
     return 0;
 }
 
-__declspec(dllexport) void fpv_decoder_set_tuning(int standard, int invert, float brightness, float contrast, int auto_hsync, float manual_line_len, int v_hold_offset, int h_hold_offset) {
+DLL_EXPORT void fpv_decoder_set_tuning(int standard, int invert, float brightness, float contrast, int auto_hsync, float manual_line_len, int v_hold_offset, int h_hold_offset) {
     g_standard = standard;
     g_invert_polarity = (invert != 0);
     g_brightness = brightness;
@@ -293,7 +335,7 @@ __declspec(dllexport) void fpv_decoder_set_tuning(int standard, int invert, floa
     g_h_hold_offset = h_hold_offset;
 }
 
-__declspec(dllexport) int fpv_decoder_get_frame(uint8_t* out_pixels, int width, int height, int* out_sync_locked, float* out_fps) {
+DLL_EXPORT int fpv_decoder_get_frame(uint8_t* out_pixels, int width, int height, int* out_sync_locked, float* out_fps) {
     if (!g_running || !out_pixels) return 0;
 
     uint32_t seq = g_field_sequence;
@@ -417,9 +459,8 @@ __declspec(dllexport) int fpv_decoder_get_frame(uint8_t* out_pixels, int width, 
 
     // FPS Calculation
     g_frame_count++;
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    double elapsed = (double)(now.QuadPart - g_last_fps_time.QuadPart) / (double)g_perf_freq.QuadPart;
+    double now = now_seconds();
+    double elapsed = now - g_last_fps_time;
     if (elapsed >= 1.0) {
         g_fps = (float)((double)g_frame_count / elapsed);
         g_frame_count = 0;
@@ -432,10 +473,10 @@ __declspec(dllexport) int fpv_decoder_get_frame(uint8_t* out_pixels, int width, 
     return 1;
 }
 
-static volatile LONG g_stop_lock = 0;
+static atomic_lock_t g_stop_lock = 0;
 
-__declspec(dllexport) void fpv_decoder_stop(void) {
-    if (InterlockedExchange(&g_stop_lock, 1) != 0) {
+DLL_EXPORT void fpv_decoder_stop(void) {
+    if (ATOMIC_XCHG(&g_stop_lock, 1) != 0) {
         return;
     }
 
@@ -453,5 +494,5 @@ __declspec(dllexport) void fpv_decoder_stop(void) {
         }
     }
 
-    InterlockedExchange(&g_stop_lock, 0);
+    ATOMIC_XCHG(&g_stop_lock, 0);
 }
