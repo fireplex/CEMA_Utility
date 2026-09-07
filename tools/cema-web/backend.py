@@ -1512,6 +1512,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         serial_cmd_queue.put("LOCK_PILOT:AUTO")
                         log_sitrep("INFO", "PILOT", "Target lock released -> AUTO mode", voice=True)
                     else:
+                        pin_rate = None
                         p = tactical_state.pilots.get(target)
                         if not p and "," in target:
                             try:
@@ -1525,6 +1526,9 @@ async def websocket_endpoint(websocket: WebSocket):
                             target_uid = p.get("uid", target)
                             tactical_state.active_target_pilot = target_uid
                             cmd = f"LOCK_PILOT:{p['u3']},{p['u4']},{p['u5']}"
+                            pr = str(p.get("rate", "")).upper().strip()
+                            if pr and pr not in ("UNKNOWN", "AUTO"):
+                                pin_rate = pr
                         elif ":" in target:
                             parts = [int(x, 16) for x in target.split(":")]
                             tactical_state.active_target_pilot = target
@@ -1536,8 +1540,14 @@ async def websocket_endpoint(websocket: WebSocket):
                         else:
                             tactical_state.active_target_pilot = target
                             cmd = f"LOCK_PILOT:{target}"
+                        # Pin the demodulator to the pilot's discovered rate FIRST so it locks
+                        # cleanly, instead of staying in auto-rate scan (which rotates onto wrong
+                        # rates seeing only noise and collapses the RC feed to ~1-2 pkt/s).
+                        if pin_rate:
+                            tactical_state.active_rate_name = pin_rate
+                            serial_cmd_queue.put(f"SET_RATE:{pin_rate}")
                         serial_cmd_queue.put(cmd)
-                        log_sitrep("CRIT", "PILOT", f"TARGET LOCKED: UID {tactical_state.active_target_pilot}", voice=True)
+                        log_sitrep("CRIT", "PILOT", f"TARGET LOCKED: UID {tactical_state.active_target_pilot} @ {pin_rate or 'current rate'}", voice=True)
                 
             elif action == "serial_tx":
                 cmd = msg.get("cmd", "").strip()
