@@ -5,6 +5,16 @@
 #include <SSD1306Wire.h>
 
 // =============================================================================
+// NON-BLOCKING HOT-PATH LOGGING
+// Drops the line instead of stalling the demodulation loop when the UART TX FIFO
+// is full (serial back-pressure was starving the RX/scan path, esp. on the Pi).
+// Use LOG_HOT() for per-packet prints; keep Serial.printf/println for rare,
+// important status lines that must not be dropped.
+// =============================================================================
+#define HOT_LOG_MIN_TXBUF 256
+#define LOG_HOT(...) do { if (Serial.availableForWrite() >= HOT_LOG_MIN_TXBUF) Serial.printf(__VA_ARGS__); } while (0)
+
+// =============================================================================
 // HARDWARE TARGET SELECTOR
 // (Select ONE board target according to your hardware)
 // =============================================================================
@@ -594,7 +604,7 @@ void parseDownlinkTelemetry(const byte *raw) {
     int8_t droneRssi = -(raw[2] & 0x7F);
     uint8_t droneLq = raw[4] & 0x7F;
     int8_t droneSnr = (int8_t)raw[5];
-    Serial.printf("[TLM LINK] DroneRSSI:%d | DroneLQ:%u | DroneSNR:%+d\n", droneRssi, droneLq, droneSnr);
+    LOG_HOT("[TLM LINK] DroneRSSI:%d | DroneLQ:%u | DroneSNR:%+d\n", droneRssi, droneLq, droneSnr);
   } else {
     // CRSF Sensor Frame
     uint8_t sensorType = raw[2];
@@ -606,7 +616,7 @@ void parseDownlinkTelemetry(const byte *raw) {
       uint16_t spd_kmh = (((uint16_t)raw[11] << 8) | raw[12]) / 10;
       uint16_t alt_m = (((uint16_t)raw[13] << 8) | raw[14]) - 1000;
       uint8_t sats = raw[15];
-      Serial.printf("[TLM GPS] Lat:%.6f | Lon:%.6f | Alt:%u | Spd:%u | Sats:%u\n", lat, lon, alt_m, spd_kmh, sats);
+      LOG_HOT("[TLM GPS] Lat:%.6f | Lon:%.6f | Alt:%u | Spd:%u | Sats:%u\n", lat, lon, alt_m, spd_kmh, sats);
     } else if (sensorType == 0x08) { // Battery Sensor
       uint16_t vbat_mv = ((uint16_t)raw[3] << 8) | raw[4];
       uint16_t curr_ma = ((uint16_t)raw[5] << 8) | raw[6];
@@ -614,19 +624,19 @@ void parseDownlinkTelemetry(const byte *raw) {
       uint8_t rem_pct = raw[10];
       float vbat = vbat_mv / 10.0f;
       float curr = curr_ma / 10.0f;
-      Serial.printf("[TLM BAT] V:%.1f | I:%.1f | Cap:%lu | Batt:%u\n", vbat, curr, (unsigned long)cap_mah, rem_pct);
+      LOG_HOT("[TLM BAT] V:%.1f | I:%.1f | Cap:%lu | Batt:%u\n", vbat, curr, (unsigned long)cap_mah, rem_pct);
     } else if (sensorType == 0x1E) { // Attitude Sensor
       int16_t pitch_deg = (int16_t)(((uint16_t)raw[3] << 8) | raw[4]) / 100;
       int16_t roll_deg = (int16_t)(((uint16_t)raw[5] << 8) | raw[6]) / 100;
       int16_t yaw_deg = (int16_t)(((uint16_t)raw[7] << 8) | raw[8]) / 100;
-      Serial.printf("[TLM ATT] Pitch:%d | Roll:%d | Yaw:%d\n", pitch_deg, roll_deg, yaw_deg);
+      LOG_HOT("[TLM ATT] Pitch:%d | Roll:%d | Yaw:%d\n", pitch_deg, roll_deg, yaw_deg);
     } else if (sensorType == 0x21) { // Flight Mode Frame
       char fmode[16] = {0};
       for (uint8_t i = 0; i < 12 && (3 + i) < 16; i++) {
         fmode[i] = (char)raw[3 + i];
         if (fmode[i] == 0) break;
       }
-      Serial.printf("[TLM MODE] Mode:%s\n", fmode[0] ? fmode : "ANGLE");
+      LOG_HOT("[TLM MODE] Mode:%s\n", fmode[0] ? fmode : "ANGLE");
     }
   }
 }
@@ -803,8 +813,8 @@ void applyRateConfig(uint8_t idx, bool force = false) {
 }
 
 void setup() {
-  Serial.setTxBufferSize(2048);
-  Serial.begin(115200);
+  Serial.setTxBufferSize(4096);
+  Serial.begin(921600); // High baud reduces host-side stalls during heavy scan output (must match Pi reader)
   Serial.setTimeout(20); // Bound readStringUntil() so a partial command can't stall loop() for 1s (dropping RX packets)
   unsigned long start = millis();
   while (!Serial && (millis() - start < 2500));
@@ -1103,7 +1113,7 @@ void loop() {
     uint32_t now_ms = millis();
     if (!g_link_locked && ((rssi > -60.0f && now_ms - last_diag_ms >= 200) || (now_ms - last_diag_ms >= 1000))) {
       last_diag_ms = now_ms;
-      Serial.printf("[RX-DIAG %s @ %.1fMHz] RSSI=%.0f RAW: %02X %02X %02X %02X %02X %02X %02X %02X\n",
+      LOG_HOT("[RX-DIAG %s @ %.1fMHz] RSSI=%.0f RAW: %02X %02X %02X %02X %02X %02X %02X %02X\n",
                     RATE_TABLE[g_current_rate_idx].name, freq_table[disc_scan_ch], rssi,
                     raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
     }
@@ -1264,7 +1274,7 @@ void loop() {
         uint32_t now_ms = millis();
         if (now_ms - last_serial_emit_ms >= 40) {
           last_serial_emit_ms = now_ms;
-          Serial.printf("[RC %s] RSSI:%4.0f dBm | SNR:%+5.1f dB | CH1:%4u | CH2:%4u | CH3:%4u | CH4:%4u | CH5:%4u | CH6:%4u | CH7:%4u | CH8:%4u | CH9:%4u | CH10:%4u | CH11:%4u | CH12:%4u | CH13:%4u | CH14:%4u | CH15:%4u | CH16:%4u | ARM:%s\n",
+          LOG_HOT("[RC %s] RSSI:%4.0f dBm | SNR:%+5.1f dB | CH1:%4u | CH2:%4u | CH3:%4u | CH4:%4u | CH5:%4u | CH6:%4u | CH7:%4u | CH8:%4u | CH9:%4u | CH10:%4u | CH11:%4u | CH12:%4u | CH13:%4u | CH14:%4u | CH15:%4u | CH16:%4u | ARM:%s\n",
                         RATE_TABLE[g_current_rate_idx].name, rssi, snr, 
                         ch[0], ch[1], ch[2], ch[3], ch[4], ch[5], ch[6], ch[7],
                         ch[8], ch[9], ch[10], ch[11], ch[12], ch[13], ch[14], ch[15],

@@ -40,7 +40,7 @@ class HeltecLoraThread(QThread):
     pilot_discovered = pyqtSignal(dict)
     status_changed = pyqtSignal(str, bool)
 
-    def __init__(self, port="COM6", baud=115200, node_id="Node_1", node_name="LoRa Sniffer", parent=None):
+    def __init__(self, port="COM6", baud=921600, node_id="Node_1", node_name="LoRa Sniffer", parent=None):
         super().__init__(parent)
         self.port = port
         self.baud = baud
@@ -92,7 +92,19 @@ class HeltecLoraThread(QThread):
                 # 2. Open serial port if needed
                 if self.ser is None or not getattr(self.ser, 'is_open', False):
                     try:
-                        self.ser = serial.Serial(self.port, self.baud, timeout=0.1)
+                        # Open without pulsing DTR/RTS so connecting doesn't auto-reset the ESP32-S3
+                        self.ser = serial.Serial()
+                        self.ser.port = self.port
+                        self.ser.baudrate = self.baud
+                        self.ser.timeout = 0.1
+                        self.ser.dsrdtr = False
+                        self.ser.rtscts = False
+                        try:
+                            self.ser.dtr = False
+                            self.ser.rts = False
+                        except Exception:
+                            pass
+                        self.ser.open()
                         self.status_changed.emit(f"{self.node_name}: CONNECTED ({self.port})", True)
                     except Exception:
                         self.status_changed.emit(f"{self.node_name}: WAITING ({self.port})...", False)

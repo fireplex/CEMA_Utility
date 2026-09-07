@@ -318,6 +318,36 @@ def get_candidate_serial_ports() -> List[str]:
     return candidates
 
 
+HELTEC_BAUD = 921600  # must match ELRS_Sniffer.ino Serial.begin()
+
+
+def open_heltec_serial(port: str, baud: int = HELTEC_BAUD) -> serial.Serial:
+    """
+    Opens the Heltec serial WITHOUT pulsing DTR/RTS, so connecting/reconnecting does
+    not auto-reset the ESP32-S3 (which would drop the sniffer's lock). On Linux we also
+    clear hupcl so closing the port doesn't reset it either.
+    """
+    if os.name == "posix":
+        try:
+            subprocess.run(["stty", "-F", port, "-hupcl"], capture_output=True, timeout=2)
+        except Exception:
+            pass
+    ser = serial.Serial()
+    ser.port = port
+    ser.baudrate = baud
+    ser.timeout = 0.1
+    ser.dsrdtr = False
+    ser.rtscts = False
+    # Set DTR/RTS de-asserted BEFORE open so pyserial won't raise the auto-reset line
+    try:
+        ser.dtr = False
+        ser.rts = False
+    except Exception:
+        pass
+    ser.open()
+    return ser
+
+
 def serial_reader_thread():
     """Background worker continuously reading and parsing Heltec V3 serial frames."""
     ser: Optional[serial.Serial] = None
@@ -365,7 +395,7 @@ def serial_reader_thread():
             target_candidates = [forced_port] if forced_port in ports else ports
             for candidate in target_candidates:
                 try:
-                    ser = serial.Serial(candidate, 115200, timeout=0.1)
+                    ser = open_heltec_serial(candidate, HELTEC_BAUD)
                     current_port = candidate
                     with tactical_state.lock:
                         tactical_state.serial_connected = True
