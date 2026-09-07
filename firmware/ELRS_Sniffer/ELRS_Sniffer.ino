@@ -93,6 +93,7 @@ TaskHandle_t displayTaskHandle = NULL;
 #define OTA_VERSION_ID_V4 4
 volatile uint8_t g_ota_version = 4; // Default to ExpressLRS 4.x
 #define ELRS_CRC14_POLY 0x2E57
+#define ELRS_CRC16_POLY 0x3D65   // OTA8 full-res 16-bit CRC polynomial
 
 #define FHSS_FREQ_COUNT 40
 #define FHSS_SEQUENCE_LEN 240
@@ -163,7 +164,8 @@ public:
   }
 };
 
-Crc2Byte ota_crc;
+Crc2Byte ota_crc;     // OTA4 8-byte frames: 14-bit CRC (poly 0x2E57)
+Crc2Byte ota_crc16;   // OTA8 13-byte full-res frames: 16-bit CRC (poly 0x3D65)
 
 // Algebraic GF(2) Matrix Inversion for CRC-14 (Poly 0x2E57)
 // Solves exact dynamicCrcInit in under 0.05 us without brute-force scanning
@@ -172,12 +174,30 @@ const uint16_t CRC14_MINV[14] = {
   0x2E59, 0x1CB3, 0x1CCA, 0x1C39, 0x1DDE, 0x3BBD, 0x12D6
 };
 
+// GF(2) inverse matrix for the OTA8 16-bit CRC (poly 0x3D65) over 11 data bytes.
+// Recovers OtaCrcInitializer from a full-res sync packet in one pass.
+const uint16_t CRC16_MINV_11[16] = {
+  0x249F, 0x493E, 0xB6E3, 0x6DC7, 0xDB8E, 0x9383, 0x0398, 0x0731,
+  0x2AFD, 0x55FB, 0x8F69, 0x3A4C, 0x5006, 0x8493, 0x0927, 0x124F
+};
+
 uint16_t solveCrcInit(const uint8_t *data, uint16_t inCRC) {
   uint16_t c0 = ota_crc.calc(data, 7, 0);
   uint16_t delta = (inCRC ^ c0) & 0x3FFF;
   uint16_t init = 0;
   for (uint8_t i = 0; i < 14; i++) {
     init |= (__builtin_parity(CRC14_MINV[i] & delta) << i);
+  }
+  return init;
+}
+
+// Recover the 16-bit OtaCrcInitializer from an OTA8 full-res sync (11 data bytes)
+uint16_t solveCrcInit16(const uint8_t *data, uint16_t inCRC) {
+  uint16_t c0 = ota_crc16.calc(data, 11, 0);
+  uint16_t delta = inCRC ^ c0;
+  uint16_t init = 0;
+  for (uint8_t i = 0; i < 16; i++) {
+    init |= (__builtin_parity(CRC16_MINV_11[i] & delta) << i);
   }
   return init;
 }
@@ -753,17 +773,27 @@ bool authenticatePacket(const byte *raw, uint8_t &pkt_type, int &matched_slot, u
       }
     }
   } else if (len == 13) { // Full Res 13-byte OTA8 frame
-    uint16_t inCRC = ((uint16_t)raw[11] << 8) | raw[12];
-    if (ota_crc.calc(d, 11, dynamicCrcInit) == inCRC || ota_crc.calc(d, 11, dynamicCrcInit ^ OtaNonce) == inCRC) {
-      matched_slot = 0;
-      return true;
-    }
-    if (ota_crc.calc(d, 11, dynamicCrcInit ^ 0x80) == inCRC || ota_crc.calc(d, 11, (dynamicCrcInit ^ 0x80) ^ OtaNonce) == inCRC) {
-      dynamicCrcInit ^= 0x80;
-      discovered_UID[5] ^= 0x80;
-      buildDynamicFHSSSequence(discovered_UID[2], discovered_UID[3], discovered_UID[4], discovered_UID[5], g_ota_version);
-      matched_slot = 0;
-      return true;
+    // OTA8 full-res: 16-bit CRC (poly 0x3D65), little-endian, init = OtaCrcInitializer ^ OtaNonce.
+    uint16_t inCRC = ((uint16_t)raw[12] << 8) | raw[11];
+    uint8_t hop_int = RATE_TABLE[g_current_rate_idx].hop_interval;
+    for (int8_t offset = 0; offset <= 4; offset++) {
+      int8_t deltas[2] = {offset, (int8_t)-offset};
+      for (uint8_t d_idx = 0; d_idx < (offset == 0 ? 1 : 2); d_idx++) {
+        uint8_t testNonce = (uint8_t)(OtaNonce + deltas[d_idx]);
+        if (ota_crc16.calc(d, 11, dynamicCrcInit ^ testNonce) == inCRC) {
+          OtaNonce = testNonce;
+          matched_slot = testNonce % hop_int;
+          return true;
+        }
+        if (ota_crc16.calc(d, 11, (dynamicCrcInit ^ 0x80) ^ testNonce) == inCRC) {
+          dynamicCrcInit ^= 0x80;
+          discovered_UID[5] ^= 0x80;
+          buildDynamicFHSSSequence(discovered_UID[2], discovered_UID[3], discovered_UID[4], discovered_UID[5], g_ota_version);
+          OtaNonce = testNonce;
+          matched_slot = testNonce % hop_int;
+          return true;
+        }
+      }
     }
   }
   return false;
@@ -852,6 +882,7 @@ void setup() {
   display.display();
 
   ota_crc.init(14, ELRS_CRC14_POLY);
+  ota_crc16.init(16, ELRS_CRC16_POLY);
   initFrequencyRegisters();
 
   // Flag rate profiles whose spreading factor an SX127x-based ELRS link cannot transmit (SF < ELRS_MIN_COMPAT_SF).
@@ -1124,31 +1155,42 @@ void loop() {
     if (pkt_type == 0b10) {
       uint8_t fhssIdx = raw[1];
       uint8_t nonce = raw[2];
-      uint8_t data_len = (plen == 13) ? 11 : 7;
-      uint16_t inCRC = ((uint16_t)(raw[0] >> 2) << 8) | raw[7];
+      bool is_full = (plen == 13);
+      uint8_t data_len = is_full ? 11 : 7;
+      uint16_t inCRC;
       byte d[13];
       memcpy(d, raw, data_len);
-      d[0] = 0x02;
+      if (is_full) {
+        // OTA8 full-res: 16-bit CRC, little-endian, at bytes 11-12. byte0 is the
+        // packet-type byte and is CRC'd as-is (no crcHigh bits like OTA4).
+        inCRC = ((uint16_t)raw[12] << 8) | raw[11];
+      } else {
+        inCRC = ((uint16_t)(raw[0] >> 2) << 8) | raw[7];
+        d[0] = 0x02;
+      }
 
       // Plausibility check: valid sequence index and detectable signal
       bool plausibility_ok = (fhssIdx < FHSS_SEQUENCE_LEN) && (rssi > -80.0f);
 
       if (plausibility_ok) {
-        uint16_t solvedCrc = solveCrcInit(d, inCRC);
+        uint16_t solvedCrc = is_full ? solveCrcInit16(d, inCRC) : solveCrcInit(d, inCRC);
 
         Serial.printf("[SYNC-DETECT @ %.1fMHz] RSSI:%.0f RAW: %02X %02X %02X %02X %02X %02X %02X %02X | solved=0x%04X (u4=%u, u5=%u)\n",
                       freq_table[sync_channel], rssi, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
                       solvedCrc, (solvedCrc >> 8) ^ 4, solvedCrc & 0xFF);
 
-        // First check ELRS 4.x:
+        // ELRS 4.x: OTA4 recovers only 6 usable bits of u5 (14-bit CRC) so it masks the
+        // low 6 bits; OTA8 full-res has a true 16-bit init so it verifies u5 exactly.
         uint8_t u4_v4 = (solvedCrc >> 8) ^ 4;
         uint8_t u5_v4 = solvedCrc & 0xFF;
-        bool v4_crc_matched = (u4_v4 == raw[5]) && (((u5_v4 ^ raw[6]) & ~0x3F) == 0);
+        bool v4_crc_matched = is_full
+            ? ((u4_v4 == raw[5]) && (u5_v4 == raw[6]))
+            : ((u4_v4 == raw[5]) && (((u5_v4 ^ raw[6]) & ~0x3F) == 0));
 
-        // Second check ELRS 3.x:
+        // ELRS 3.x is OTA4-only (no full-res variant)
         uint8_t u4_v3 = (solvedCrc >> 8);
         uint8_t u5_v3 = (solvedCrc & 0xFF) ^ 3;
-        bool v3_crc_matched = (u4_v3 == raw[5]) && (u5_v3 == raw[6]);
+        bool v3_crc_matched = (!is_full) && (u4_v3 == raw[5]) && (u5_v3 == raw[6]);
         uint8_t u3_v3 = raw[4];
 
         if (v4_crc_matched || v3_crc_matched) {
@@ -1197,12 +1239,15 @@ void loop() {
             discovered_UID[4] = u4_v4;
             discovered_UID[5] = u5_v4;
 
-            // Rate resolution for ELRS 4.x
-            uint8_t rfRateEnum = raw[3];
-            if (rfRateEnum == 5 || rfRateEnum == 6 || rfRateEnum == 0) target_rate_idx = 0;      // 200Hz
-            else if (rfRateEnum == 2 || rfRateEnum == 3) target_rate_idx = 1; // 100Hz
-            else if (rfRateEnum == 1) target_rate_idx = 2;                    // 50Hz
-            else if (rfRateEnum == 4) target_rate_idx = 3;                    // 25Hz
+            // Rate resolution for ELRS 4.x (OTA4 8-byte rates). For full-res (OTA8) the
+            // auto-scan already selected the correct 13-byte rate, so keep the current one.
+            if (!is_full) {
+              uint8_t rfRateEnum = raw[3];
+              if (rfRateEnum == 5 || rfRateEnum == 6 || rfRateEnum == 0) target_rate_idx = 0;      // 200Hz
+              else if (rfRateEnum == 2 || rfRateEnum == 3) target_rate_idx = 1; // 100Hz
+              else if (rfRateEnum == 1) target_rate_idx = 2;                    // 50Hz
+              else if (rfRateEnum == 4) target_rate_idx = 3;                    // 25Hz
+            }
 
             // Match known pilot seeds
             if (u4_v4 == 38 && u5_v4 == 194) {
