@@ -191,6 +191,35 @@ uint16_t solveCrcInit(const uint8_t *data, uint16_t inCRC) {
   return init;
 }
 
+// -----------------------------------------------------------------------------
+// OTA8 FULL-RES (100Hz Full / 200Hz Full / 333Hz Full) — WIP FINDINGS
+//
+// Confirmed against the ExpressLRS source (src/lib/OTA/OTA.{h,cpp}):
+//   * OTA8 = 13-byte packet. CRC is 16-bit, poly 0x3D65, LITTLE-ENDIAN, at bytes
+//     11-12, computed over the first 11 bytes (OTA8_CRC_CALC_LEN = offsetof crc).
+//   * CRC init = ((UID[4]<<8)|UID[5]) ^ (OTA_VERSION_ID<<8), XOR OtaNonce
+//     (SYNC packets use nonce = 0). Same UID/init as OTA4, just full 16-bit.
+//   * Packet types: RCDATA=0b00, DATA=0b01, SYNC=0b10 (LINKSTATS=0b00 downlink).
+//     Full-res RC/telemetry is carried as PACKET_TYPE_DATA=0b01 (byte0 also packs
+//     stubbornAck:1, uplinkPower:3, isHighAux:1, isArmed:1) — NOT 0b00 like OTA4.
+//   * OTA_Sync_s (bytes 1-6) is identical to OTA4: fhssIndex,nonce,rfRateEnum,
+//     flags,UID4,UID5.
+//
+// Implemented here: ota_crc16 + solveCrcInit16() (GF(2) inverse, round-trip
+// verified) + 13-byte sync-detect and authenticatePacket paths.
+//
+// OPEN / NOT YET WORKING (needs local/wired verification, a reference RX, or an
+// SDR capture — could not be resolved via remote iteration):
+//   * On-air 100Hz-Full frames captured by this SX1262 do NOT validate with the
+//     authoritative CRC (poly/coverage/endian/init all per-spec, engine round-trip
+//     verified). No coverage/endian combo yields the constant init high-byte that
+//     clean base^nonce packets must have — i.e. the received bytes aren't clean
+//     OTA8 from the target pilot. Suspected SF6 reception/demod issue or the strong
+//     900MHz signal seen is not the pilot's OTA8. Resolve the PHY/reception first.
+//   * TODO once reception is clean: route PACKET_TYPE_DATA (0b01) to the RC path
+//     for plen==13, unpack full-res channels, and confirm the full-res FHSS/sync
+//     channel model.
+// -----------------------------------------------------------------------------
 // Recover the 16-bit OtaCrcInitializer from an OTA8 full-res sync (11 data bytes)
 uint16_t solveCrcInit16(const uint8_t *data, uint16_t inCRC) {
   uint16_t c0 = ota_crc16.calc(data, 11, 0);
