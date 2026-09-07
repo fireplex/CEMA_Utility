@@ -1,5 +1,5 @@
 // CEMA Tactical Suite Service Worker (Network-First Strategy)
-const CACHE_NAME = 'cema-tactical-v10';
+const CACHE_NAME = 'cema-tactical-v11';
 const ASSETS = [
   '/',
   '/manifest.json',

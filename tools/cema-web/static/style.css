@@ -502,6 +502,12 @@ canvas.hud-canvas {
   gap: 4px;
 }
 
+/* Prevent flex children from shrinking to fit (which collapsed the log lines on
+   top of each other); keep their height so the container scrolls instead. */
+.log-stream > * {
+  flex-shrink: 0;
+}
+
 .log-entry {
   display: flex;
   align-items: flex-start;

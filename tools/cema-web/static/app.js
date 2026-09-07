@@ -481,17 +481,28 @@ function applyTelemetry(data) {
   const consoleEl = document.getElementById('serialConsole');
   if (consoleEl && n.last_serial_line && n.last_serial_line !== state.last_serial_line) {
     state.last_serial_line = n.last_serial_line;
-    const lineDiv = document.createElement('div');
-    lineDiv.style.fontFamily = "var(--font-mono)";
-    lineDiv.style.fontSize = "10.5px";
-    lineDiv.style.color = "var(--text-muted)";
-    lineDiv.style.whiteSpace = "nowrap";
-    lineDiv.style.overflow = "hidden";
-    lineDiv.style.textOverflow = "ellipsis";
-    lineDiv.textContent = `[${new Date().toLocaleTimeString()}] ${n.last_serial_line}`;
-    consoleEl.appendChild(lineDiv);
-    while (consoleEl.children.length > 50) consoleEl.removeChild(consoleEl.firstChild);
-    consoleEl.scrollTop = consoleEl.scrollHeight;
+    const line = n.last_serial_line;
+    // Rate-limit noisy per-packet RC lines (decoded sticks stream up to ~25/s) to
+    // ~1/sec so they don't flood the console; always show other events immediately.
+    const isRC = line.startsWith('[RC ');
+    const now = Date.now();
+    if (!isRC || (now - (state._lastRcConsoleMs || 0) >= 1000)) {
+      if (isRC) state._lastRcConsoleMs = now;
+      // Only autoscroll if the user is already near the bottom (don't yank while
+      // they're scrolled up reading history).
+      const nearBottom = (consoleEl.scrollHeight - consoleEl.scrollTop - consoleEl.clientHeight) < 40;
+      const lineDiv = document.createElement('div');
+      lineDiv.style.fontFamily = "var(--font-mono)";
+      lineDiv.style.fontSize = "10.5px";
+      lineDiv.style.color = "var(--text-muted)";
+      lineDiv.style.whiteSpace = "nowrap";
+      lineDiv.style.overflow = "hidden";
+      lineDiv.style.textOverflow = "ellipsis";
+      lineDiv.textContent = `[${new Date().toLocaleTimeString()}] ${line}`;
+      consoleEl.appendChild(lineDiv);
+      while (consoleEl.children.length > 50) consoleEl.removeChild(consoleEl.firstChild);
+      if (nearBottom) consoleEl.scrollTop = consoleEl.scrollHeight;
+    }
   }
 
   // SDR Status & Device Information
