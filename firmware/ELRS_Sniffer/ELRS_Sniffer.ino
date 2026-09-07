@@ -1152,6 +1152,41 @@ void loop() {
         uint8_t u3_v3 = raw[4];
 
         if (v4_crc_matched || v3_crc_matched) {
+          // Resolve the reported pilot identity locally (no state mutation yet)
+          uint8_t rep_ver = v4_crc_matched ? 4 : 3;
+          uint8_t rep_ch  = v4_crc_matched ? 20 : 21;
+          uint8_t rep_u4  = v4_crc_matched ? u4_v4 : u4_v3;
+          uint8_t rep_u5  = v4_crc_matched ? u5_v4 : u5_v3;
+
+          // AIRSPACE SURVEY: observe & report only. Do NOT rewrite the demodulator
+          // lock state (dynamicCrcInit / discovered_UID / sync_channel / FHSS) — otherwise
+          // every beacon from every pilot thrashes the lock and the survey parks on the
+          // sync channel returning only ~1-2 beacons/sec. Just catalogue and keep listening.
+          if (g_scan_mode) {
+            static uint32_t last_survey_ms = 0;
+            uint32_t survey_ms = millis();
+            if (survey_ms - last_survey_ms >= 100) {
+              last_survey_ms = survey_ms;
+              if (v4_crc_matched) {
+                LOG_HOT("[PILOT DISCOVERED] v4 | UID4:%u UID5:%u | CRC:0x%04X | RSSI:%.0f | Rate:%s | Ch:20\n",
+                        rep_u4, rep_u5, solvedCrc, rssi, RATE_TABLE[g_current_rate_idx].name);
+              } else {
+                LOG_HOT("[PILOT DISCOVERED] v3 | UID3:%u UID4:%u UID5:%u | CRC:0x%04X | RSSI:%.0f | Rate:%s | Ch:21\n",
+                        u3_v3, rep_u4, rep_u5, solvedCrc, rssi, RATE_TABLE[g_current_rate_idx].name);
+              }
+            }
+            radio.startReceive();
+            return;
+          }
+
+          // TARGET LOCK FILTER: when a specific pilot is selected, ignore other pilots'
+          // syncs so we actually lock the chosen one (this filter was previously never
+          // enforced, so locks would bounce between pilots and stall the RC feed).
+          if (g_target_lock_enabled && (rep_u4 != g_target_uid[1] || rep_u5 != g_target_uid[2])) {
+            radio.startReceive();
+            return;
+          }
+
           uint8_t target_rate_idx = g_current_rate_idx;
 
           if (v4_crc_matched) {
@@ -1198,12 +1233,6 @@ void loop() {
             Serial.printf("[PILOT DISCOVERED] v%u | UID4:%u UID5:%u | CRC:0x%04X | RSSI:%.0f | Rate:%s | Ch:%u\n",
                           g_ota_version, discovered_UID[4], discovered_UID[5], dynamicCrcInit, rssi, RATE_TABLE[g_current_rate_idx].name, sync_channel);
             Serial.printf("[SYNC VERIFIED] HopIdx:%u Nonce:%u | CRC:0x%04X\n", fhssIdx, nonce, dynamicCrcInit);
-          }
-
-          if (g_scan_mode) {
-            // In Airspace Survey mode: stay parked on sync channel, do not follow FHSS hop
-            radio.startReceive();
-            return;
           }
 
           // Ignore syncs whose rate uses an SF an SX127x ELRS link can't transmit (e.g. SF5).
