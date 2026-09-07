@@ -338,12 +338,9 @@ def open_heltec_serial(port: str, baud: int = HELTEC_BAUD) -> serial.Serial:
     ser.timeout = 0.1
     ser.dsrdtr = False
     ser.rtscts = False
-    # Set DTR/RTS de-asserted BEFORE open so pyserial won't raise the auto-reset line
-    try:
-        ser.dtr = False
-        ser.rts = False
-    except Exception:
-        pass
+    # Do NOT assign ser.dtr/ser.rts: on the Heltec V3's CP210x auto-reset circuit ANY
+    # DTR/RTS line edge reboots the board. Empirically, clearing hupcl (above) and
+    # leaving the modem lines untouched opens the port without resetting the ESP32-S3.
     ser.open()
     return ser
 

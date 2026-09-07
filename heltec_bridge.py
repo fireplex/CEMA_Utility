@@ -99,11 +99,8 @@ class HeltecLoraThread(QThread):
                         self.ser.timeout = 0.1
                         self.ser.dsrdtr = False
                         self.ser.rtscts = False
-                        try:
-                            self.ser.dtr = False
-                            self.ser.rts = False
-                        except Exception:
-                            pass
+                        # Don't toggle DTR/RTS: any line edge triggers the ESP32-S3
+                        # auto-reset (CP210x). Leave the modem lines untouched.
                         self.ser.open()
                         self.status_changed.emit(f"{self.node_name}: CONNECTED ({self.port})", True)
                     except Exception:
