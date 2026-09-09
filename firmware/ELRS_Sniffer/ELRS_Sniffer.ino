@@ -1146,16 +1146,20 @@ void loop() {
         bool v4_crc_matched = (u4_v4 == raw[5]) && (((u5_v4 ^ raw[6]) & ~0x3F) == 0);
 
         // Second check ELRS 3.x:
+        // The 14-bit CRC init only encodes the LOW 6 bits of UID4 (top 2 bits are lost
+        // in the 0x3FFF mask), so compare only those 6 bits against the sync payload's
+        // full UID4 (raw[5]); u5 is fully recoverable. Previously this used an exact
+        // u4 match, which could never pass for a pilot whose UID4 >= 64.
         uint8_t u4_v3 = (solvedCrc >> 8);
         uint8_t u5_v3 = (solvedCrc & 0xFF) ^ 3;
-        bool v3_crc_matched = (u4_v3 == raw[5]) && (u5_v3 == raw[6]);
+        bool v3_crc_matched = (((u4_v3 ^ raw[5]) & 0x3F) == 0) && (u5_v3 == raw[6]);
         uint8_t u3_v3 = raw[4];
 
         if (v4_crc_matched || v3_crc_matched) {
           // Resolve the reported pilot identity locally (no state mutation yet)
           uint8_t rep_ver = v4_crc_matched ? 4 : 3;
           uint8_t rep_ch  = v4_crc_matched ? 20 : 21;
-          uint8_t rep_u4  = v4_crc_matched ? u4_v4 : u4_v3;
+          uint8_t rep_u4  = v4_crc_matched ? u4_v4 : raw[5];  // v3: report the full UID4 from the sync payload
           uint8_t rep_u5  = v4_crc_matched ? u5_v4 : u5_v3;
 
           // AIRSPACE SURVEY: observe & report only. Do NOT rewrite the demodulator
@@ -1217,13 +1221,14 @@ void loop() {
             sync_channel = 21;
             dynamicCrcInit = solvedCrc;
             discovered_UID[3] = u3_v3;
-            discovered_UID[4] = u4_v3;
+            discovered_UID[4] = raw[5];   // full UID4 from sync payload (CRC only carries low 6 bits)
             discovered_UID[5] = u5_v3;
 
-            uint8_t rateIdx = (raw[3] >> 4) & 0x0F;
-            if (rateIdx < RATE_COUNT) target_rate_idx = rateIdx;
+            // Keep the current rate: we only decode a v3 sync when already at the pilot's
+            // SF/rate, so re-deriving the rate from raw[3] (which mis-mapped to 50Hz) is
+            // both unnecessary and harmful. target_rate_idx stays = g_current_rate_idx.
 
-            buildDynamicFHSSSequence(253, u3_v3, u4_v3, u5_v3, 3);
+            buildDynamicFHSSSequence(discovered_UID[2], u3_v3, raw[5], u5_v3, 3);
           }
 
           static uint32_t last_sync_print_ms = 0;
