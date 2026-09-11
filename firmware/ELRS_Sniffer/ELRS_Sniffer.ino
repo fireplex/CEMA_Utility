@@ -197,7 +197,23 @@ uint8_t FHSSsequence[FHSS_SEQUENCE_LEN];
 float freq_table[FHSS_FREQ_COUNT];
 uint32_t freq_regs[FHSS_FREQ_COUNT];
 volatile uint8_t FHSSptr = 0;
+volatile int16_t g_pin_channel = -1;  // pin radio to this channel (0-39); -1 = normal hop. Used by the autonomous seed-solver and the manual PIN cmd.
 volatile uint8_t OtaNonce = 0;
+
+// [SEED-SOLVE] Autonomous FHSS-seed (u2,u3) brute-force for phrase-free / traditional-bound pilots.
+// Sync packets only reveal u4,u5; the hop sequence is seeded by u2,u3,u4,u5. After locking a pilot
+// we pin the radio to a few channels, record (FHSSptr, channel) hits where the pilot lands, then
+// brute-force the two unknown bytes so sequence[ptr]==channel for every observation.
+struct SeedCon { uint8_t ptr; uint8_t ch; };
+SeedCon  g_seed_cons[192];
+uint16_t g_seed_con_n = 0;
+bool     g_seed_solved = false;      // u2,u3 confirmed for the current pilot
+bool     g_seed_collecting = false;  // sweep+record in progress
+uint8_t  g_seed_sweep_idx = 0;
+uint32_t g_seed_dwell_until_ms = 0;
+uint8_t  g_seed_pilot_u4 = 0, g_seed_pilot_u5 = 0;  // pilot the current solve belongs to
+const uint8_t SEED_SWEEP_CH[] = {4, 10, 16, 26, 33, 8};  // spread of non-sync channels to pin
+const uint32_t SEED_DWELL_MS = 2500;
 uint8_t sync_channel = 20; // Channel 20 = 915.5 MHz (ELRS 4.x), Channel 21 = 916.1 MHz (ELRS 3.x)
 volatile uint8_t g_wide_switch_idx = 0;
 
@@ -330,7 +346,9 @@ void fhssHopTask(void *param) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     if (g_hopping_locked) {
       FHSSptr = (FHSSptr + 1) % FHSS_SEQUENCE_LEN;
-      setChannelFast(FHSSsequence[FHSSptr]);
+      // when pinned (seed-solve/PIN), keep FHSSptr advancing (phase-locked to pilot) but hold the
+      // radio on the pinned channel so each received packet yields sequence[FHSSptr]==pinCh.
+      setChannelFast(g_pin_channel >= 0 ? (uint8_t)g_pin_channel : FHSSsequence[FHSSptr]);
     }
   }
 }
@@ -531,6 +549,53 @@ void buildDynamicFHSSSequence(uint8_t u2, uint8_t u3, uint8_t u4, uint8_t u5, ui
       FHSSsequence[offset + rand] = temp;
     }
   }
+}
+
+// [SEED-SOLVE] Brute-force the two unknown UID seed bytes (u2,u3) from collected (ptr,ch)
+// constraints. u2 bit 7 lands at seed bit 31 which the RNG masks off (% 2^31), so it never
+// affects the sequence -> we only scan u2 in 0..127 (32768 candidates, <~2s on ESP32) and every
+// distinct sequence is unique in that space. We score each candidate by how many constraints it
+// satisfies (best-score, not all-or-nothing) so a stray phase-drift/off-by-one observation costs
+// one point instead of disqualifying the true seed. Accept only when the winner clears an
+// absolute floor AND beats the runner-up by a clear margin. Returns the winner + its scores.
+bool solveSeedFromConstraints(uint8_t u4, uint8_t u5, uint8_t ota,
+                              uint8_t &out_u2, uint8_t &out_u3,
+                              uint16_t &out_best, uint16_t &out_second) {
+  static uint8_t seq[FHSS_SEQUENCE_LEN];
+  const uint8_t freqCount = FHSS_FREQ_COUNT;
+  const uint8_t sync = (ota == 4) ? (freqCount / 2) : ((freqCount / 2) + 1);
+  uint16_t best = 0, second = 0; uint8_t f2 = 0, f3 = 0;
+
+  for (uint16_t u2 = 0; u2 < 128; u2++) {
+    for (uint16_t u3 = 0; u3 < 256; u3++) {
+      uint32_t rs = (((uint32_t)u2 << 24) + ((uint32_t)u3 << 16) +
+                     ((uint32_t)u4 << 8) + (uint8_t)(u5 ^ ota));
+      // base sequence
+      for (uint16_t i = 0; i < FHSS_SEQUENCE_LEN; i++) {
+        if (i % freqCount == 0)          seq[i] = sync;
+        else if (i % freqCount == sync)  seq[i] = 0;
+        else                             seq[i] = i % freqCount;
+      }
+      // in-block Fisher-Yates using the ELRS LCG (must mirror buildDynamicFHSSSequence exactly)
+      for (uint16_t i = 0; i < FHSS_SEQUENCE_LEN; i++) {
+        if (i % freqCount != 0) {
+          rs = (214013UL * rs + 2531011UL) % 2147483648UL;
+          uint8_t rnd = (uint8_t)(((rs >> 16) % (freqCount - 1)) + 1);
+          uint8_t off = (i / freqCount) * freqCount;
+          uint8_t t = seq[i]; seq[i] = seq[off + rnd]; seq[off + rnd] = t;
+        }
+      }
+      uint16_t hits = 0;
+      for (uint16_t k = 0; k < g_seed_con_n; k++) {
+        if (seq[g_seed_cons[k].ptr] == g_seed_cons[k].ch) hits++;
+      }
+      if (hits > best)       { second = best; best = hits; f2 = (uint8_t)u2; f3 = (uint8_t)u3; }
+      else if (hits > second) second = hits;
+    }
+  }
+  out_u2 = f2; out_u3 = f3; out_best = best; out_second = second;
+  // Accept: enough absolute agreement and a decisive lead over the next-best candidate.
+  return (g_seed_con_n >= 8) && (best >= 8) && (best >= second + 4);
 }
 
 // Persistent channel state (prevents non-active round-robin switches from resetting/flickering)
@@ -863,17 +928,18 @@ void setup() {
     }
   }
 
-  // Initialize with target pilot UID (Jumper T14 binding phrase 'testtest')
-  discovered_UID[0] = 220;
-  discovered_UID[1] = 70;
-  discovered_UID[2] = 8;
-  discovered_UID[3] = 39;
+  // Boot placeholder sequence. u2,u3 are unknown until the autonomous seed-solver recovers
+  // them per pilot; these defaults are wrong on purpose so a real lock proves the solver works.
+  discovered_UID[0] = 0;
+  discovered_UID[1] = 0;
+  discovered_UID[2] = 0;
+  discovered_UID[3] = 0;
   discovered_UID[4] = 38;
   discovered_UID[5] = 194;
   g_ota_version = 4;
   sync_channel = 20; // Channel 20 = 915.5 MHz for ELRS 4.x
   dynamicCrcInit = (((uint16_t)(38 ^ 4) << 8) | 194) & 0x3FFF; // 0x22C2 for ELRS 4.x
-  buildDynamicFHSSSequence(8, 39, 38, 194, 4);
+  buildDynamicFHSSSequence(0, 0, 38, 194, 4);
 
   loraSpi->begin(SCK_PIN, MISO_PIN, MOSI_PIN, NSS_PIN);
   loraSpi->setFrequency(16000000); // 16 MHz Hardware SPI
@@ -941,6 +1007,7 @@ void loop() {
         g_phase_hunting = false;
         isSynced = false;
         g_sync_grace_period_until = 0;
+        g_seed_solved = false; g_seed_collecting = false; g_seed_con_n = 0; g_pin_channel = -1;
         g_last_auto_scan_us = now;
         setChannelFast(sync_channel);
         Serial.println("[RATE AUTO] Dynamic auto-rate scanning enabled.");
@@ -960,6 +1027,7 @@ void loop() {
             g_phase_hunting = false;
             isSynced = false;
             g_sync_grace_period_until = 0;
+            g_seed_solved = false; g_seed_collecting = false; g_seed_con_n = 0; g_pin_channel = -1;
             applyRateConfig(r, true);
             setChannelFast(sync_channel);
             break;
@@ -973,8 +1041,14 @@ void loop() {
       g_phase_hunting = false;
       isSynced = false;
       g_sync_grace_period_until = 0;
+      g_seed_solved = false; g_seed_collecting = false; g_seed_con_n = 0; g_pin_channel = -1;
       setChannelFast(sync_channel);
       Serial.println("[SCAN MODE] Airspace survey active. Monitoring sync channels for all beacons.");
+    } else if (cmd.startsWith("PIN:")) {
+      // Manual diagnostic: pin the radio to a channel and print [OBS] hits (offline seed analysis). PIN:OFF to release.
+      String a = cmd.substring(4); a.trim(); a.toUpperCase();
+      if (a == "OFF") { g_pin_channel = -1; Serial.println("[PIN] released"); }
+      else { g_pin_channel = (int16_t)a.toInt(); Serial.printf("[PIN] holding radio on Ch %d\n", g_pin_channel); }
     } else if (cmd.startsWith("SCAN:STOP")) {
       g_scan_mode = false;
       Serial.println("[SCAN MODE] Airspace survey stopped.");
@@ -1073,8 +1147,61 @@ void loop() {
     g_phase_candidate = (g_phase_candidate + 1) % 6;
   }
 
+  // [SEED-SOLVE] Autonomous sweep: pin each survey channel in turn (looping over the list for
+  // several passes), recording strong RC hits. After each full pass, try to brute-force the
+  // unknown seed bytes (u2,u3); accept the first decisive solution and resume full hop-following.
+  if (g_seed_collecting) {
+    const uint8_t nch = (uint8_t)(sizeof(SEED_SWEEP_CH));
+    const uint8_t MAX_PASSES = 4;
+    uint32_t ms = millis();
+    if (g_seed_dwell_until_ms == 0) {                 // begin sweep
+      g_seed_sweep_idx = 0;
+      g_pin_channel = SEED_SWEEP_CH[0];
+      g_seed_dwell_until_ms = ms + SEED_DWELL_MS;
+      Serial.printf("[SEED] collecting FHSS constraints (pin Ch %u)...\n", (unsigned)SEED_SWEEP_CH[0]);
+    } else if (ms >= g_seed_dwell_until_ms) {
+      g_seed_sweep_idx++;
+      bool pass_done = (g_seed_sweep_idx % nch) == 0;
+      if (!pass_done) {
+        g_pin_channel = SEED_SWEEP_CH[g_seed_sweep_idx % nch];
+        g_seed_dwell_until_ms = ms + SEED_DWELL_MS;
+      } else {
+        // full pass complete -> attempt a solve from everything gathered so far
+        uint8_t pass_no = g_seed_sweep_idx / nch;
+        g_pin_channel = -1;
+        uint8_t su2, su3; uint16_t best, second;
+        Serial.printf("[SEED] pass %u: solving from %u constraints...\n", pass_no, g_seed_con_n);
+        uint32_t t0 = millis();
+        bool ok = solveSeedFromConstraints(discovered_UID[4], discovered_UID[5], g_ota_version,
+                                           su2, su3, best, second);
+        last_packet_time_us = esp_timer_get_time();   // fresh grace so no watchdog re-park after the blocking solve
+        if (ok) {
+          discovered_UID[2] = su2;
+          discovered_UID[3] = su3;
+          buildDynamicFHSSSequence(su2, su3, discovered_UID[4], discovered_UID[5], g_ota_version);
+          g_seed_solved = true;
+          g_seed_collecting = false;
+          g_hopping_locked = true;
+          Serial.printf("[SEED SOLVED] u2=%u u3=%u (best %u/%u vs %u, %lums) -> full FHSS hop-following active\n",
+                        su2, su3, best, g_seed_con_n, second, (unsigned long)(millis() - t0));
+        } else if (pass_no >= MAX_PASSES) {
+          g_seed_collecting = false;   // give up gracefully; stay locked on sync channel
+          Serial.printf("[SEED] no decisive solution after %u passes (best %u/%u vs %u); staying parked.\n",
+                        pass_no, best, g_seed_con_n, second);
+        } else {
+          // keep the constraints, run another pass for more coverage
+          Serial.printf("[SEED] pass %u inconclusive (best %u/%u vs %u); another pass...\n",
+                        pass_no, best, g_seed_con_n, second);
+          if (g_seed_con_n > 170) g_seed_con_n = 170;   // clamp against overflow across passes
+          g_pin_channel = SEED_SWEEP_CH[0];
+          g_seed_dwell_until_ms = millis() + SEED_DWELL_MS;
+        }
+      }
+    }
+  }
+
   // 4. Loss of Hopping Watchdog (600ms timeout during active hopping)
-  if (g_hopping_locked && (now - last_packet_time_us > 600000)) {
+  if (g_pin_channel < 0 && !g_seed_collecting && g_hopping_locked && (now - last_packet_time_us > 600000)) {
     g_hopping_locked = false;
     g_phase_hunting = false;
     setChannelFast(sync_channel);
@@ -1119,6 +1246,22 @@ void loop() {
     }
 
     uint8_t pkt_type = raw[0] & 0x03;
+
+    // While pinned, a received packet means the pilot is on the pinned channel at the current
+    // FHSSptr -> hard constraint sequence[FHSSptr] == pinCh. During autonomous seed-solving we
+    // record strong RC hits; the manual PIN command prints them for offline analysis.
+    if (g_pin_channel >= 0) {
+      if (g_seed_collecting) {
+        if (pkt_type == 0b00 && rssi >= -80.0f && g_seed_con_n < (uint16_t)(sizeof(g_seed_cons)/sizeof(g_seed_cons[0]))) {
+          g_seed_cons[g_seed_con_n].ptr = FHSSptr;
+          g_seed_cons[g_seed_con_n].ch  = (uint8_t)g_pin_channel;
+          g_seed_con_n++;
+        }
+      } else {
+        Serial.printf("[OBS ptr=%u pinCh=%d nonce=%u type=%u rssi=%.0f]\n",
+                      FHSSptr, g_pin_channel, OtaNonce, pkt_type, rssi);
+      }
+    }
 
     // 1. SYNC PACKET DISCOVERY
     if (pkt_type == 0b10) {
@@ -1208,12 +1351,9 @@ void loop() {
             else if (rfRateEnum == 1) target_rate_idx = 2;                    // 50Hz
             else if (rfRateEnum == 4) target_rate_idx = 3;                    // 25Hz
 
-            // Match known pilot seeds
-            if (u4_v4 == 38 && u5_v4 == 194) {
-              discovered_UID[2] = 8; discovered_UID[3] = 39; // 'testtest'
-            } else if (u4_v4 == 33 && u5_v4 == 85) {
-              discovered_UID[2] = 253; discovered_UID[3] = 130; // 'test'
-            }
+            // u2,u3 are NOT carried in the sync packet; the autonomous seed-solver (below)
+            // recovers them by brute force. Build a placeholder sequence for now so the radio
+            // has something to hop and FHSSptr can anchor — the solver overwrites it once solved.
             buildDynamicFHSSSequence(discovered_UID[2], discovered_UID[3], u4_v4, u5_v4, 4);
           } else {
             // ExpressLRS 3.x protocol
@@ -1266,6 +1406,18 @@ void loop() {
 
           g_rssi = rssi;
           g_snr = snr;
+
+          // [SEED-SOLVE] Sync only reveals u4,u5. If we haven't solved this pilot's seed bytes
+          // (u2,u3) yet, start the autonomous sweep now that FHSSptr is anchored and hopping is
+          // locked. A different pilot (u4/u5 changed) invalidates any prior solution.
+          if (!g_seed_collecting && (!g_seed_solved || rep_u4 != g_seed_pilot_u4 || rep_u5 != g_seed_pilot_u5)) {
+            g_seed_solved = false;
+            g_seed_pilot_u4 = rep_u4;
+            g_seed_pilot_u5 = rep_u5;
+            g_seed_con_n = 0;
+            g_seed_dwell_until_ms = 0;
+            g_seed_collecting = true;
+          }
         }
       }
     }
