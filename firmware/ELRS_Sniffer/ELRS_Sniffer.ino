@@ -1111,10 +1111,15 @@ void loop() {
     }
   }
 
-  // Dual-frequency autodiscovery: alternate listening between Ch 20 (915.5 MHz v4) and Ch 21 (916.1 MHz v3) every 1.5s when not locked
+  // Dual-frequency autodiscovery: alternate listening between Ch 20 (915.5 MHz v4) and Ch 21
+  // (916.1 MHz v3) every 1.5s until we get a real SYNC. We deliberately gate on !g_hopping_locked
+  // (set only by a genuine sync), NOT !g_link_locked: an RC packet can latch g_link_locked while
+  // parked on the WRONG sync channel (e.g. Ch 21 for a v4 pilot), which would freeze the hunt on
+  // that channel so no v4 sync is ever heard and the seed-solve never triggers. Keep hunting both
+  // channels through an RC-only lock until the correct sync channel is found.
   static int64_t last_disc_alt_us = 0;
   static uint8_t disc_scan_ch = 20;
-  if (!g_link_locked && (now - last_disc_alt_us > 1500000)) {
+  if (!g_hopping_locked && g_pin_channel < 0 && (now - last_disc_alt_us > 1500000)) {
     last_disc_alt_us = now;
     if (g_band_mode == 0) {
       disc_scan_ch = (disc_scan_ch == 20) ? 21 : 20;
@@ -1273,8 +1278,13 @@ void loop() {
       memcpy(d, raw, data_len);
       d[0] = 0x02;
 
-      // Plausibility check: valid sequence index and detectable signal
-      bool plausibility_ok = (fhssIdx < FHSS_SEQUENCE_LEN) && (rssi > -80.0f);
+      // Plausibility check: valid sequence index and a signal above the deep-noise floor.
+      // The real validity gate is the 14-bit CRC match below (v4/v3_crc_matched) - false-CRC
+      // "sync" garbage sits at -100..-120 dBm - so the RSSI floor only needs to reject deep
+      // noise, not real (sometimes weak) beacons. A -80 floor here used to drop borderline
+      // syncs, letting the pilot lock via RC only and never anchoring FHSSptr, so the
+      // autonomous seed-solve never triggered ("[SEED] collecting" intermittently missing).
+      bool plausibility_ok = (fhssIdx < FHSS_SEQUENCE_LEN) && (rssi > -92.0f);
 
       if (plausibility_ok) {
         uint16_t solvedCrc = solveCrcInit(d, inCRC);
